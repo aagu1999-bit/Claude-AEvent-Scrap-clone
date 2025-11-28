@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+.pythonlibs/
+
+# Replit
+.cache/
+.local/
+.upm/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Output files
+outputs/
+*.csv
+*.xlsx
+*.pkl
+pipeline_checkpoint.pkl
+
+# Credentials (NEVER commit these)
+*.json
+!package.json
+service-account*.json
+credentials*.json
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
