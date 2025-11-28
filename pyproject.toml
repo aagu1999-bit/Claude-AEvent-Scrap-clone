@@ -1,0 +1,16 @@
+[project]
+name = "repl-nix-workspace"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.13.2",
+    "google-auth>=2.43.0",
+    "google-cloud-vision>=3.11.0",
+    "google-generativeai>=0.8.5",
+    "nest-asyncio>=1.6.0",
+    "openpyxl>=3.1.5",
+    "pandas>=2.3.3",
+    "requests>=2.32.5",
+    "sift-stack-py>=0.9.1",
+]
