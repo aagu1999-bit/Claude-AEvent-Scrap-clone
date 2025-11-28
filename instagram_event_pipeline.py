@@ -409,7 +409,7 @@ class InstagramEventPipeline:
         common_names = {
             'Caption': ['caption', 'text', 'captionText', 'description'],
             'Display URL': ['displayUrl', 'display_url', 'imageUrl', 'image_url', 'photoUrl'],
-            'Image URL': ['imageUrl', 'image_url', 'url', 'mediaUrl', 'media_url'],
+            'Image URL': ['displayUrl', 'image_url', 'mediaUrl', 'media_url'],
             'Timestamp': ['timestamp', 'takenAt', 'taken_at', 'created_time', 'date'],
             'Location': ['locationName', 'location_name', 'location', 'place', 'venue'],
             'Owner Username': ['ownerUsername', 'owner_username', 'username', 'author', 'account'],
