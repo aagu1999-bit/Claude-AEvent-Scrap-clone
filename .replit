@@ -18,9 +18,14 @@ author = "agent"
 task = "workflow.run"
 args = "Event Pipeline"
 
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "History Migration"
+
 [[workflows.workflow]]
 name = "Event Pipeline"
 author = "agent"
+mode = "sequential"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
@@ -28,3 +33,14 @@ args = "python main.py"
 
 [workflows.workflow.metadata]
 outputType = "console"
+
+[[workflows.workflow]]
+name = "History Migration"
+author = "agent"
+
+[workflows.workflow.metadata]
+outputType = "console"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python migrate_history.py"

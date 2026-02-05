@@ -545,12 +545,31 @@ class InstagramEventPipeline:
 
         try:
             response = self.gemini_model.generate_content(prompt)
-            text = response.text.strip()
+            if not response:
+                return []
+            
+            try:
+                text = response.text.strip()
+            except (AttributeError, ValueError) as e:
+                print(f"    ✗ Gemini response error: {e}")
+                return []
+                
             text = re.sub(r'^```json\s*', '', text)
             text = re.sub(r'\s*```$', '', text)
 
             # Parse response
-            result = json.loads(text)
+            try:
+                result = json.loads(text)
+            except json.JSONDecodeError:
+                # Try to extract JSON from text if it's not pure
+                json_match = re.search(r'\{.*\}', text, re.DOTALL)
+                if json_match:
+                    try:
+                        result = json.loads(json_match.group())
+                    except:
+                        return []
+                else:
+                    return []
 
             # Extract events array
             events = result.get('events', [])
