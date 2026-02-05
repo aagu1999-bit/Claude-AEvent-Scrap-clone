@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Instagram Event Extraction Pipeline - Final
-Features: Config File, Gemini 2.5 Flash Lite, Service Account, Strict Formatting
+Features: Config File, Gemini 2.0 Flash Lite, Service Account, Strict Formatting
 """
 
 import os
@@ -24,7 +24,7 @@ def load_configuration():
         "schedule_day": "Thursday",
         "schedule_time": "14:00",
         "sheet_name": "Instagram_Events_Master",
-        "gemini_model": "gemini-2.5-flash-lite", # The 2.5 Lite model
+        "gemini_model": "gemini-2.0-flash-lite", # Updated to stable 2.0 version
         "instagram_data_url": ""
     }
 
@@ -38,10 +38,10 @@ def load_configuration():
         except Exception as e:
             print(f"⚠ Error loading config.json: {e}")
 
-    # 3. Load from Secrets (Overrides config.json - useful for testing)
-    if os.environ.get("SCHEDULE_DAY"): config["schedule_day"] = os.environ.get("SCHEDULE_DAY")
-    if os.environ.get("SCHEDULE_TIME"): config["schedule_time"] = os.environ.get("SCHEDULE_TIME")
-    if os.environ.get("DATA_URL"): config["instagram_data_url"] = os.environ.get("DATA_URL")
+    # 3. Load from Secrets (Overrides config.json)
+    if os.environ.get("SCHEDULE_DAY"): config["schedule_day"] = str(os.environ.get("SCHEDULE_DAY"))
+    if os.environ.get("SCHEDULE_TIME"): config["schedule_time"] = str(os.environ.get("SCHEDULE_TIME"))
+    if os.environ.get("DATA_URL"): config["instagram_data_url"] = str(os.environ.get("DATA_URL"))
 
     return config
 
@@ -77,8 +77,6 @@ class InstagramEventPipeline:
         # Setup Gemini
         if not GEMINI_API_KEY:
             print("❌ ERROR: GEMINI_API_KEY not found in Secrets!")
-            # Don't exit here to allow scheduler to wait if key is added later
-            # But for main script we need it
         else:
             genai.configure(api_key=GEMINI_API_KEY)
 
@@ -95,6 +93,7 @@ class InstagramEventPipeline:
 
         try:
             scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+            # oauth2client expects a list for scopes, which we are providing
             creds = ServiceAccountCredentials.from_json_keyfile_name(SERVICE_ACCOUNT_FILE, scope)
             self.sheets_client = gspread.authorize(creds)
 
@@ -230,7 +229,7 @@ class InstagramEventPipeline:
         df = df[[c for c in cols if c in df.columns]]
 
         # 2. UPPERCASE
-        df = df.applymap(lambda x: str(x).upper() if isinstance(x, str) else x)
+        df = df.apply(lambda col: col.map(lambda x: str(x).upper() if isinstance(x, str) else x))
         df.columns = [c.upper().replace('_', ' ') for c in df.columns]
 
         # 3. CSV SAVE
@@ -240,7 +239,7 @@ class InstagramEventPipeline:
         print(f"✓ Saved CSV: {csv_file}")
 
         # 4. SHEET SYNC
-        if self.sheets_client:
+        if self.sheets_client and self.log_worksheet and self.main_sheet:
             try:
                 # Log IDs
                 if new_ids:
@@ -250,7 +249,7 @@ class InstagramEventPipeline:
                 # Append Events
                 try:
                     evt_sheet = self.main_sheet.worksheet("All_Events")
-                except:
+                except gspread.WorksheetNotFound:
                     evt_sheet = self.main_sheet.add_worksheet("All_Events", 1000, 20)
                     evt_sheet.append_row(df.columns.tolist())
 
@@ -279,7 +278,9 @@ class InstagramEventPipeline:
                 try:
                     url = CONF["instagram_data_url"]
                     if url:
-                        raw_posts = requests.get(url).json()
+                        response = requests.get(url)
+                        response.raise_for_status()
+                        raw_posts = response.json()
                     else:
                         print("⚠ No instagram_data_url in config. Using empty list.")
                         raw_posts = []
@@ -288,13 +289,13 @@ class InstagramEventPipeline:
                     events, ids = self.run_pipeline(raw_posts)
                     self.save_data(events, ids)
 
-                    print("✅ Complete. Sleeping...")
-                    time.sleep(70)
+                    print("✅ Complete. Sleeping until next window...")
+                    time.sleep(70) # Skip the current minute
                 except Exception as e:
                     print(f"❌ Run Failed: {e}")
                     time.sleep(60)
 
-            time.sleep(15)
+            time.sleep(10) # Check more frequently
 
 if __name__ == "__main__":
     bot = InstagramEventPipeline()
@@ -303,7 +304,9 @@ if __name__ == "__main__":
         bot.setup_sheets()
         url = CONF["instagram_data_url"]
         if url:
-             data = requests.get(url).json()
+             response = requests.get(url)
+             response.raise_for_status()
+             data = response.json()
              e, i = bot.run_pipeline(data)
              bot.save_data(e, i)
     else:
