@@ -44,3 +44,8 @@ outputType = "console"
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = "python migrate_history.py"
+
+[userenv]
+
+[userenv.shared]
+SCHEDULE_DAY = "Thursday"

@@ -1,138 +1,309 @@
 #!/usr/bin/env python3
 """
-Instagram Event Extraction Pipeline - Main Entry Point
-Run this script to start the pipeline with configuration from environment variables.
+Instagram Event Extraction Pipeline - Final
+Features: Config File, Gemini 2.5 Flash Lite, Service Account, Strict Formatting
 """
 
 import os
 import sys
+import json
+import pandas as pd
+import requests
+import time
+import re
+from datetime import datetime
 from pathlib import Path
+import logging
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
-from instagram_event_pipeline import run_pipeline, InstagramEventPipeline
+# --- CONFIGURATION LOADER ---
+def load_configuration():
+    # 1. Default Settings
+    config = {
+        "schedule_day": "Thursday",
+        "schedule_time": "14:00",
+        "sheet_name": "Instagram_Events_Master",
+        "gemini_model": "gemini-2.5-flash-lite", # The 2.5 Lite model
+        "instagram_data_url": ""
+    }
 
-def get_config_from_env():
-    """Build configuration from environment variables"""
-    config = {}
-    
-    gemini_key = os.environ.get('GEMINI_API_KEY')
-    if not gemini_key:
-        print("ERROR: GEMINI_API_KEY environment variable is required")
-        print("\nTo set it, add GEMINI_API_KEY in the Secrets tab")
-        return None
-    config['gemini_api_key'] = gemini_key
-    
-    vision_json = os.environ.get('GOOGLE_VISION_JSON_PATH')
-    if vision_json:
-        config['vision_json_path'] = vision_json
-    
-    data_url = os.environ.get('INSTAGRAM_DATA_URL')
-    if data_url:
-        config['instagram_data_url'] = data_url
-    
-    data_path = os.environ.get('INSTAGRAM_DATA_PATH')
-    if data_path:
-        config['instagram_data_path'] = data_path
-    
-    max_workers = os.environ.get('MAX_WORKERS')
-    if max_workers:
+    # 2. Load from config.json (Overrides defaults)
+    if os.path.exists("config.json"):
         try:
-            config['max_workers'] = int(max_workers)
-        except ValueError:
-            pass
-    
-    max_posts = os.environ.get('MAX_POSTS')
-    if max_posts:
-        try:
-            config['max_posts'] = int(max_posts)
-        except ValueError:
-            pass
-    
-    rate_limit = os.environ.get('RATE_LIMIT_DELAY')
-    if rate_limit:
-        try:
-            config['rate_limit_delay'] = float(rate_limit)
-        except ValueError:
-            pass
-    
-    output_dir = os.environ.get('OUTPUT_DIR', './outputs')
-    config['output_dir'] = output_dir
-    
+            with open("config.json", "r") as f:
+                file_config = json.load(f)
+                config.update(file_config)
+            print("✓ Loaded settings from config.json")
+        except Exception as e:
+            print(f"⚠ Error loading config.json: {e}")
+
+    # 3. Load from Secrets (Overrides config.json - useful for testing)
+    if os.environ.get("SCHEDULE_DAY"): config["schedule_day"] = os.environ.get("SCHEDULE_DAY")
+    if os.environ.get("SCHEDULE_TIME"): config["schedule_time"] = os.environ.get("SCHEDULE_TIME")
+    if os.environ.get("DATA_URL"): config["instagram_data_url"] = os.environ.get("DATA_URL")
+
     return config
 
+# Load Config Globally
+CONF = load_configuration()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+SERVICE_ACCOUNT_FILE = "apt-mark-468506-u9-ec44cabc7335 copy.json"
 
-def print_usage():
-    """Print usage instructions"""
-    print("=" * 60)
-    print(" INSTAGRAM EVENT EXTRACTION PIPELINE")
-    print(" Replit Environment")
-    print("=" * 60)
-    print()
-    print("REQUIRED ENVIRONMENT VARIABLES:")
-    print("  GEMINI_API_KEY       - Your Google Gemini API key")
-    print()
-    print("OPTIONAL ENVIRONMENT VARIABLES:")
-    print("  GOOGLE_VISION_JSON_PATH - Path to Vision API service account JSON")
-    print("  INSTAGRAM_DATA_URL      - URL to fetch Instagram JSON data")
-    print("  INSTAGRAM_DATA_PATH     - Local path to Instagram JSON file")
-    print("  MAX_WORKERS             - Parallel workers (1-5, default 3)")
-    print("  MAX_POSTS               - Maximum posts to process")
-    print("  RATE_LIMIT_DELAY        - Delay between API calls (default 0.5)")
-    print("  OUTPUT_DIR              - Output directory (default ./outputs)")
-    print()
-    print("DATA SOURCE (provide one):")
-    print("  - INSTAGRAM_DATA_URL: URL to JSON endpoint")
-    print("  - INSTAGRAM_DATA_PATH: Path to local JSON file")
-    print()
-    print("Set these in the Secrets tab in Replit.")
-    print()
+# --- SETUP LOGGING ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%I:%M:%S %p')
 
+# Import Google AI
+try:
+    import google.generativeai as genai
+    from google.cloud import vision
+    from google.oauth2 import service_account
+except ImportError:
+    print("Installing dependencies...")
+    os.system(f"{sys.executable} -m pip install -q google-generativeai google-cloud-vision pandas gspread oauth2client openpyxl requests")
+    import google.generativeai as genai
+    from google.cloud import vision
+    from google.oauth2 import service_account
 
-def main():
-    """Main entry point"""
-    print_usage()
-    
-    config = get_config_from_env()
-    
-    if config is None:
-        print("\nConfiguration incomplete. Please set required environment variables.")
-        sys.exit(1)
-    
-    if not config.get('instagram_data_url') and not config.get('instagram_data_path'):
-        print("\nNo data source configured.")
-        print("Please set INSTAGRAM_DATA_URL or INSTAGRAM_DATA_PATH")
-        print("\nPipeline is ready. Waiting for data source configuration...")
-        print("\nTo test the pipeline, you can also import and use it programmatically:")
-        print()
-        print("  from instagram_event_pipeline import run_pipeline")
-        print("  ")
-        print("  config = {")
-        print("      'gemini_api_key': 'YOUR_KEY',")
-        print("      'instagram_data': [  # Your Instagram post data")
-        print("          {'caption': 'Event post', 'shortCode': 'ABC123', ...}")
-        print("      ]")
-        print("  }")
-        print("  df = run_pipeline(config)")
-        return
-    
-    print("\nStarting pipeline with configuration:")
-    for key, value in config.items():
-        if 'key' in key.lower() or 'api' in key.lower():
-            print(f"  {key}: ***hidden***")
-        else:
-            print(f"  {key}: {value}")
-    
-    try:
-        result = run_pipeline(config)
-        if result is not None:
-            print(f"\n✓ Pipeline completed! Extracted {len(result)} events.")
-        else:
-            print("\n✗ No events were extracted.")
-    except Exception as e:
-        print(f"\n✗ Pipeline error: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+class InstagramEventPipeline:
+    def __init__(self):
+        self.processed_posts = set()
+        self.sheets_client = None
+        self.main_sheet = None
+        self.log_worksheet = None
+        self.output_dir = Path("outputs")
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Setup Gemini
+        if not GEMINI_API_KEY:
+            print("❌ ERROR: GEMINI_API_KEY not found in Secrets!")
+            sys.exit(1)
+
+        genai.configure(api_key=GEMINI_API_KEY)
+
+        # Use the model defined in Config
+        model_name = CONF["gemini_model"]
+        print(f"✓ Using AI Model: {model_name}")
+        self.gemini_model = genai.GenerativeModel(model_name)
+
+    def setup_sheets(self):
+        """Connect to Sheets and LOAD HISTORY"""
+        if not os.path.exists(SERVICE_ACCOUNT_FILE):
+            print(f"⚠ No {SERVICE_ACCOUNT_FILE} found. Running in offline mode.")
+            return
+
+        try:
+            scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+            creds = ServiceAccountCredentials.from_json_keyfile_name(SERVICE_ACCOUNT_FILE, scope)
+            self.sheets_client = gspread.authorize(creds)
+
+            sheet_name = CONF["sheet_name"]
+
+            # Open Sheet
+            try:
+                self.main_sheet = self.sheets_client.open(sheet_name)
+                print(f"✓ Connected to Sheet: {sheet_name}")
+            except gspread.SpreadsheetNotFound:
+                print(f"❌ Error: Could not find Google Sheet named '{sheet_name}'")
+                print(f"   Please create it manually and share it with: {creds.service_account_email}")
+                return
+
+            # Load History
+            try:
+                self.log_worksheet = self.main_sheet.worksheet("Processed_Log")
+                existing_ids = self.log_worksheet.col_values(1)[1:] 
+                self.processed_posts.update(existing_ids)
+                print(f"✓ History Loaded: Skipping {len(existing_ids)} previously processed IDs.")
+            except gspread.WorksheetNotFound:
+                self.log_worksheet = self.main_sheet.add_worksheet("Processed_Log", 5000, 5)
+                self.log_worksheet.append_row(["Post ID", "Date Processed", "Source", "Notes"])
+                print("✓ Created new 'Processed_Log' tab.")
+
+        except Exception as e:
+            print(f"⚠ Sheets Connection Failed: {e}")
+
+    def clean_time(self, time_str):
+        """Strict X:XX AM/PM format"""
+        if not time_str: return ""
+        try:
+            dt = None
+            for fmt in ['%H:%M', '%I:%M %p', '%I:%M%p', '%I %p', '%H:%M:%S']:
+                try:
+                    dt = datetime.strptime(str(time_str).strip().upper(), fmt)
+                    break
+                except ValueError: continue
+
+            if dt:
+                formatted = dt.strftime('%I:%M %p')
+                return formatted.lstrip('0')
+        except:
+            pass
+        return str(time_str).upper()
+
+    def analyze_post(self, post):
+        """AI Analysis"""
+        caption = post.get('caption', '') or post.get('text', '')
+        user = post.get('ownerUsername', '')
+        pid = post.get('id') or post.get('shortCode')
+
+        prompt = f"""
+        Extract events from this Instagram post.
+
+        CAPTION: {caption}
+        ACCOUNT: {user}
+        DATE: {post.get('timestamp', '')}
+
+        REQUIREMENTS:
+        1. "newsletter_description": Create a "HYPE_LINE". A one-sentence, punchy teaser for a newsletter. 
+           Example: "Kick off your weekend with live jazz downtown!"
+        2. "section_of_nj": North/Central/South (Based on city/county).
+        3. TIME: Strict 12-hour format (e.g. 2:00 PM).
+
+        Return JSON with "events" list containing:
+        event_name, date (YYYY-MM-DD), start_time, venue_name, city, section_of_nj, newsletter_description, event_type, description
+        """
+
+        try:
+            resp = self.gemini_model.generate_content(prompt)
+            clean_json = re.sub(r'```json\s*|```', '', resp.text).strip()
+            data = json.loads(clean_json)
+
+            events = []
+            for e in data.get('events', []):
+                e['instagram_handle'] = user
+                e['instagram_post_url'] = f"https://www.instagram.com/p/{post.get('shortCode', '')}/"
+                e['display_url'] = post.get('displayUrl', '')
+                e['post_url'] = post.get('url', '')
+                e['instagram_profile_url'] = f"https://www.instagram.com/{user}/"
+                e['account_name'] = post.get('ownerFullName', '')
+                e['start_time'] = self.clean_time(e.get('start_time'))
+                events.append(e)
+            return events
+        except Exception:
+            return []
+
+    def run_pipeline(self, posts):
+        """Process batch"""
+        new_events = []
+        new_ids = []
+
+        print(f"Scanning {len(posts)} posts...")
+
+        for post in posts:
+            pid = post.get('id') or post.get('shortCode')
+            if pid in self.processed_posts: continue 
+
+            print(f"  🔎 Analyzing: {pid}")
+            events = self.analyze_post(post)
+
+            if events:
+                new_events.extend(events)
+                new_ids.append(pid)
+                self.processed_posts.add(pid)
+
+            time.sleep(1)
+
+        return new_events, new_ids
+
+    def save_data(self, events, new_ids):
+        """Save with strict formatting"""
+        if not events:
+            print("No new events found.")
+            return
+
+        df = pd.DataFrame(events)
+
+        # 1. COLUMN ORDER
+        cols = [
+            'instagram_handle', 'event_name', 'location', 'date', 'start_time',
+            'venue_name', 'city', 'section_of_nj', 'newsletter_description',
+            'instagram_post_url', 'display_url', 'post_url', 'instagram_profile_url',
+            'event_type', 'account_name', 'description'
+        ]
+
+        # Ensure cols exist
+        for c in cols:
+            if c not in df.columns: df[c] = ""
+
+        # Select/Reorder
+        df = df[[c for c in cols if c in df.columns]]
+
+        # 2. UPPERCASE
+        df = df.applymap(lambda x: str(x).upper() if isinstance(x, str) else x)
+        df.columns = [c.upper().replace('_', ' ') for c in df.columns]
+
+        # 3. CSV SAVE
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        csv_file = self.output_dir / f"Events_{ts}.csv"
+        df.to_csv(csv_file, index=False)
+        print(f"✓ Saved CSV: {csv_file}")
+
+        # 4. SHEET SYNC
+        if self.sheets_client:
+            try:
+                # Log IDs
+                if new_ids:
+                    log_rows = [[uid, str(datetime.now().date()), "Auto-Bot", ""] for uid in new_ids]
+                    self.log_worksheet.append_rows(log_rows)
+
+                # Append Events
+                try:
+                    evt_sheet = self.main_sheet.worksheet("All_Events")
+                except:
+                    evt_sheet = self.main_sheet.add_worksheet("All_Events", 1000, 20)
+                    evt_sheet.append_row(df.columns.tolist())
+
+                evt_sheet.append_rows(df.values.tolist())
+                print(f"✓ Uploaded {len(events)} events to Sheets")
+            except Exception as e:
+                print(f"⚠ Sheets Upload Error: {e}")
+
+    def start_scheduler(self):
+        """Scheduler Loop"""
+        target_day = CONF["schedule_day"]
+        target_time = CONF["schedule_time"]
+
+        print(f"\n⏰ BOT STARTED.")
+        print(f"   Target: Every {target_day} at {target_time}")
+        print("   Status: Waiting...")
+
+        while True:
+            now = datetime.now()
+            day = now.strftime("%A")
+            hm = now.strftime("%H:%M")
+
+            if day == target_day and hm == target_time:
+                print(f"\n🚀 STARTING RUN: {now}")
+
+                try:
+                    url = CONF["instagram_data_url"]
+                    if url:
+                        raw_posts = requests.get(url).json()
+                    else:
+                        print("⚠ No instagram_data_url in config. Using empty list.")
+                        raw_posts = []
+
+                    self.setup_sheets()
+                    events, ids = self.run_pipeline(raw_posts)
+                    self.save_data(events, ids)
+
+                    print("✅ Complete. Sleeping...")
+                    time.sleep(70)
+                except Exception as e:
+                    print(f"❌ Run Failed: {e}")
+                    time.sleep(60)
+
+            time.sleep(15)
 
 if __name__ == "__main__":
-    main()
+    bot = InstagramEventPipeline()
+    if "--now" in sys.argv:
+        print("Force run initiated...")
+        bot.setup_sheets()
+        url = CONF["instagram_data_url"]
+        if url:
+             data = requests.get(url).json()
+             e, i = bot.run_pipeline(data)
+             bot.save_data(e, i)
+    else:
+        bot.start_scheduler()
