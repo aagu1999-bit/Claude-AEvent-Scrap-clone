@@ -5,8 +5,8 @@ from pathlib import Path
 import datetime
 
 # --- CONFIGURATION ---
-CHECKPOINT_FILE = "pipeline_checkpoint.pkl"  # Make sure this is in your folder
-SERVICE_ACCOUNT_FILE = "service_account.json"  # Your bot key
+CHECKPOINT_FILE = "outputs/pipeline_checkpoint.pkl"  # Correct path
+SERVICE_ACCOUNT_FILE = "apt-mark-468506-u9-ec44cabc7335 copy.json"  # Use your uploaded JSON
 SHEET_NAME = "Instagram_Events_Master"  # The name of the sheet you want to use
 
 
