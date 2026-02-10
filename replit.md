@@ -83,6 +83,9 @@ Pipeline generates:
 - Google Sheets: All_Events tab + Processed_Log tab
 
 ## Recent Changes
+- **2026-02-10**: URL fix + processed timestamp
+  - Fixed uppercase conversion breaking Instagram links (URLs now keep original casing)
+  - Added 'processed_timestamp' column at end of output data
 - **2026-02-05**: Performance + logging overhaul
   - Increased parallel workers to 10 (from 3)
   - Restored full verbose logging from original pipeline
