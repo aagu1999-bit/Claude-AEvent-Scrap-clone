@@ -644,15 +644,22 @@ class InstagramEventPipeline:
             'venue_name', 'city', 'section_of_nj', 'newsletter_description',
             'instagram_post_url', 'display_url', 'post_url', 'instagram_profile_url',
             'event_type', 'account_name', 'description', 'performer', 'price',
-            'confidence', 'post_id', 'had_ocr', 'from_calendar'
+            'confidence', 'post_id', 'had_ocr', 'from_calendar',
+            'processed_timestamp'
         ]
+
+        df['processed_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
         for c in cols:
             if c not in df.columns:
                 df[c] = ""
         df = df[[c for c in cols if c in df.columns]]
 
-        df = df.apply(lambda col: col.map(lambda x: str(x).upper() if isinstance(x, str) else x))
+        url_columns = {'instagram_post_url', 'display_url', 'post_url', 'instagram_profile_url'}
+        skip_upper = url_columns | {'processed_timestamp'}
+        for col_name in df.columns:
+            if col_name not in skip_upper:
+                df[col_name] = df[col_name].map(lambda x: str(x).upper() if isinstance(x, str) else x)
         df.columns = [c.upper().replace('_', ' ') for c in df.columns]
 
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
