@@ -48,4 +48,3 @@ args = "python migrate_history.py"
 [userenv]
 
 [userenv.shared]
-SCHEDULE_DAY = "Thursday"
