@@ -745,19 +745,40 @@ class InstagramEventPipeline:
             time.sleep(10)
 
 
+def reset_run_now():
+    try:
+        with open("config.json", "r") as f:
+            cfg = json.load(f)
+        cfg["run_now"] = False
+        with open("config.json", "w") as f:
+            json.dump(cfg, f, indent=2)
+        print("✓ Reset run_now to false in config.json")
+    except Exception as e:
+        print(f"⚠ Could not reset run_now in config.json: {e}")
+
+
+def do_force_run(bot):
+    print("\n🚀 Force run initiated...\n")
+    bot.setup_sheets()
+    url = CONF["instagram_data_url"]
+    if url:
+        response = requests.get(url, timeout=120)
+        response.raise_for_status()
+        data = response.json()
+        events, ids = bot.run_pipeline(data)
+        bot.save_data(events, ids)
+    else:
+        print("❌ No instagram_data_url configured.")
+
+
 if __name__ == "__main__":
     bot = InstagramEventPipeline()
-    if "--now" in sys.argv:
-        print("\n🚀 Force run initiated...\n")
-        bot.setup_sheets()
-        url = CONF["instagram_data_url"]
-        if url:
-            response = requests.get(url, timeout=120)
-            response.raise_for_status()
-            data = response.json()
-            events, ids = bot.run_pipeline(data)
-            bot.save_data(events, ids)
-        else:
-            print("❌ No instagram_data_url configured.")
+    config_forced = CONF.get("run_now", False)
+    if "--now" in sys.argv or config_forced:
+        try:
+            do_force_run(bot)
+        finally:
+            if config_forced:
+                reset_run_now()
     else:
         bot.start_scheduler()

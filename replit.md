@@ -71,6 +71,9 @@ Python-based pipeline that extracts event information from Instagram posts using
 The Event Pipeline workflow runs `main.py` which waits for the configured day/time, then processes all posts automatically.
 
 ### Force Run
+Option 1 — In config.json, set `"run_now": true`, then restart the workflow. It will run immediately and automatically reset back to `false` when done.
+
+Option 2 — From the Shell:
 ```bash
 python main.py --now
 ```
@@ -83,6 +86,7 @@ Pipeline generates:
 - Google Sheets: All_Events tab + Processed_Log tab
 
 ## Recent Changes
+- **2026-03-12**: Added run_now toggle to config.json for triggering immediate runs without Shell commands
 - **2026-02-10**: URL fix + processed timestamp
   - Fixed uppercase conversion breaking Instagram links (URLs now keep original casing)
   - Added 'processed_timestamp' column at end of output data
