@@ -775,6 +775,8 @@ if __name__ == "__main__":
     bot = InstagramEventPipeline()
     config_forced = CONF.get("run_now", False)
     if "--now" in sys.argv or config_forced:
+        if config_forced:
+            print("⚡ run_now is ON in config.json — triggering immediate run")
         try:
             do_force_run(bot)
         finally:
