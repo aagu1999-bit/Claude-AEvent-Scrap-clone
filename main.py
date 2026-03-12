@@ -699,7 +699,15 @@ class InstagramEventPipeline:
                     evt_sheet = self.main_sheet.add_worksheet("All_Events", 5000, 25)
                     evt_sheet.append_row(df.columns.tolist())
 
-                evt_sheet.append_rows(df.values.tolist())
+                def sanitize(val):
+                    if isinstance(val, list):
+                        return ", ".join(str(v) for v in val)
+                    if isinstance(val, dict):
+                        return str(val)
+                    return val
+
+                rows = [[sanitize(v) for v in row] for row in df.values.tolist()]
+                evt_sheet.append_rows(rows)
                 print(f"✓ Uploaded {len(events)} events to Google Sheets")
             except Exception as e:
                 print(f"⚠ Sheets Upload Error: {e}")
