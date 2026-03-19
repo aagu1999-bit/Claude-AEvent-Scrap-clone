@@ -409,13 +409,17 @@ class InstagramEventPipeline:
         → Example: POST DATE is Wednesday 2026-03-10, event is "Every Saturday" → date = 2026-03-14
 
         REQUIREMENTS:
-        1. "newsletter_description": Create a "HYPE_LINE" - a one-sentence, punchy teaser for a newsletter.
+        1. "event_name": Maximum 40 characters. If the natural event name exceeds 40 characters,
+           create a shorter, marketable version that captures the essence.
+           Examples: "CULTR One Year Anniversary" not "CULTR ONE YEAR ANNIVERSARY CELEBRATION PARTY"
+                     "Jazz & Jamz Night" not "Jesus, Jazz & Jamz Community Celebration Evening"
+        2. "newsletter_description": Create a "HYPE_LINE" - a one-sentence, punchy teaser for a newsletter.
            Example: "Kick off your weekend with live jazz downtown!"
-        2. "section_of_nj": North/Central/South based on city/county:
+        3. "section_of_nj": North/Central/South based on city/county:
            North = Bergen/Essex/Hudson/Morris/Passaic/Sussex/Warren
            Central = Hunterdon/Mercer/Middlesex/Monmouth/Somerset/Union
            South = Atlantic/Burlington/Camden/Cape May/Cumberland/Gloucester/Ocean/Salem
-        3. TIME: Strict 12-hour format (e.g. 2:00 PM).
+        4. TIME: Strict 12-hour format (e.g. 2:00 PM).
 
         Return JSON with "events" list containing:
         event_name, date (YYYY-MM-DD), start_time, venue_name, city, section_of_nj,
@@ -479,6 +483,8 @@ class InstagramEventPipeline:
             for e in events:
                 if not e.get('event_name') and not e.get('date'):
                     continue
+                if e.get('event_name') and len(e['event_name']) > 40:
+                    e['event_name'] = e['event_name'][:40].rsplit(' ', 1)[0]
                 e['instagram_handle'] = user
                 e['instagram_post_url'] = f"https://www.instagram.com/p/{shortcode}/" if shortcode else ''
                 e['display_url'] = display_url
