@@ -404,7 +404,7 @@ class InstagramEventPipeline:
         RECURRING EVENTS — if the post describes a recurring event with no specific one-time date:
         - "Every Saturday", "Every weekend", "Every Friday night", "Weekly Thursdays"
         - "Industry Mondays", "Brunch every Sunday", "EVERY SATURDAY & SUNDAY"
-        → Calculate the NEXT upcoming occurrence of that day AFTER the POST DATE and use that as the date
+        → Calculate the NEXT upcoming occurrence of that day ON OR AFTER the POST DATE and use that as the date
         → Set "is_recurring": true in the event object
         → Example: POST DATE is Wednesday 2026-03-10, event is "Every Saturday" → date = 2026-03-14
 
