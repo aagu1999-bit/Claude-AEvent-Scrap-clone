@@ -377,7 +377,7 @@ class InstagramEventPipeline:
         prompt = f"""
         Extract ALL events from this Instagram post. A post may contain MULTIPLE events.
 
-        POST DATE: {post_date.strftime('%Y-%m-%d')}
+        POST DATE: {post_date.strftime('%Y-%m-%d')} (use this to resolve relative and recurring dates)
         ACCOUNT: @{user} ({owner_full_name})
         LOCATION TAG: {location_name}
 
@@ -391,6 +391,23 @@ class InstagramEventPipeline:
         4. Each date/event combination should be a separate event
         5. If location_name exists, use it as venue for ALL events
 
+        DATE PARSING — handle ALL of these formats and convert to YYYY-MM-DD:
+        - Shorthand with dots: "3.13.26" or "3.13" → use POST DATE year if year omitted
+        - Shorthand with slashes: "3/13", "3/13/26", "03/13/2026"
+        - Written out: "March 13th", "March 13", "Mar 13"
+        - Day references: "this Saturday", "next Friday", "this weekend" → calculate exact date from POST DATE
+        - Day + date: "Saturday the 13th", "Friday, April 4th"
+        - Relative: "tomorrow", "tonight" → calculate from POST DATE
+        - Month only with context: "this March" → use the month with POST DATE year
+        - Year shorthand: "26" means 2026, "25" means 2025
+
+        RECURRING EVENTS — if the post describes a recurring event with no specific one-time date:
+        - "Every Saturday", "Every weekend", "Every Friday night", "Weekly Thursdays"
+        - "Industry Mondays", "Brunch every Sunday", "EVERY SATURDAY & SUNDAY"
+        → Calculate the NEXT upcoming occurrence of that day AFTER the POST DATE and use that as the date
+        → Set "is_recurring": true in the event object
+        → Example: POST DATE is Wednesday 2026-03-10, event is "Every Saturday" → date = 2026-03-14
+
         REQUIREMENTS:
         1. "newsletter_description": Create a "HYPE_LINE" - a one-sentence, punchy teaser for a newsletter.
            Example: "Kick off your weekend with live jazz downtown!"
@@ -402,7 +419,7 @@ class InstagramEventPipeline:
 
         Return JSON with "events" list containing:
         event_name, date (YYYY-MM-DD), start_time, venue_name, city, section_of_nj,
-        newsletter_description, event_type, description, performer, price, confidence
+        newsletter_description, event_type, description, performer, price, confidence, is_recurring
 
         Also include:
         "total_events_found": number,
@@ -499,7 +516,8 @@ class InstagramEventPipeline:
                 if len(processed_events) > 1:
                     print(f"  🎉 MULTIPLE EVENTS FOUND: {len(processed_events)} events extracted!")
                     for idx, event in enumerate(processed_events, 1):
-                        print(f"    {idx}. {event.get('event_name', 'Unnamed')}")
+                        recurring_tag = " ♻ recurring" if event.get('is_recurring') else ""
+                        print(f"    {idx}. {event.get('event_name', 'Unnamed')}{recurring_tag}")
                         if event.get('date'):
                             print(f"       Date: {event['date']}")
                         if event.get('venue_name'):
@@ -507,7 +525,8 @@ class InstagramEventPipeline:
                         print(f"       Confidence: {event.get('confidence', 'unknown')}")
                 else:
                     event = processed_events[0]
-                    print(f"  ✓ EVENT FOUND: {event.get('event_name', 'Unnamed')}")
+                    recurring_tag = " ♻ recurring" if event.get('is_recurring') else ""
+                    print(f"  ✓ EVENT FOUND: {event.get('event_name', 'Unnamed')}{recurring_tag}")
                     print(f"    • Date: {event.get('date', 'N/A')}")
                     print(f"    • Venue: {event.get('venue_name', 'N/A')}")
                     print(f"    • Confidence: {event.get('confidence', 'unknown')}")
@@ -644,7 +663,7 @@ class InstagramEventPipeline:
             'venue_name', 'city', 'section_of_nj', 'newsletter_description',
             'instagram_post_url', 'display_url', 'post_url', 'instagram_profile_url',
             'event_type', 'account_name', 'description', 'performer', 'price',
-            'confidence', 'post_id', 'had_ocr', 'from_calendar',
+            'confidence', 'post_id', 'had_ocr', 'from_calendar', 'is_recurring',
             'processed_timestamp'
         ]
 
