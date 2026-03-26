@@ -512,7 +512,7 @@ class InstagramEventPipeline:
                     if is_calendar:
                         self.stats['calendar_posts'] += 1
 
-                    if self.stats['events_found'] % 25 == 0:
+                    if self.stats['events_found'] % 500 == 0:
                         self.save_checkpoint()
                         print(f"  ↳ Checkpoint saved ({self.stats['events_found']} total events)")
                 else:
