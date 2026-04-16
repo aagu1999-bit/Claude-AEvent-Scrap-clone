@@ -109,7 +109,7 @@
 
             self.max_workers = min(5, max(1, self.config.get('max_workers', 3)))
             self.rate_limit_delay = max(0.1, self.config.get('rate_limit_delay', 0.5))
-            self.output_dir = Path(self.config.get('output_dir', '/mnt/user-data/outputs'))
+            self.output_dir = Path(self.config.get('output_dir', './outputs'))
             self.output_dir.mkdir(parents=True, exist_ok=True)
 
             self.checkpoint_file = self.output_dir / 'pipeline_checkpoint.pkl'
