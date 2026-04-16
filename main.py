@@ -763,6 +763,14 @@ class InstagramEventPipeline:
                         print("⚠ No instagram_data_url in config.")
                         raw_posts = []
 
+                    offset = CONF.get("post_offset", 0)
+                    cap = CONF.get("max_posts", 0)
+                    if offset:
+                        raw_posts = raw_posts[offset:]
+                        print(f"  • Post offset: skipping first {offset} posts")
+                    if cap:
+                        raw_posts = raw_posts[:cap]
+                        print(f"  • Post cap: processing up to {cap} posts")
                     self.setup_sheets()
                     events, ids = self.run_pipeline(raw_posts)
                     self.save_data(events, ids)
@@ -798,6 +806,14 @@ def do_force_run(bot):
         response = requests.get(url, timeout=120)
         response.raise_for_status()
         data = response.json()
+        offset = CONF.get("post_offset", 0)
+        cap = CONF.get("max_posts", 0)
+        if offset:
+            data = data[offset:]
+            print(f"  • Post offset: skipping first {offset} posts")
+        if cap:
+            data = data[:cap]
+            print(f"  • Post cap: processing up to {cap} posts")
         events, ids = bot.run_pipeline(data)
         bot.save_data(events, ids)
     else:
