@@ -116,6 +116,9 @@ class InstagramEventPipeline:
             'ocr_failed': 0,
             'download_errors': 0,
             'vision_errors': {},
+            'carousel_posts': 0,
+            'total_slides_ocrd': 0,
+            'slides_with_text': 0,
         }
 
         if not GEMINI_API_KEY:
@@ -223,6 +226,36 @@ class InstagramEventPipeline:
         except Exception:
             pass
         return str(time_str).upper()
+
+    def collect_carousel_urls(self, post):
+        urls = []
+        seen = set()
+
+        def add(url):
+            if not url or not isinstance(url, str) or url == 'null':
+                return
+            try:
+                from urllib.parse import urlparse
+                key = urlparse(url).path or url
+            except Exception:
+                key = url
+            if key not in seen:
+                seen.add(key)
+                urls.append(url)
+
+        add(post.get('displayUrl', '') or post.get('display_url', ''))
+
+        for child in post.get('childPosts', []):
+            if isinstance(child, dict):
+                add(child.get('displayUrl', '') or child.get('display_url', ''))
+
+        for img in post.get('images', []):
+            if isinstance(img, str):
+                add(img)
+            elif isinstance(img, dict):
+                add(img.get('url', '') or img.get('displayUrl', ''))
+
+        return urls
 
     def extract_ocr_text(self, image_url, post_id=""):
         if not self.vision_client or not image_url or image_url == 'null':
@@ -339,11 +372,36 @@ class InstagramEventPipeline:
         has_image = bool(display_url)
 
         ocr_text = ""
-        if self.vision_enabled and display_url:
-            print(f"  ↳ Found image URL")
-            ocr_text = self.extract_ocr_text(display_url, pid)
-        elif self.vision_enabled:
-            print(f"  ⚠ No image URL found - relying on text fields")
+        if self.vision_enabled:
+            all_urls = self.collect_carousel_urls(post)
+            if all_urls:
+                num_slides = len(all_urls)
+                if num_slides > 1:
+                    print(f"  📸 CAROUSEL: {num_slides} slides detected — OCR'ing all")
+                else:
+                    print(f"  ↳ Found image URL")
+                if num_slides > 1:
+                    with self.lock:
+                        self.stats['carousel_posts'] += 1
+                slide_texts = []
+                for idx, url in enumerate(all_urls, 1):
+                    if num_slides > 1:
+                        print(f"    ─── Slide {idx}/{num_slides} ───")
+                    text = self.extract_ocr_text(url, f"{pid}_s{idx}")
+                    with self.lock:
+                        self.stats['total_slides_ocrd'] += 1
+                    if text:
+                        with self.lock:
+                            self.stats['slides_with_text'] += 1
+                        if num_slides > 1:
+                            slide_texts.append(f"[SLIDE {idx} of {num_slides}]\n{text}")
+                        else:
+                            slide_texts.append(text)
+                ocr_text = "\n\n".join(slide_texts)
+                if num_slides > 1:
+                    print(f"  ✓ Carousel OCR complete: {len(slide_texts)}/{num_slides} slides had text")
+            else:
+                print(f"  ⚠ No image URL found - relying on text fields")
         else:
             print(f"  ⚠ Vision API disabled - relying on text fields only")
 
@@ -382,7 +440,10 @@ class InstagramEventPipeline:
         LOCATION TAG: {location_name}
 
         CAPTION: {caption[:2000]}
-        OCR TEXT FROM IMAGE: {ocr_text[:3000]}
+        OCR TEXT FROM IMAGE(S): {ocr_text[:5000]}
+        NOTE: If OCR text contains [SLIDE N of M] markers, this is a carousel post.
+        Each slide may show different events (e.g. a weekly calendar spread across slides).
+        Extract events from ALL slides.
 
         EXTRACTION INSTRUCTIONS:
         1. Look for MULTIPLE events - calendars, weekly lineups, event series
@@ -639,6 +700,14 @@ class InstagramEventPipeline:
         print(f"  • Posts with multiple events: {self.stats['multi_event_posts']}")
         print(f"  • Maximum events in single post: {self.stats['max_events_in_post']}")
         print(f"  • Calendar/schedule posts: {self.stats['calendar_posts']}")
+
+        print(f"\n📸 CAROUSEL STATISTICS:")
+        print(f"  • Carousel posts (multi-slide): {self.stats['carousel_posts']}")
+        print(f"  • Total slides OCR'd: {self.stats['total_slides_ocrd']}")
+        print(f"  • Slides with text found: {self.stats['slides_with_text']}")
+        if self.stats['total_slides_ocrd'] > 0:
+            slide_rate = (self.stats['slides_with_text'] / self.stats['total_slides_ocrd']) * 100
+            print(f"  • Slide text rate: {slide_rate:.1f}%")
 
         print(f"\n🔍 OCR STATISTICS:")
         total_ocr = self.stats['ocr_success'] + self.stats['ocr_failed']
