@@ -127,7 +127,7 @@ def find_rows_to_reprocess(spreadsheet, weekend_dates):
     weekend_date_strs = {str(d) for d in weekend_dates}
 
     # Phase 1: collect post IDs that have at least one weekend-dated row
-    _DATE_FMTS = ('%m/%d/%Y', '%Y-%m-%d', '%m/%d/%y', '%B %d, %Y', '%-m/%-d/%Y')
+    _DATE_FMTS = ('%m/%d/%Y', '%Y-%m-%d', '%m/%d/%y', '%B %d, %Y')
 
     def _parse_date(s):
         for fmt in _DATE_FMTS:
