@@ -22,6 +22,7 @@ Python-based pipeline that extracts event information from Instagram posts using
 - Scheduled weekly runs via config.json
 - Verbose logging: OCR status, event details, calendar detection, stats
 - Reliable Accounts detection: scores accounts on recurring event signals, writes Reliable_Accounts tab to Google Sheets after each run
+- Smart history: Processed_Log tags each post with result (events_found/no_events_found/ocr_failed/gemini_error); OCR/Gemini failures are retried on next run; posts older than `history_max_age_days` always skipped
 
 ## Project Structure
 ```
