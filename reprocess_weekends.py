@@ -15,6 +15,7 @@ import os
 import sys
 import time
 import argparse
+import re
 import requests
 from datetime import datetime, date, timedelta
 
@@ -24,7 +25,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 SERVICE_ACCOUNT_FILE = "apt-mark-468506-u9-ec44cabc7335 copy.json"
 SHEET_NAME = "Instagram_Events_Master"
 APIFY_BASE_URL = "https://api.apify.com/v2"
-APIFY_ACTOR = "apify~instagram-post-scraper"
+APIFY_ACTOR = "apify~instagram-scraper"
 
 
 # ─────────────────────────────────────────────
@@ -226,13 +227,44 @@ def backup_rows(spreadsheet, header, rows_to_delete):
 # ─────────────────────────────────────────────
 
 def delete_from_all_events(spreadsheet, rows_to_delete):
-    """Delete all rows from All_Events. Deletes bottom-up to preserve sheet row indices."""
+    """Delete rows from All_Events using batched batchUpdate (avoids per-row quota limits)."""
     ws = spreadsheet.worksheet("All_Events")
     sheet_rows = sorted({r["sheet_row"] for r in rows_to_delete}, reverse=True)
-    for sheet_row in sheet_rows:
-        ws.delete_rows(sheet_row)
-        time.sleep(0.15)
-    print(f"✓ Deleted {len(sheet_rows)} rows from All_Events")
+
+    # Group consecutive row numbers into ranges to minimise request count.
+    # Sorted descending so that earlier deletions don't shift later indices.
+    range_requests = []
+    i = 0
+    while i < len(sheet_rows):
+        high = sheet_rows[i]
+        low = high
+        while i + 1 < len(sheet_rows) and sheet_rows[i] - sheet_rows[i + 1] == 1:
+            i += 1
+            low = sheet_rows[i]
+        # Sheets API uses 0-based startIndex, exclusive endIndex
+        range_requests.append({
+            "deleteDimension": {
+                "range": {
+                    "sheetId": ws.id,
+                    "dimension": "ROWS",
+                    "startIndex": low - 1,
+                    "endIndex": high,
+                }
+            }
+        })
+        i += 1
+
+    # Execute in batches of 500 (well within the 10 MB request size limit).
+    # Each batchUpdate call counts as ONE write request regardless of how many
+    # operations it contains, so this stays far below the 60-writes/min quota.
+    batch_size = 500
+    for start in range(0, len(range_requests), batch_size):
+        batch = range_requests[start : start + batch_size]
+        spreadsheet.batch_update({"requests": batch})
+        if start + batch_size < len(range_requests):
+            time.sleep(1)
+
+    print(f"✓ Deleted {len(sheet_rows)} rows from All_Events ({len(range_requests)} range requests)")
 
 
 # ─────────────────────────────────────────────
@@ -263,9 +295,34 @@ def unlock_from_processed_log(spreadsheet, post_ids_to_remove):
         if pid in ids_to_remove:
             rows_to_delete.append(idx)
 
-    for idx in sorted(rows_to_delete, reverse=True):
-        ws.delete_rows(idx + 2)
-        time.sleep(0.15)
+    # Build batched deleteDimension requests (1 API call per 500 ranges)
+    sheet_rows_desc = sorted({idx + 2 for idx in rows_to_delete}, reverse=True)
+    range_requests = []
+    i = 0
+    while i < len(sheet_rows_desc):
+        high = sheet_rows_desc[i]
+        low = high
+        while i + 1 < len(sheet_rows_desc) and sheet_rows_desc[i] - sheet_rows_desc[i + 1] == 1:
+            i += 1
+            low = sheet_rows_desc[i]
+        range_requests.append({
+            "deleteDimension": {
+                "range": {
+                    "sheetId": ws.id,
+                    "dimension": "ROWS",
+                    "startIndex": low - 1,
+                    "endIndex": high,
+                }
+            }
+        })
+        i += 1
+
+    batch_size = 500
+    for start in range(0, len(range_requests), batch_size):
+        batch = range_requests[start : start + batch_size]
+        spreadsheet.batch_update({"requests": batch})
+        if start + batch_size < len(range_requests):
+            time.sleep(1)
 
     print(f"✓ Unlocked {len(rows_to_delete)} Processed_Log entries for {len(ids_to_remove)} post ID(s)")
     return len(rows_to_delete)
@@ -280,9 +337,16 @@ def apify_rescrape(post_urls, apify_token):
     Submits a batch Apify run for the given post URLs.
     Waits for completion and returns the raw dataset items list.
     """
-    unique_urls = list(dict.fromkeys(u for u in post_urls if u))
+    ig_url_re = re.compile(
+        r"^(https://)?(www\.)?instagram\.com/[A-Za-z0-9._-]+(/.*)?$"
+    )
+    all_urls = list(dict.fromkeys(u for u in post_urls if u))
+    unique_urls = [u for u in all_urls if ig_url_re.match(u.strip())]
+    skipped = len(all_urls) - len(unique_urls)
+    if skipped:
+        print(f"  ⚠ Skipped {skipped} URL(s) that didn't match Instagram URL pattern")
     if not unique_urls:
-        print("⚠ No post URLs to scrape.")
+        print("⚠ No valid post URLs to scrape.")
         return []
 
     print(f"\n🚀 Submitting Apify run for {len(unique_urls)} post URL(s)...")
@@ -299,6 +363,8 @@ def apify_rescrape(post_urls, apify_token):
         json=payload,
         timeout=30,
     )
+    if not resp.ok:
+        print(f"  ↳ Apify error {resp.status_code}: {resp.text[:500]}")
     resp.raise_for_status()
     run_data = resp.json()
 
@@ -398,28 +464,65 @@ def main():
         spreadsheet, weekend_dates
     )
 
+    # ── Recovery mode: rows already deleted in a prior interrupted run ────
+    # If All_Events has no matching rows but Reprocess_Backup exists with data,
+    # the deletion step completed previously but Steps 3-5 did not. Resume from
+    # the backup so we still unlock Processed_Log and re-run the pipeline.
+    resuming = False
     if not rows_to_delete:
-        print("\n✅ No weekend events found in All_Events for the target date range. Nothing to do.")
-        sys.exit(0)
+        try:
+            bk_ws = spreadsheet.worksheet("Reprocess_Backup")
+            bk_values = bk_ws.get_all_values()
+        except gspread.WorksheetNotFound:
+            bk_values = []
 
-    unique_post_ids  = list(dict.fromkeys(r["post_id"]  for r in rows_to_delete if r["post_id"]))
+        if len(bk_values) > 1:  # header + at least one data row
+            bk_header = bk_values[0]
+            bk_data   = bk_values[1:]
+            pid_col   = _col_index(bk_header, "POST ID") or 0
+            url_col   = _col_index(bk_header, "POST URL") or _col_index(bk_header, "instagram_post_url") or 1
+            handle_col = _col_index(bk_header, "Account") or _col_index(bk_header, "account") or None
+
+            for row in bk_data:
+                pid  = row[pid_col].strip()  if len(row) > pid_col  else ""
+                url  = row[url_col].strip()  if len(row) > url_col  else ""
+                hdl  = (row[handle_col].strip() if handle_col is not None and len(row) > handle_col else "")
+                if pid and pid not in post_id_to_url:
+                    post_id_to_url[pid] = url
+                if hdl and pid not in post_id_to_handle:
+                    post_id_to_handle[pid] = hdl
+
+            if post_id_to_url:
+                print(f"\n♻️  RESUME MODE — Reprocess_Backup has {len(bk_data)} row(s) from a prior run.")
+                print(f"   Steps 1 & 2 already completed. Continuing from Step 3 (unlock + re-scrape).")
+                resuming = True
+            else:
+                print("\n✅ No weekend events found and no backup to resume from. Nothing to do.")
+                sys.exit(0)
+        else:
+            print("\n✅ No weekend events found in All_Events for the target date range. Nothing to do.")
+            sys.exit(0)
+
+    unique_post_ids  = list(dict.fromkeys(r["post_id"]  for r in rows_to_delete if r["post_id"])) if not resuming else list(post_id_to_url.keys())
     unique_post_urls = list(dict.fromkeys(post_id_to_url.get(pid, "") for pid in unique_post_ids if post_id_to_url.get(pid)))
     unique_accounts  = list(dict.fromkeys(post_id_to_handle.get(pid, "") for pid in unique_post_ids if post_id_to_handle.get(pid)))
     posts_without_url = [pid for pid in unique_post_ids if not post_id_to_url.get(pid)]
 
-    # ── Detailed preview ──────────────────────────────────────────────────
-    print(f"\n{'─'*65}")
-    print(f"📋 PREVIEW — exact rows that will be deleted from All_Events")
-    print(f"{'─'*65}")
-    print(f"{'Sheet Row':<12} {'Post ID':<25} {'Date':<12} {'Event Name':<35} Post URL")
-    print(f"{'─'*65}")
-    for r in rows_to_delete:
-        event_display = (r["event_name"][:33] + "..") if len(r["event_name"]) > 35 else r["event_name"]
-        pid_display   = (r["post_id"][:23]   + "..") if len(r["post_id"])   > 25 else r["post_id"]
-        print(f"  row {r['sheet_row']:<7} {pid_display:<25} {r['date']:<12} {event_display:<35} {r['post_url']}")
-    print(f"{'─'*65}")
+    if not resuming:
+        # ── Detailed preview ──────────────────────────────────────────────────
+        print(f"\n{'─'*65}")
+        print(f"📋 PREVIEW — exact rows that will be deleted from All_Events")
+        print(f"{'─'*65}")
+        print(f"{'Sheet Row':<12} {'Post ID':<25} {'Date':<12} {'Event Name':<35} Post URL")
+        print(f"{'─'*65}")
+        for r in rows_to_delete:
+            event_display = (r["event_name"][:33] + "..") if len(r["event_name"]) > 35 else r["event_name"]
+            pid_display   = (r["post_id"][:23]   + "..") if len(r["post_id"])   > 25 else r["post_id"]
+            print(f"  row {r['sheet_row']:<7} {pid_display:<25} {r['date']:<12} {event_display:<35} {r['post_url']}")
+        print(f"{'─'*65}")
     print(f"\n  Summary:")
-    print(f"   • Total rows to delete from All_Events: {len(rows_to_delete)}")
+    if not resuming:
+        print(f"   • Total rows to delete from All_Events: {len(rows_to_delete)}")
     print(f"   • Unique post IDs:                      {len(unique_post_ids)}")
     print(f"   • Unique post URLs to re-scrape:        {len(unique_post_urls)}")
     print(f"   • Accounts affected:                    {len(unique_accounts)}")
@@ -436,7 +539,7 @@ def main():
             print(f"    ... and {len(posts_without_url) - 10} more")
 
     # ── Confirm ───────────────────────────────────────────────────────────
-    if not args.confirm:
+    if not args.confirm and not resuming:
         print("\n⚠ This will DELETE the rows above from All_Events and Processed_Log,")
         print("  then re-scrape each post fresh from Apify and re-run the full pipeline.")
         print("  Originals are backed up to Reprocess_Backup before anything is deleted.")
@@ -449,13 +552,14 @@ def main():
             print("Aborted.")
             sys.exit(0)
 
-    # ── Step 1: Backup ────────────────────────────────────────────────────
-    print("\n💾 Step 1 — Backing up affected rows to Reprocess_Backup...")
-    backup_rows(spreadsheet, header, rows_to_delete)
+    if not resuming:
+        # ── Step 1: Backup ────────────────────────────────────────────────────
+        print("\n💾 Step 1 — Backing up affected rows to Reprocess_Backup...")
+        backup_rows(spreadsheet, header, rows_to_delete)
 
-    # ── Step 2: Delete from All_Events ───────────────────────────────────
-    print("\n🗑  Step 2 — Deleting rows from All_Events (post-ID based)...")
-    delete_from_all_events(spreadsheet, rows_to_delete)
+        # ── Step 2: Delete from All_Events ───────────────────────────────────
+        print("\n🗑  Step 2 — Deleting rows from All_Events (post-ID based)...")
+        delete_from_all_events(spreadsheet, rows_to_delete)
 
     # ── Step 3: Unlock Processed_Log ─────────────────────────────────────
     print("\n🔓 Step 3 — Unlocking post IDs in Processed_Log...")

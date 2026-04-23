@@ -22,6 +22,10 @@ args = "Event Pipeline"
 task = "workflow.run"
 args = "History Migration"
 
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Reprocess Weekends"
+
 [[workflows.workflow]]
 name = "Event Pipeline"
 author = "agent"
@@ -44,6 +48,17 @@ outputType = "console"
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = "python migrate_history.py"
+
+[[workflows.workflow]]
+name = "Reprocess Weekends"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python reprocess_weekends.py --confirm"
+
+[workflows.workflow.metadata]
+outputType = "console"
 
 [userenv]
 
