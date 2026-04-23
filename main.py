@@ -24,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+import recurring_accounts
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%I:%M:%S %p')
 logger = logging.getLogger(__name__)
@@ -805,6 +806,11 @@ class InstagramEventPipeline:
                 print(f"✓ Uploaded {len(events)} events to Google Sheets")
             except Exception as e:
                 print(f"⚠ Sheets Upload Error: {e}")
+
+        try:
+            recurring_accounts.refresh(self.main_sheet)
+        except Exception as e:
+            print(f"⚠ Reliable Accounts refresh failed: {e}")
 
     def start_scheduler(self):
         target_day = CONF["schedule_day"]

@@ -21,6 +21,7 @@ Python-based pipeline that extracts event information from Instagram posts using
 - Google Sheets history tracking (Processed_Log tab) to skip duplicates
 - Scheduled weekly runs via config.json
 - Verbose logging: OCR status, event details, calendar detection, stats
+- Reliable Accounts detection: scores accounts on recurring event signals, writes Reliable_Accounts tab to Google Sheets after each run
 
 ## Project Structure
 ```
@@ -30,6 +31,7 @@ Python-based pipeline that extracts event information from Instagram posts using
 ├── original.py                                      # Original entry point (reference)
 ├── config.json                                      # Schedule, model, workers config
 ├── migrate_history.py                               # One-time history migration script
+├── recurring_accounts.py                            # Reliable Accounts detection + Sheets sync
 ├── apt-mark-468506-u9-ec44cabc7335 copy.json       # Google service account
 ├── pyproject.toml                                   # Python dependencies
 ├── outputs/                                         # Generated output files
@@ -83,7 +85,8 @@ Pipeline generates:
 - `Events_YYYYMMDD_HHMMSS.csv` - Event data in CSV format
 - `Events_YYYYMMDD_HHMMSS.xlsx` - Event data in Excel format
 - `stats_YYYYMMDD_HHMMSS.json` - Processing statistics
-- Google Sheets: All_Events tab + Processed_Log tab
+- Google Sheets: All_Events tab + Processed_Log tab + Reliable_Accounts tab
+- `outputs/reliable_accounts.csv` - Recurring/reliable accounts watchlist
 
 ## Recent Changes
 - **2026-03-12**: Added run_now toggle to config.json for triggering immediate runs without Shell commands
