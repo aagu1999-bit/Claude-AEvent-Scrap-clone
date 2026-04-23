@@ -208,10 +208,24 @@ class InstagramEventPipeline:
                 header = all_rows[0] if all_rows else []
                 data_rows = all_rows[1:] if len(all_rows) > 1 else []
 
-                if "Result" not in header:
-                    new_header = header + ["Result"] if header else ["Post ID", "Date Processed", "Source", "Notes", "Result"]
-                    self.log_worksheet.update([new_header], value_input_option='RAW')
-                    print("✓ Added 'Result' column to Processed_Log header")
+                updated_header = list(header)
+                needs_update = False
+                if "Result" not in updated_header:
+                    updated_header.append("Result")
+                    needs_update = True
+                if "Post Date" not in updated_header:
+                    updated_header.append("Post Date")
+                    needs_update = True
+                if not updated_header:
+                    updated_header = ["Post ID", "Date Processed", "Source", "Notes", "Result", "Post Date"]
+                    needs_update = True
+                if needs_update:
+                    self.log_worksheet.update([updated_header], value_input_option='RAW')
+                    print(f"✓ Updated Processed_Log header: {updated_header}")
+
+                result_col = updated_header.index("Result") if "Result" in updated_header else None
+                post_date_col = updated_header.index("Post Date") if "Post Date" in updated_header else None
+                date_processed_col = updated_header.index("Date Processed") if "Date Processed" in updated_header else 1
 
                 max_age_days = int(CONF.get("history_max_age_days", 30))
                 cutoff = (datetime.now() - timedelta(days=max_age_days)).date()
@@ -225,13 +239,21 @@ class InstagramEventPipeline:
                     pid = row[0].strip() if row else ''
                     if not pid:
                         continue
-                    date_str = row[1].strip() if len(row) > 1 else ''
-                    result_tag = row[-1].strip().lower() if len(row) >= 5 else ''
+
+                    result_tag = ''
+                    if result_col is not None and len(row) > result_col:
+                        result_tag = row[result_col].strip().lower()
+
+                    post_date_str_row = ''
+                    if post_date_col is not None and len(row) > post_date_col:
+                        post_date_str_row = row[post_date_col].strip()
+                    if not post_date_str_row and len(row) > date_processed_col:
+                        post_date_str_row = row[date_processed_col].strip()
 
                     row_date = None
-                    if date_str:
+                    if post_date_str_row:
                         try:
-                            row_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+                            row_date = datetime.strptime(post_date_str_row, '%Y-%m-%d').date()
                         except ValueError:
                             pass
 
@@ -249,8 +271,8 @@ class InstagramEventPipeline:
 
                 print(f"✓ History Loaded: Skipping {skip_count} IDs, {retry_count} eligible for retry (ocr_failed/gemini_error).")
             except gspread.WorksheetNotFound:
-                self.log_worksheet = self.main_sheet.add_worksheet("Processed_Log", 5000, 5)
-                self.log_worksheet.append_row(["Post ID", "Date Processed", "Source", "Notes", "Result"])
+                self.log_worksheet = self.main_sheet.add_worksheet("Processed_Log", 5000, 6)
+                self.log_worksheet.append_row(["Post ID", "Date Processed", "Source", "Notes", "Result", "Post Date"])
                 print("✓ Created new 'Processed_Log' tab.")
 
         except Exception as e:
@@ -400,6 +422,19 @@ class InstagramEventPipeline:
         display_url = post.get('displayUrl', '') or post.get('display_url', '')
         location_name = post.get('locationName', '') or post.get('location', '')
 
+        timestamp_val = post.get('timestamp', '')
+        try:
+            if timestamp_val:
+                if isinstance(timestamp_val, (int, float)):
+                    post_date = datetime.fromtimestamp(timestamp_val)
+                else:
+                    post_date = datetime.fromisoformat(str(timestamp_val).replace('Z', '+00:00'))
+            else:
+                post_date = datetime.now()
+        except Exception:
+            post_date = datetime.now()
+        post_date_str = post_date.strftime('%Y-%m-%d')
+
         print(f"\n[{post_num}/{total}] Processing post: {pid}")
         print(f"  ↳ Account: @{user} ({owner_full_name})")
 
@@ -407,7 +442,7 @@ class InstagramEventPipeline:
             print(f"  ⚠ No caption or image URL - skipping")
             with self.lock:
                 self.processed_posts.add(pid)
-                self.post_results[pid] = 'no_events_found'
+                self.post_results[pid] = {'result': 'no_events_found', 'post_date': post_date_str}
                 self.stats['processed'] += 1
                 self.stats['skipped_no_data'] += 1
             return None
@@ -463,18 +498,6 @@ class InstagramEventPipeline:
             print(f"  📅 Possible calendar/multi-event post detected")
 
         time.sleep(self.rate_limit_delay)
-
-        timestamp_val = post.get('timestamp', '')
-        try:
-            if timestamp_val:
-                if isinstance(timestamp_val, (int, float)):
-                    post_date = datetime.fromtimestamp(timestamp_val)
-                else:
-                    post_date = datetime.fromisoformat(str(timestamp_val).replace('Z', '+00:00'))
-            else:
-                post_date = datetime.now()
-        except Exception:
-            post_date = datetime.now()
 
         print(f"  ↳ Analyzing with Gemini AI (checking for multiple events)...")
 
@@ -545,7 +568,7 @@ class InstagramEventPipeline:
                 print(f"  ✗ Gemini returned empty response")
                 with self.lock:
                     self.processed_posts.add(pid)
-                    self.post_results[pid] = 'gemini_error'
+                    self.post_results[pid] = {'result': 'gemini_error', 'post_date': post_date_str}
                     self.stats['gemini_errors'] += 1
                     self.stats['processed'] += 1
                 return None
@@ -556,7 +579,7 @@ class InstagramEventPipeline:
                 print(f"  ✗ Gemini response error: {e}")
                 with self.lock:
                     self.processed_posts.add(pid)
-                    self.post_results[pid] = 'gemini_error'
+                    self.post_results[pid] = {'result': 'gemini_error', 'post_date': post_date_str}
                     self.stats['gemini_errors'] += 1
                     self.stats['processed'] += 1
                 return None
@@ -574,7 +597,7 @@ class InstagramEventPipeline:
                         print(f"  ✗ Could not parse Gemini JSON response")
                         with self.lock:
                             self.processed_posts.add(pid)
-                            self.post_results[pid] = 'gemini_error'
+                            self.post_results[pid] = {'result': 'gemini_error', 'post_date': post_date_str}
                             self.stats['gemini_errors'] += 1
                             self.stats['processed'] += 1
                         return None
@@ -582,7 +605,7 @@ class InstagramEventPipeline:
                     print(f"  ✗ No valid JSON in Gemini response")
                     with self.lock:
                         self.processed_posts.add(pid)
-                        self.post_results[pid] = 'gemini_error'
+                        self.post_results[pid] = {'result': 'gemini_error', 'post_date': post_date_str}
                         self.stats['gemini_errors'] += 1
                         self.stats['processed'] += 1
                     return None
@@ -595,7 +618,7 @@ class InstagramEventPipeline:
                 result_tag = 'ocr_failed' if ocr_attempted_and_failed else 'no_events_found'
                 with self.lock:
                     self.processed_posts.add(pid)
-                    self.post_results[pid] = result_tag
+                    self.post_results[pid] = {'result': result_tag, 'post_date': post_date_str}
                     self.stats['processed'] += 1
                     self.stats['posts_no_events'] += 1
                 return None
@@ -620,7 +643,8 @@ class InstagramEventPipeline:
 
             with self.lock:
                 self.processed_posts.add(pid)
-                self.post_results[pid] = 'events_found' if processed_events else 'no_events_found'
+                _result_tag = 'events_found' if processed_events else 'no_events_found'
+                self.post_results[pid] = {'result': _result_tag, 'post_date': post_date_str}
                 self.stats['processed'] += 1
                 if processed_events:
                     self.stats['posts_with_events'] += 1
@@ -669,7 +693,7 @@ class InstagramEventPipeline:
             with self.lock:
                 self.stats['gemini_errors'] += 1
                 self.processed_posts.add(pid)
-                self.post_results[pid] = 'gemini_error'
+                self.post_results[pid] = {'result': 'gemini_error', 'post_date': post_date_str}
                 self.stats['processed'] += 1
             if '429' in error_str:
                 with self.lock:
@@ -690,6 +714,7 @@ class InstagramEventPipeline:
             pass
 
     def run_pipeline(self, posts):
+        self.post_results = {}
         total = len(posts)
         self.stats['total_posts'] = total
 
@@ -789,7 +814,7 @@ class InstagramEventPipeline:
 
         if self.post_results:
             from collections import Counter
-            tag_counts = Counter(self.post_results.values())
+            tag_counts = Counter(info.get('result', '') for info in self.post_results.values())
             print(f"\n🏷  RESULT TAG BREAKDOWN:")
             print(f"  • events_found:    {tag_counts.get('events_found', 0)}")
             print(f"  • no_events_found: {tag_counts.get('no_events_found', 0)}")
@@ -799,14 +824,17 @@ class InstagramEventPipeline:
     def save_data(self, events, post_log):
         if post_log and self.sheets_client and self.log_worksheet:
             try:
+                date_processed = str(datetime.now().date())
                 log_rows = [
-                    [pid, str(datetime.now().date()), "Auto-Bot", "", result]
-                    for pid, result in post_log.items()
+                    [pid, date_processed, "Auto-Bot", "",
+                     info.get('result', ''), info.get('post_date', '')]
+                    for pid, info in post_log.items()
                 ]
                 self.log_worksheet.append_rows(log_rows)
                 tag_counts = {}
-                for result in post_log.values():
-                    tag_counts[result] = tag_counts.get(result, 0) + 1
+                for info in post_log.values():
+                    tag = info.get('result', '')
+                    tag_counts[tag] = tag_counts.get(tag, 0) + 1
                 summary = ', '.join(f"{v} {k}" for k, v in sorted(tag_counts.items()))
                 print(f"✓ Logged {len(post_log)} post IDs to Processed_Log ({summary})")
             except Exception as e:
