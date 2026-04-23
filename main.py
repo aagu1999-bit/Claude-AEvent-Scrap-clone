@@ -208,13 +208,16 @@ class InstagramEventPipeline:
                 header = all_rows[0] if all_rows else []
                 data_rows = all_rows[1:] if len(all_rows) > 1 else []
 
-                default_header = ["Post ID", "Date Processed", "Source", "Notes", "Result", "Post Date"]
+                default_header = ["Post ID", "Account", "Date Processed", "Source", "Notes", "Result", "Post Date"]
                 updated_header = list(header)
                 needs_update = False
                 if not updated_header or "Post ID" not in updated_header:
                     updated_header = default_header
                     needs_update = True
                 else:
+                    if "Account" not in updated_header:
+                        updated_header.insert(1, "Account")
+                        needs_update = True
                     if "Result" not in updated_header:
                         updated_header.append("Result")
                         needs_update = True
@@ -225,9 +228,10 @@ class InstagramEventPipeline:
                     self.log_worksheet.update([updated_header], value_input_option='RAW')
                     print(f"✓ Updated Processed_Log header: {updated_header}")
 
-                result_col = updated_header.index("Result") if "Result" in updated_header else None
-                post_date_col = updated_header.index("Post Date") if "Post Date" in updated_header else None
-                date_processed_col = updated_header.index("Date Processed") if "Date Processed" in updated_header else 1
+                read_header = header if header else updated_header
+                result_col = read_header.index("Result") if "Result" in read_header else None
+                post_date_col = read_header.index("Post Date") if "Post Date" in read_header else None
+                date_processed_col = read_header.index("Date Processed") if "Date Processed" in read_header else 1
 
                 max_age_days = int(CONF.get("history_max_age_days", 30))
                 cutoff = (datetime.now() - timedelta(days=max_age_days)).date()
@@ -273,8 +277,8 @@ class InstagramEventPipeline:
 
                 print(f"✓ History Loaded: Skipping {skip_count} IDs, {retry_count} eligible for retry (ocr_failed/gemini_error).")
             except gspread.WorksheetNotFound:
-                self.log_worksheet = self.main_sheet.add_worksheet("Processed_Log", 5000, 6)
-                self.log_worksheet.append_row(["Post ID", "Date Processed", "Source", "Notes", "Result", "Post Date"])
+                self.log_worksheet = self.main_sheet.add_worksheet("Processed_Log", 5000, 7)
+                self.log_worksheet.append_row(["Post ID", "Account", "Date Processed", "Source", "Notes", "Result", "Post Date"])
                 print("✓ Created new 'Processed_Log' tab.")
 
         except Exception as e:
@@ -444,7 +448,7 @@ class InstagramEventPipeline:
             print(f"  ⚠ No caption or image URL - skipping")
             with self.lock:
                 self.processed_posts.add(pid)
-                self.post_results[pid] = {'result': 'no_events_found', 'post_date': post_date_str}
+                self.post_results[pid] = {'result': 'no_events_found', 'account': user, 'post_date': post_date_str}
                 self.stats['processed'] += 1
                 self.stats['skipped_no_data'] += 1
             return None
@@ -570,7 +574,7 @@ class InstagramEventPipeline:
                 print(f"  ✗ Gemini returned empty response")
                 with self.lock:
                     self.processed_posts.add(pid)
-                    self.post_results[pid] = {'result': 'gemini_error', 'post_date': post_date_str}
+                    self.post_results[pid] = {'result': 'gemini_error', 'account': user, 'post_date': post_date_str}
                     self.stats['gemini_errors'] += 1
                     self.stats['processed'] += 1
                 return None
@@ -581,7 +585,7 @@ class InstagramEventPipeline:
                 print(f"  ✗ Gemini response error: {e}")
                 with self.lock:
                     self.processed_posts.add(pid)
-                    self.post_results[pid] = {'result': 'gemini_error', 'post_date': post_date_str}
+                    self.post_results[pid] = {'result': 'gemini_error', 'account': user, 'post_date': post_date_str}
                     self.stats['gemini_errors'] += 1
                     self.stats['processed'] += 1
                 return None
@@ -599,7 +603,7 @@ class InstagramEventPipeline:
                         print(f"  ✗ Could not parse Gemini JSON response")
                         with self.lock:
                             self.processed_posts.add(pid)
-                            self.post_results[pid] = {'result': 'gemini_error', 'post_date': post_date_str}
+                            self.post_results[pid] = {'result': 'gemini_error', 'account': user, 'post_date': post_date_str}
                             self.stats['gemini_errors'] += 1
                             self.stats['processed'] += 1
                         return None
@@ -607,7 +611,7 @@ class InstagramEventPipeline:
                     print(f"  ✗ No valid JSON in Gemini response")
                     with self.lock:
                         self.processed_posts.add(pid)
-                        self.post_results[pid] = {'result': 'gemini_error', 'post_date': post_date_str}
+                        self.post_results[pid] = {'result': 'gemini_error', 'account': user, 'post_date': post_date_str}
                         self.stats['gemini_errors'] += 1
                         self.stats['processed'] += 1
                     return None
@@ -620,7 +624,7 @@ class InstagramEventPipeline:
                 result_tag = 'ocr_failed' if ocr_attempted_and_failed else 'no_events_found'
                 with self.lock:
                     self.processed_posts.add(pid)
-                    self.post_results[pid] = {'result': result_tag, 'post_date': post_date_str}
+                    self.post_results[pid] = {'result': result_tag, 'account': user, 'post_date': post_date_str}
                     self.stats['processed'] += 1
                     self.stats['posts_no_events'] += 1
                 return None
@@ -646,7 +650,7 @@ class InstagramEventPipeline:
             with self.lock:
                 self.processed_posts.add(pid)
                 _result_tag = 'events_found' if processed_events else 'no_events_found'
-                self.post_results[pid] = {'result': _result_tag, 'post_date': post_date_str}
+                self.post_results[pid] = {'result': _result_tag, 'account': user, 'post_date': post_date_str}
                 self.stats['processed'] += 1
                 if processed_events:
                     self.stats['posts_with_events'] += 1
@@ -695,7 +699,7 @@ class InstagramEventPipeline:
             with self.lock:
                 self.stats['gemini_errors'] += 1
                 self.processed_posts.add(pid)
-                self.post_results[pid] = {'result': 'gemini_error', 'post_date': post_date_str}
+                self.post_results[pid] = {'result': 'gemini_error', 'account': user, 'post_date': post_date_str}
                 self.stats['processed'] += 1
             if '429' in error_str:
                 with self.lock:
@@ -828,7 +832,7 @@ class InstagramEventPipeline:
             try:
                 date_processed = str(datetime.now().date())
                 log_rows = [
-                    [pid, date_processed, "Auto-Bot", "",
+                    [pid, info.get('account', ''), date_processed, "Auto-Bot", "",
                      info.get('result', ''), info.get('post_date', '')]
                     for pid, info in post_log.items()
                 ]
