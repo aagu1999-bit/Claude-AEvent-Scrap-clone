@@ -208,17 +208,19 @@ class InstagramEventPipeline:
                 header = all_rows[0] if all_rows else []
                 data_rows = all_rows[1:] if len(all_rows) > 1 else []
 
+                default_header = ["Post ID", "Date Processed", "Source", "Notes", "Result", "Post Date"]
                 updated_header = list(header)
                 needs_update = False
-                if "Result" not in updated_header:
-                    updated_header.append("Result")
+                if not updated_header or "Post ID" not in updated_header:
+                    updated_header = default_header
                     needs_update = True
-                if "Post Date" not in updated_header:
-                    updated_header.append("Post Date")
-                    needs_update = True
-                if not updated_header:
-                    updated_header = ["Post ID", "Date Processed", "Source", "Notes", "Result", "Post Date"]
-                    needs_update = True
+                else:
+                    if "Result" not in updated_header:
+                        updated_header.append("Result")
+                        needs_update = True
+                    if "Post Date" not in updated_header:
+                        updated_header.append("Post Date")
+                        needs_update = True
                 if needs_update:
                     self.log_worksheet.update([updated_header], value_input_option='RAW')
                     print(f"✓ Updated Processed_Log header: {updated_header}")
