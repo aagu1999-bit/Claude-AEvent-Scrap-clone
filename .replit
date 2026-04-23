@@ -48,3 +48,7 @@ args = "python migrate_history.py"
 [userenv]
 
 [userenv.shared]
+
+[postMerge]
+path = "scripts/post-merge.sh"
+timeoutMs = 60000
