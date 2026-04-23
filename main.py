@@ -233,6 +233,10 @@ class InstagramEventPipeline:
                 post_date_col = read_header.index("Post Date") if "Post Date" in read_header else None
                 date_processed_col = read_header.index("Date Processed") if "Date Processed" in read_header else 1
 
+                _DATE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+                acct_in_col1 = "Account" in updated_header and updated_header.index("Account") == 1
+                OLD_RESULT_COL, OLD_POST_DATE_COL, OLD_DATE_PROCESSED_COL = 4, 5, 1
+
                 max_age_days = int(CONF.get("history_max_age_days", 30))
                 cutoff = (datetime.now() - timedelta(days=max_age_days)).date()
 
@@ -246,15 +250,24 @@ class InstagramEventPipeline:
                     if not pid:
                         continue
 
+                    is_old_row = (
+                        acct_in_col1
+                        and len(row) > 1
+                        and _DATE_RE.match(row[1].strip())
+                    )
+                    _rcol = OLD_RESULT_COL if is_old_row else result_col
+                    _pdcol = OLD_POST_DATE_COL if is_old_row else post_date_col
+                    _dpcol = OLD_DATE_PROCESSED_COL if is_old_row else date_processed_col
+
                     result_tag = ''
-                    if result_col is not None and len(row) > result_col:
-                        result_tag = row[result_col].strip().lower()
+                    if _rcol is not None and len(row) > _rcol:
+                        result_tag = row[_rcol].strip().lower()
 
                     post_date_str_row = ''
-                    if post_date_col is not None and len(row) > post_date_col:
-                        post_date_str_row = row[post_date_col].strip()
-                    if not post_date_str_row and len(row) > date_processed_col:
-                        post_date_str_row = row[date_processed_col].strip()
+                    if _pdcol is not None and len(row) > _pdcol:
+                        post_date_str_row = row[_pdcol].strip()
+                    if not post_date_str_row and len(row) > _dpcol:
+                        post_date_str_row = row[_dpcol].strip()
 
                     row_date = None
                     if post_date_str_row:
