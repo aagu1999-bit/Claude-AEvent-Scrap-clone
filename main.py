@@ -955,14 +955,21 @@ class InstagramEventPipeline:
                 print(f"\n🚀 STARTING RUN: {now}")
 
                 try:
-                    url = CONF["instagram_data_url"]
-                    if url:
-                        response = requests.get(url, timeout=120)
-                        response.raise_for_status()
-                        raw_posts = response.json()
-                    else:
-                        print("⚠ No instagram_data_url in config.")
-                        raw_posts = []
+                    # Try live Apify scrape first; fall back to static URL if disabled or failed
+                    raw_posts = []
+                    if CONF.get("apify_enabled", True):
+                        raw_posts = fetch_posts_via_apify()
+
+                    if not raw_posts:
+                        url = CONF.get("instagram_data_url", "")
+                        if url:
+                            print("  ↳ Using static instagram_data_url as data source")
+                            response = requests.get(url, timeout=120)
+                            response.raise_for_status()
+                            raw_posts = response.json()
+                        else:
+                            print("⚠ No posts fetched — Apify returned nothing and no instagram_data_url is set.")
+                            raw_posts = []
 
                     offset = CONF.get("post_offset", 0)
                     cap = CONF.get("max_posts", 0)
@@ -987,6 +994,104 @@ class InstagramEventPipeline:
             time.sleep(10)
 
 
+def fetch_posts_via_apify():
+    """
+    Triggers a live apify/instagram-post-scraper run using the account list in
+    accounts.json. Returns a list of raw post dicts on success, or [] on any
+    failure (missing file, empty list, API error, non-SUCCEEDED status) so the
+    caller can fall back to instagram_data_url.
+    """
+    apify_token = os.environ.get("APIFY_API_KEY", "").strip()
+    if not apify_token:
+        print("⚠ APIFY_API_KEY not set — skipping Apify fetch")
+        return []
+
+    accounts_path = Path("accounts.json")
+    if not accounts_path.exists():
+        print("⚠ accounts.json not found — skipping Apify fetch")
+        return []
+
+    try:
+        with open(accounts_path) as f:
+            usernames = json.load(f)
+    except Exception as e:
+        print(f"⚠ Failed to read accounts.json: {e}")
+        return []
+
+    if not usernames:
+        print("⚠ accounts.json is empty — skipping Apify fetch")
+        return []
+
+    newer_than_days = int(CONF.get("apify_newer_than_days", 7))
+    newer_than_date = (datetime.now() - timedelta(days=newer_than_days)).strftime("%Y-%m-%d")
+    results_limit   = int(CONF.get("apify_posts_per_profile", 9))
+
+    payload = {
+        "username":           usernames,
+        "resultsLimit":       results_limit,
+        "onlyPostsNewerThan": newer_than_date,
+        "skipPinnedPosts":    False,
+        "dataDetailLevel":    "detailedData",
+    }
+
+    print(f"\n📡 Fetching fresh posts via Apify (instagram-post-scraper)...")
+    print(f"  • Accounts:          {len(usernames)}")
+    print(f"  • Posts per profile: {results_limit}")
+    print(f"  • Newer than:        {newer_than_date}")
+
+    apify_base = "https://api.apify.com/v2"
+    actor      = "apify~instagram-post-scraper"
+
+    try:
+        run_resp = requests.post(
+            f"{apify_base}/acts/{actor}/runs",
+            params={"token": apify_token},
+            json=payload,
+            timeout=30,
+        )
+        if not run_resp.ok:
+            print(f"  ↳ Apify error {run_resp.status_code}: {run_resp.text[:300]}")
+            run_resp.raise_for_status()
+
+        run_data   = run_resp.json()["data"]
+        run_id     = run_data["id"]
+        dataset_id = run_data["defaultDatasetId"]
+        print(f"  ↳ Run ID:     {run_id}")
+        print(f"  ↳ Dataset ID: {dataset_id}")
+        print(f"  ↳ Waiting for run to finish (may take 20-40 min)...")
+
+        while True:
+            time.sleep(15)
+            poll = requests.get(
+                f"{apify_base}/actor-runs/{run_id}",
+                params={"token": apify_token},
+                timeout=30,
+            )
+            poll.raise_for_status()
+            status = poll.json()["data"]["status"]
+            print(f"    Status: {status}")
+            if status in ("SUCCEEDED", "FAILED", "TIMED-OUT", "ABORTED"):
+                break
+
+        if status != "SUCCEEDED":
+            print(f"  ↳ Run ended with status: {status} — falling back to static URL")
+            return []
+
+        dataset_resp = requests.get(
+            f"{apify_base}/datasets/{dataset_id}/items",
+            params={"token": apify_token, "format": "json", "clean": "false"},
+            timeout=120,
+        )
+        dataset_resp.raise_for_status()
+        posts = dataset_resp.json()
+        print(f"  ✓ Downloaded {len(posts)} fresh post(s) from Apify")
+        return posts
+
+    except Exception as e:
+        print(f"⚠ Apify fetch failed: {e} — falling back to static URL")
+        return []
+
+
 def reset_run_now():
     try:
         with open("config.json", "r") as f:
@@ -1002,23 +1107,34 @@ def reset_run_now():
 def do_force_run(bot):
     print("\n🚀 Force run initiated...\n")
     bot.setup_sheets()
-    url = CONF["instagram_data_url"]
-    if url:
-        response = requests.get(url, timeout=120)
-        response.raise_for_status()
-        data = response.json()
-        offset = CONF.get("post_offset", 0)
-        cap = CONF.get("max_posts", 0)
-        if offset:
-            data = data[offset:]
-            print(f"  • Post offset: skipping first {offset} posts")
-        if cap:
-            data = data[:cap]
-            print(f"  • Post cap: processing up to {cap} posts")
-        events, ids = bot.run_pipeline(data)
-        bot.save_data(events, ids)
-    else:
-        print("❌ No instagram_data_url configured.")
+
+    # Try live Apify scrape first; fall back to static URL if disabled or failed
+    data = []
+    if CONF.get("apify_enabled", True):
+        data = fetch_posts_via_apify()
+
+    if not data:
+        url = CONF.get("instagram_data_url", "")
+        if url:
+            print("  ↳ Using static instagram_data_url as data source")
+            response = requests.get(url, timeout=120)
+            response.raise_for_status()
+            data = response.json()
+        else:
+            print("❌ No posts fetched — Apify returned nothing and no instagram_data_url is set.")
+            return
+
+    offset = CONF.get("post_offset", 0)
+    cap    = CONF.get("max_posts", 0)
+    if offset:
+        data = data[offset:]
+        print(f"  • Post offset: skipping first {offset} posts")
+    if cap:
+        data = data[:cap]
+        print(f"  • Post cap: processing up to {cap} posts")
+
+    events, ids = bot.run_pipeline(data)
+    bot.save_data(events, ids)
 
 
 if __name__ == "__main__":
