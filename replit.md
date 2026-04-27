@@ -23,7 +23,8 @@ Python-based pipeline that extracts event information from Instagram posts using
 - Verbose logging: OCR status, event details, calendar detection, stats
 - Reliable Accounts detection: scores accounts on recurring event signals, writes Reliable_Accounts tab to Google Sheets after each run
 - Smart history: Processed_Log tags each post with result (events_found/no_events_found/ocr_failed/gemini_error); OCR/Gemini failures are retried on next run; posts older than `history_max_age_days` always skipped
-- **Live Apify scrape**: Weekly pipeline triggers a fresh `apify/instagram-post-scraper` run at startup using the account list in `accounts.json`; falls back to `instagram_data_url` if Apify is disabled or fails
+- **Live Apify scrape**: Weekly pipeline triggers a fresh `apify/instagram-post-scraper` run at startup using the account list from the "Accounts" tab in the Google Sheet (falls back to `accounts.json` if the tab is missing/empty, falls back to `instagram_data_url` if Apify is disabled or fails)
+- **Sheet-managed accounts**: Add/remove Instagram accounts directly in the "Accounts" tab of the Google Sheet — no file editing needed. On first run, the tab is auto-created and pre-loaded from `accounts.json`
 
 ## Project Structure
 ```
@@ -60,8 +61,14 @@ Python-based pipeline that extracts event information from Instagram posts using
 }
 ```
 
-### accounts.json
-Array of Instagram usernames (no `@`) to scrape each week. 901 accounts pre-loaded. Edit freely to add/remove accounts.
+### Accounts tab (Google Sheet) — primary source
+The "Accounts" tab in the `Instagram_Events_Master` Google Sheet is the primary list of Instagram usernames (no `@`) to scrape each week. Add or remove rows directly in the sheet.
+
+- **Header row**: `Username`
+- On the very first run, the tab is auto-created and pre-loaded from `accounts.json` (901 usernames)
+
+### accounts.json — fallback only
+Still present as a backward-compatible fallback if the sheet tab is unreachable. No longer needs to be edited directly.
 
 ### Required Secrets
 | Variable | Required | Description |
@@ -100,6 +107,11 @@ Pipeline generates:
 - `outputs/reliable_accounts.csv` - Recurring/reliable accounts watchlist
 
 ## Recent Changes
+- **2026-04-27**: Accounts list now managed from Google Sheet "Accounts" tab
+  - New `load_usernames_from_accounts_sheet()` function reads usernames from the "Accounts" tab
+  - On first run: tab is auto-created and pre-loaded with all 901 usernames from `accounts.json`
+  - `fetch_posts_via_apify()` now tries the Sheet first, falls back to `accounts.json` if tab missing/empty
+  - `accounts.json` kept as backward-compatible fallback only
 - **2026-04-27**: Live Apify scrape for weekly pipeline
   - Weekly pipeline now triggers a fresh `apify/instagram-post-scraper` run at startup
   - `accounts.json` added with 901 pre-loaded Instagram usernames

@@ -997,32 +997,101 @@ class InstagramEventPipeline:
             time.sleep(10)
 
 
+def load_usernames_from_accounts_sheet():
+    """
+    Reads Instagram usernames from the 'Accounts' tab of the Google Sheet.
+
+    On first run (tab missing), creates the tab and pre-loads it with the
+    usernames from accounts.json. Returns a list of username strings, or None
+    if the Sheets connection is unavailable or the tab is empty (so the caller
+    can fall back to accounts.json).
+    """
+    if not os.path.exists(SERVICE_ACCOUNT_FILE):
+        return None
+
+    try:
+        scope = [
+            'https://spreadsheets.google.com/feeds',
+            'https://www.googleapis.com/auth/drive',
+        ]
+        creds = ServiceAccountCredentials.from_json_keyfile_name(SERVICE_ACCOUNT_FILE, scope)
+        client = gspread.authorize(creds)
+        spreadsheet = client.open(CONF["sheet_name"])
+    except Exception as e:
+        print(f"⚠ Could not connect to Google Sheets for Accounts tab: {e}")
+        return None
+
+    try:
+        ws = spreadsheet.worksheet("Accounts")
+        print("✓ Found 'Accounts' tab in Google Sheet")
+    except gspread.WorksheetNotFound:
+        print("⚠ 'Accounts' tab not found — creating it and pre-loading from accounts.json")
+        accounts_path = Path("accounts.json")
+        seed_usernames = []
+        if accounts_path.exists():
+            try:
+                with open(accounts_path) as f:
+                    seed_usernames = json.load(f)
+            except Exception as e:
+                print(f"⚠ Could not read accounts.json for seeding: {e}")
+
+        ws = spreadsheet.add_worksheet(title="Accounts", rows=max(len(seed_usernames) + 10, 100), cols=1)
+        rows = [["Username"]] + [[u] for u in seed_usernames]
+        ws.update(rows, value_input_option="RAW")
+        print(f"✓ Created 'Accounts' tab and loaded {len(seed_usernames)} usernames")
+        return seed_usernames if seed_usernames else None
+
+    try:
+        all_values = ws.col_values(1)
+    except Exception as e:
+        print(f"⚠ Could not read 'Accounts' tab: {e}")
+        return None
+
+    if not all_values:
+        print("⚠ 'Accounts' tab is empty")
+        return None
+
+    if all_values[0].strip().lower() == "username":
+        all_values = all_values[1:]
+
+    usernames = [u.strip() for u in all_values if u.strip()]
+    if not usernames:
+        print("⚠ 'Accounts' tab has no usernames after header")
+        return None
+
+    print(f"✓ Loaded {len(usernames)} usernames from 'Accounts' tab")
+    return usernames
+
+
 def fetch_posts_via_apify():
     """
-    Triggers a live apify/instagram-post-scraper run using the account list in
-    accounts.json. Returns a list of raw post dicts on success, or [] on any
-    failure (missing file, empty list, API error, non-SUCCEEDED status) so the
-    caller can fall back to instagram_data_url.
+    Triggers a live apify/instagram-post-scraper run. Usernames are loaded from
+    the 'Accounts' tab of the Google Sheet; falls back to accounts.json if the
+    tab is missing or empty. Returns a list of raw post dicts on success, or []
+    on any failure so the caller can fall back to instagram_data_url.
     """
     apify_token = os.environ.get("APIFY_API_KEY", "").strip()
     if not apify_token:
         print("⚠ APIFY_API_KEY not set — skipping Apify fetch")
         return []
 
-    accounts_path = Path("accounts.json")
-    if not accounts_path.exists():
-        print("⚠ accounts.json not found — skipping Apify fetch")
-        return []
+    usernames = load_usernames_from_accounts_sheet()
 
-    try:
-        with open(accounts_path) as f:
-            usernames = json.load(f)
-    except Exception as e:
-        print(f"⚠ Failed to read accounts.json: {e}")
-        return []
+    if usernames is None:
+        print("⚠ Falling back to accounts.json for username list")
+        accounts_path = Path("accounts.json")
+        if not accounts_path.exists():
+            print("⚠ accounts.json not found — skipping Apify fetch")
+            return []
+        try:
+            with open(accounts_path) as f:
+                usernames = json.load(f)
+        except Exception as e:
+            print(f"⚠ Failed to read accounts.json: {e}")
+            return []
 
     if not usernames:
-        print("⚠ accounts.json is empty — skipping Apify fetch")
+        print("⚠ No usernames found in Accounts tab or accounts.json — skipping Apify fetch")
         return []
 
     newer_than_days = int(CONF.get("apify_newer_than_days", 7))
