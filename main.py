@@ -1060,6 +1060,17 @@ def load_usernames_from_accounts_sheet():
         return None
 
     print(f"✓ Loaded {len(usernames)} usernames from 'Accounts' tab")
+
+    accounts_path = Path("accounts.json")
+    try:
+        tmp_path = accounts_path.with_suffix(".json.tmp")
+        with open(tmp_path, "w") as f:
+            json.dump(usernames, f, indent=2)
+        tmp_path.replace(accounts_path)
+        print(f"✓ accounts.json updated with {len(usernames)} usernames from Sheet")
+    except Exception as e:
+        print(f"⚠ Could not update accounts.json: {e}")
+
     return usernames
 
 
