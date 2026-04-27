@@ -1062,14 +1062,35 @@ def load_usernames_from_accounts_sheet():
     print(f"✓ Loaded {len(usernames)} usernames from 'Accounts' tab")
 
     accounts_path = Path("accounts.json")
+    previous_usernames = []
+    if accounts_path.exists():
+        try:
+            with open(accounts_path) as f:
+                previous_usernames = json.load(f)
+        except Exception as e:
+            print(f"⚠ Could not read previous accounts.json for drift check: {e}")
+
+    write_succeeded = False
     try:
         tmp_path = accounts_path.with_suffix(".json.tmp")
         with open(tmp_path, "w") as f:
             json.dump(usernames, f, indent=2)
         tmp_path.replace(accounts_path)
+        write_succeeded = True
         print(f"✓ accounts.json updated with {len(usernames)} usernames from Sheet")
     except Exception as e:
         print(f"⚠ Could not update accounts.json: {e}")
+
+    if write_succeeded:
+        prev_set = set(previous_usernames)
+        new_set = set(usernames)
+        added = new_set - prev_set
+        removed = prev_set - new_set
+        if added or removed:
+            added_str = f"+{len(added)} added ({', '.join(sorted(added))})" if added else ""
+            removed_str = f"-{len(removed)} removed ({', '.join(sorted(removed))})" if removed else ""
+            delta_parts = [p for p in [added_str, removed_str] if p]
+            print(f"↕ accounts.json drift detected: {', '.join(delta_parts)}")
 
     return usernames
 
