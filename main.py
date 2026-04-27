@@ -51,6 +51,9 @@ def load_configuration():
         "max_workers": 10,
         "rate_limit_delay": 0.5,
         "history_max_age_days": 30,
+        "apify_enabled": True,
+        "apify_posts_per_profile": 9,
+        "apify_newer_than_days": 7,
     }
 
     if os.path.exists("config.json"):
