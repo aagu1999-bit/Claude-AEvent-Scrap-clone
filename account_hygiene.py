@@ -66,9 +66,9 @@ HEADER = [
     "notes",
 ]
 
-DEFAULT_LIMIT = 100            # max IG calls per invocation
+DEFAULT_LIMIT = 100            # max IG calls per invocation (when not --all)
 DEFAULT_STALE_DAYS = 7         # re-check a handle if last_checked older than this
-DEFAULT_DELAY_SEC = 2.0        # sleep between IG calls
+DEFAULT_DELAY_SEC = 4.0        # sleep between IG calls (4s = friendlier to cloud IPs like Replit)
 BACKOFF_THRESHOLD = 3          # consecutive 401/error before extended sleep
 BACKOFF_SLEEP_SEC = 60
 
@@ -223,13 +223,20 @@ def main():
     print(f"  Accounts in tab:        {len(accounts)}")
     print(f"  Prior hygiene records:  {len(prior)}")
 
-    limit = 0 if args.limit < 0 else args.limit
+    # --all overrides --limit (unlimited). Otherwise use --limit (0 = unlimited).
+    if args.all:
+        effective_limit = len(accounts)
+    elif args.limit <= 0:
+        effective_limit = len(accounts)
+    else:
+        effective_limit = args.limit
+
     to_check = pick_handles_to_check(
         accounts, prior, args.days_stale,
-        limit if limit > 0 else len(accounts),
+        effective_limit,
         force_all=args.all,
     )
-    print(f"  Will check this run:    {len(to_check)}  (mode: {'ALL' if args.all else f'stale > {args.days_stale}d'})")
+    print(f"  Will check this run:    {len(to_check)}  (mode: {'ALL' if args.all else f'stale > {args.days_stale}d, cap={args.limit}'})")
 
     if not to_check:
         print("\n  Nothing stale — exiting clean.")
