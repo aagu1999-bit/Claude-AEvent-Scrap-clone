@@ -925,6 +925,14 @@ class InstagramEventPipeline:
                     evt_sheet.append_row(df.columns.tolist())
 
                 def sanitize(val):
+                    # gspread serializes via JSON; NaN/Inf are not JSON-compliant
+                    # and cause the entire append to fail. Coerce them to empty string.
+                    if val is None:
+                        return ""
+                    if isinstance(val, float):
+                        import math
+                        if math.isnan(val) or math.isinf(val):
+                            return ""
                     if isinstance(val, list):
                         return ", ".join(str(v) for v in val)
                     if isinstance(val, dict):
