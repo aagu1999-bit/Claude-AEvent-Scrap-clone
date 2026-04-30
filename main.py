@@ -25,6 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import recurring_accounts
+import audit
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%I:%M:%S %p')
 logger = logging.getLogger(__name__)
@@ -956,6 +957,7 @@ class InstagramEventPipeline:
 
             if day == target_day and hm == target_time:
                 print(f"\n🚀 STARTING RUN: {now}")
+                run_started_at = now
 
                 try:
                     # Try live Apify scrape first; fall back to static URL if disabled or failed
@@ -985,6 +987,17 @@ class InstagramEventPipeline:
                     self.setup_sheets()
                     events, ids = self.run_pipeline(raw_posts)
                     self.save_data(events, ids)
+
+                    if self.main_sheet:
+                        try:
+                            audit.run_audit(
+                                spreadsheet=self.main_sheet,
+                                raw_posts=raw_posts,
+                                events_extracted=len(events),
+                                run_started_at=run_started_at,
+                            )
+                        except Exception as e:
+                            print(f"⚠ Audit failed (non-fatal): {e}")
 
                     print("✅ Run complete. Sleeping until next window...")
                     time.sleep(70)
@@ -1210,6 +1223,7 @@ def reset_run_now():
 
 def do_force_run(bot):
     print("\n🚀 Force run initiated...\n")
+    run_started_at = datetime.now()
     bot.setup_sheets()
 
     # Try live Apify scrape first; fall back to static URL if disabled or failed
@@ -1239,6 +1253,17 @@ def do_force_run(bot):
 
     events, ids = bot.run_pipeline(data)
     bot.save_data(events, ids)
+
+    if bot.main_sheet:
+        try:
+            audit.run_audit(
+                spreadsheet=bot.main_sheet,
+                raw_posts=data,
+                events_extracted=len(events),
+                run_started_at=run_started_at,
+            )
+        except Exception as e:
+            print(f"⚠ Audit failed (non-fatal): {e}")
 
 
 if __name__ == "__main__":
