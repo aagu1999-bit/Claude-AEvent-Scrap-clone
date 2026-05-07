@@ -1,0 +1,17 @@
+{
+  "total_posts": 2038,
+  "processed": 2038,
+  "events_found": 2124,
+  "posts_with_events": 1240,
+  "multi_event_posts": 321,
+  "max_events_in_post": 37,
+  "calendar_posts": 38,
+  "ocr_success": 0,
+  "ocr_failed": 2038,
+  "vision_errors": {
+    "Bad image data.": 586
+  },
+  "gemini_errors": 41,
+  "download_errors": 1452,
+  "parallel_workers": 3
+}

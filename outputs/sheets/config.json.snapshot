@@ -1,0 +1,16 @@
+{
+  "run_now": false,
+  "schedule_day": "Thursday",
+  "schedule_time": "20:16",
+  "apify_enabled": false,
+  "apify_posts_per_profile": 9,
+  "apify_newer_than_days": 10,
+  "instagram_data_url": "https://api.apify.com/v2/datasets/WqdAa2sd2LTESaEVc/items?format=json&omit=audioUrl%2CvideoViewCount%2CvideoPlayCount%2CvideoDuration%2Csponsors%2CrequestErrorMessages%2CproductType%2CpaidPartnership%2CmusicInfo%2Cmentions%2ClikesCount%2ClatestComments%2CisCommentsDisabled%2CerrorDescription%2Chashtags%2CcoauthorProducers%2CcommentsCount%2CdimensionsHeight%2CdimensionsWidth%2Cerror&clean=false",
+  "sheet_name": "Instagram_Events_Master",
+  "gemini_model": "gemini-2.5-flash-lite",
+  "max_workers": 10,
+  "rate_limit_delay": 1,
+  "post_offset": 0,
+  "max_posts": 0,
+  "history_max_age_days": 30
+}
