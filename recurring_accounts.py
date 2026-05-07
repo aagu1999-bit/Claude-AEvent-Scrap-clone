@@ -40,6 +40,23 @@ from oauth2client.service_account import ServiceAccountCredentials
 SERVICE_ACCOUNT_FILE = "apt-mark-468506-u9-ec44cabc7335 copy.json"
 OUTPUTS_DIR = Path("outputs")
 LOCAL_CSV = OUTPUTS_DIR / "reliable_accounts.csv"
+BLOCKLIST_FILE = Path("promotion_blocklist.json")
+
+
+def _load_promotion_blocklist():
+    """Read the persistent blocklist of handles that should never be proposed
+    for promotion. Survives across runs so you only have to reject a handle
+    once. Returns a lowercase set of handles (empty if file missing/malformed).
+    """
+    if not BLOCKLIST_FILE.exists():
+        return set()
+    try:
+        with open(BLOCKLIST_FILE) as f:
+            data = json.load(f)
+        return {h.strip().lower() for h in data.get("handles", []) if h.strip()}
+    except Exception as e:
+        print(f"⚠ Could not read {BLOCKLIST_FILE}: {e}")
+        return set()
 
 TAB_HEADERS = [
     "Account", "Display Name", "Example Series Names",
@@ -352,16 +369,20 @@ def _promote_to_active_accounts(
 
     ws, active = _read_active_accounts(main_sheet)
     active_lc = {h.lower() for h in active}
+    blocklist = _load_promotion_blocklist()
 
     cutoff = (datetime.now(timezone.utc).date() - timedelta(days=recency_days)
               if recency_days else None)
 
     promoted = []
-    skipped = {'already_active': 0, 'below_threshold': [], 'dormant': []}
+    skipped = {'already_active': 0, 'below_threshold': [], 'dormant': [], 'blocked': []}
 
     for _, row in result_df.iterrows():
         handle = str(row['Account']).strip().lower()
         if not handle:
+            continue
+        if handle in blocklist:
+            skipped['blocked'].append(handle)
             continue
         if handle in active_lc:
             skipped['already_active'] += 1
@@ -396,6 +417,7 @@ def _promote_to_active_accounts(
     else:
         print("  No accounts qualify for promotion.")
     print(f"  Skipped — already active:    {skipped['already_active']}")
+    print(f"  Skipped — blocklisted:       {len(skipped['blocked'])}")
     print(f"  Skipped — below threshold:   {len(skipped['below_threshold'])}")
     print(f"  Skipped — dormant >{recency_days}d:    {len(skipped['dormant'])}")
     if skipped['dormant'][:5]:

@@ -49,6 +49,7 @@ pipeline_checkpoint.pkl
 # Credentials (NEVER commit these)
 *.json
 !package.json
+!promotion_blocklist.json
 service-account*.json
 credentials*.json
 
