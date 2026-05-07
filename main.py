@@ -54,7 +54,7 @@ def load_configuration():
         "history_max_age_days": 30,
         "apify_enabled": True,
         "apify_posts_per_profile": 9,
-        "apify_newer_than_days": 7,
+        "apify_newer_than_days": 14,
     }
 
     if os.path.exists("config.json"):
