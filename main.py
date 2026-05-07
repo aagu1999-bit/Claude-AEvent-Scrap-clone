@@ -88,6 +88,35 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 SERVICE_ACCOUNT_FILE = "apt-mark-468506-u9-ec44cabc7335 copy.json"
 
 
+class _TeeOutput:
+    """Forward writes to multiple streams. Used to mirror stdout/stderr to a
+    per-run log file so post-mortem forensics can read what the run actually
+    printed without needing access to Replit's live console buffer."""
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, msg):
+        for s in self._streams:
+            try:
+                s.write(msg)
+                s.flush()
+            except Exception:
+                pass
+
+    def flush(self):
+        for s in self._streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        try:
+            return self._streams[0].isatty()
+        except Exception:
+            return False
+
+
 class InstagramEventPipeline:
     def __init__(self):
         self.processed_posts = set()
@@ -106,6 +135,9 @@ class InstagramEventPipeline:
         self.vision_enabled = False
         self.max_workers = CONF["max_workers"]
         self.rate_limit_delay = CONF["rate_limit_delay"]
+
+        self.run_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self._setup_run_log()
 
         self.stats = {
             'total_posts': 0,
@@ -145,7 +177,119 @@ class InstagramEventPipeline:
         self.setup_vision()
 
         atexit.register(self.emergency_save)
+        atexit.register(self._write_anomaly_summary)
         signal.signal(signal.SIGINT, self.handle_interrupt)
+
+    def _setup_run_log(self):
+        """Tee stdout/stderr to outputs/run_<run_id>.log so a full record of
+        what this run printed survives past the live shell session. Console
+        output is unaffected."""
+        try:
+            self._run_log_path = self.output_dir / f'run_{self.run_id}.log'
+            self._run_log_fh = open(self._run_log_path, 'w', buffering=1)
+            sys.stdout = _TeeOutput(sys.__stdout__, self._run_log_fh)
+            sys.stderr = _TeeOutput(sys.__stderr__, self._run_log_fh)
+        except Exception as e:
+            self._run_log_fh = None
+            print(f"⚠ Could not open run log file: {e}")
+
+    def _record_post_outcome(self, pid, result, user, post_date_str,
+                             caption='', ocr_text='', gemini_raw='', error=''):
+        """Single source of truth for marking a post processed and recording
+        what happened to it. For anomalous outcomes (anything except
+        events_found), captures preview text + reason so the post-run
+        anomaly file lets you audit silent misses without re-scraping."""
+        with self.lock:
+            self.processed_posts.add(pid)
+            entry = {
+                'result': result,
+                'account': user,
+                'post_date': post_date_str,
+            }
+            if result != 'events_found':
+                if caption:
+                    entry['caption_preview'] = str(caption)[:400]
+                if ocr_text:
+                    entry['ocr_preview'] = str(ocr_text)[:400]
+                if gemini_raw:
+                    entry['gemini_raw'] = str(gemini_raw)[:600]
+                if error:
+                    entry['error'] = str(error)[:300]
+                entry['post_url'] = f"https://www.instagram.com/p/{pid}/"
+            self.post_results[pid] = entry
+
+    def _write_anomaly_summary(self):
+        """Dump per-post outcomes for everything that did NOT produce events,
+        plus per-account scrape→extract counts. Runs at process exit (atexit)
+        so it captures the state even on crash or Ctrl-C. Filename mirrors
+        run_id so log/anomalies/raw-Apify files share a timestamp."""
+        try:
+            if not self.post_results:
+                return
+            out_path = self.output_dir / f'anomalies_{self.run_id}.json'
+            anomalies = {pid: r for pid, r in self.post_results.items()
+                         if r.get('result') != 'events_found'}
+            per_account = {}
+            for r in self.post_results.values():
+                acct = r.get('account', '')
+                bucket = per_account.setdefault(acct, {
+                    'scraped': 0, 'events_found': 0,
+                    'no_events_found': 0, 'gemini_error': 0, 'ocr_failed': 0,
+                })
+                bucket['scraped'] += 1
+                bucket[r.get('result', 'unknown')] = bucket.get(r.get('result', 'unknown'), 0) + 1
+            summary = {
+                'run_id': self.run_id,
+                'totals': {k: v for k, v in self.stats.items()
+                           if not isinstance(v, dict)},
+                'per_account': per_account,
+                'anomalies': anomalies,
+            }
+            with open(out_path, 'w') as f:
+                json.dump(summary, f, indent=2, default=str)
+            self._check_account_regressions(per_account)
+            sys.__stdout__.write(f"\n📋 Anomaly summary: {out_path} "
+                                 f"({len(anomalies)} anomalous posts logged)\n")
+        except Exception as e:
+            sys.__stdout__.write(f"\n⚠ Failed to write anomaly summary: {e}\n")
+
+    def _check_account_regressions(self, per_account):
+        """Compare this run's per-account event counts against the most recent
+        prior Events_*.csv. Flag any account that produced events in the
+        previous run but produced zero this run — common signal of a typo,
+        suspended account, or extraction regression."""
+        try:
+            import glob
+            prior = sorted(glob.glob(str(self.output_dir / 'Events_*.csv')))
+            prior = [p for p in prior if self.run_id not in os.path.basename(p)]
+            if not prior:
+                return
+            prev_counts = {}
+            with open(prior[-1], 'r', encoding='utf-8', errors='replace') as f:
+                import csv as _csv
+                rdr = _csv.DictReader(f)
+                handle_col = next((c for c in (rdr.fieldnames or [])
+                                   if c.lower().replace(' ', '_') == 'instagram_handle'), None)
+                if not handle_col:
+                    return
+                for row in rdr:
+                    h = (row.get(handle_col) or '').strip().lower()
+                    if h:
+                        prev_counts[h] = prev_counts.get(h, 0) + 1
+            regressions = []
+            for h, prev_n in prev_counts.items():
+                cur = per_account.get(h, {})
+                if prev_n >= 2 and cur.get('events_found', 0) == 0 and cur.get('scraped', 0) > 0:
+                    regressions.append((h, prev_n))
+            if regressions:
+                sys.__stdout__.write(f"\n⚠ POSSIBLE REGRESSIONS — accounts that produced "
+                                     f"events last run but zero events this run:\n")
+                for h, n in sorted(regressions, key=lambda x: -x[1])[:20]:
+                    sys.__stdout__.write(f"    {h:32s} (had {n} events last run)\n")
+                if len(regressions) > 20:
+                    sys.__stdout__.write(f"    ... and {len(regressions) - 20} more\n")
+        except Exception as e:
+            sys.__stdout__.write(f"⚠ Regression check failed: {e}\n")
 
     def handle_interrupt(self, signum, frame):
         print("\n\n⚠ INTERRUPT DETECTED - Saving all data...")
@@ -463,9 +607,9 @@ class InstagramEventPipeline:
 
         if not caption and not display_url:
             print(f"  ⚠ No caption or image URL - skipping")
+            self._record_post_outcome(pid, 'no_events_found', user, post_date_str,
+                                      error='no_caption_or_image_url')
             with self.lock:
-                self.processed_posts.add(pid)
-                self.post_results[pid] = {'result': 'no_events_found', 'account': user, 'post_date': post_date_str}
                 self.stats['processed'] += 1
                 self.stats['skipped_no_data'] += 1
             return None
@@ -589,9 +733,10 @@ class InstagramEventPipeline:
             resp = self.gemini_model.generate_content(prompt)
             if not resp:
                 print(f"  ✗ Gemini returned empty response")
+                self._record_post_outcome(pid, 'gemini_error', user, post_date_str,
+                                          caption=caption, ocr_text=ocr_text,
+                                          error='gemini_returned_none')
                 with self.lock:
-                    self.processed_posts.add(pid)
-                    self.post_results[pid] = {'result': 'gemini_error', 'account': user, 'post_date': post_date_str}
                     self.stats['gemini_errors'] += 1
                     self.stats['processed'] += 1
                 return None
@@ -600,9 +745,10 @@ class InstagramEventPipeline:
                 text = resp.text.strip()
             except (AttributeError, ValueError) as e:
                 print(f"  ✗ Gemini response error: {e}")
+                self._record_post_outcome(pid, 'gemini_error', user, post_date_str,
+                                          caption=caption, ocr_text=ocr_text,
+                                          error=f'response_text_access_failed: {e}')
                 with self.lock:
-                    self.processed_posts.add(pid)
-                    self.post_results[pid] = {'result': 'gemini_error', 'account': user, 'post_date': post_date_str}
                     self.stats['gemini_errors'] += 1
                     self.stats['processed'] += 1
                 return None
@@ -616,19 +762,23 @@ class InstagramEventPipeline:
                 if json_match:
                     try:
                         data = json.loads(json_match.group())
-                    except Exception:
+                    except Exception as parse_e:
                         print(f"  ✗ Could not parse Gemini JSON response")
+                        self._record_post_outcome(pid, 'gemini_error', user, post_date_str,
+                                                  caption=caption, ocr_text=ocr_text,
+                                                  gemini_raw=clean_json,
+                                                  error=f'json_parse_failed_after_regex: {parse_e}')
                         with self.lock:
-                            self.processed_posts.add(pid)
-                            self.post_results[pid] = {'result': 'gemini_error', 'account': user, 'post_date': post_date_str}
                             self.stats['gemini_errors'] += 1
                             self.stats['processed'] += 1
                         return None
                 else:
                     print(f"  ✗ No valid JSON in Gemini response")
+                    self._record_post_outcome(pid, 'gemini_error', user, post_date_str,
+                                              caption=caption, ocr_text=ocr_text,
+                                              gemini_raw=clean_json,
+                                              error='no_json_brace_in_response')
                     with self.lock:
-                        self.processed_posts.add(pid)
-                        self.post_results[pid] = {'result': 'gemini_error', 'account': user, 'post_date': post_date_str}
                         self.stats['gemini_errors'] += 1
                         self.stats['processed'] += 1
                     return None
@@ -639,9 +789,13 @@ class InstagramEventPipeline:
             if not events:
                 print(f"  ↳ No events found in this post")
                 result_tag = 'ocr_failed' if ocr_attempted_and_failed else 'no_events_found'
+                reason = ('gemini_returned_empty_events_after_failed_ocr' if ocr_attempted_and_failed
+                          else 'gemini_returned_empty_events_array')
+                self._record_post_outcome(pid, result_tag, user, post_date_str,
+                                          caption=caption, ocr_text=ocr_text,
+                                          gemini_raw=clean_json,
+                                          error=reason)
                 with self.lock:
-                    self.processed_posts.add(pid)
-                    self.post_results[pid] = {'result': result_tag, 'account': user, 'post_date': post_date_str}
                     self.stats['processed'] += 1
                     self.stats['posts_no_events'] += 1
                 return None
@@ -664,10 +818,15 @@ class InstagramEventPipeline:
                 e['from_calendar'] = is_calendar
                 processed_events.append(e)
 
+            _result_tag = 'events_found' if processed_events else 'no_events_found'
+            if processed_events:
+                self._record_post_outcome(pid, _result_tag, user, post_date_str)
+            else:
+                self._record_post_outcome(pid, _result_tag, user, post_date_str,
+                                          caption=caption, ocr_text=ocr_text,
+                                          gemini_raw=clean_json,
+                                          error='gemini_returned_events_but_all_filtered')
             with self.lock:
-                self.processed_posts.add(pid)
-                _result_tag = 'events_found' if processed_events else 'no_events_found'
-                self.post_results[pid] = {'result': _result_tag, 'account': user, 'post_date': post_date_str}
                 self.stats['processed'] += 1
                 if processed_events:
                     self.stats['posts_with_events'] += 1
@@ -713,10 +872,12 @@ class InstagramEventPipeline:
         except Exception as e:
             error_str = str(e)
             print(f"  ✗ Gemini error: {error_str[:200]}")
+            tb = traceback.format_exc()
+            self._record_post_outcome(pid, 'gemini_error', user, post_date_str,
+                                      caption=caption, ocr_text=ocr_text,
+                                      error=f'unhandled_exception: {error_str[:200]} | {tb.splitlines()[-1] if tb else ""}')
             with self.lock:
                 self.stats['gemini_errors'] += 1
-                self.processed_posts.add(pid)
-                self.post_results[pid] = {'result': 'gemini_error', 'account': user, 'post_date': post_date_str}
                 self.stats['processed'] += 1
             if '429' in error_str:
                 with self.lock:
@@ -1210,6 +1371,26 @@ def fetch_posts_via_apify():
         dataset_resp.raise_for_status()
         posts = dataset_resp.json()
         print(f"  ✓ Downloaded {len(posts)} fresh post(s) from Apify")
+
+        try:
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            raw_path = Path("outputs") / f'apify_raw_{ts}.json'
+            raw_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(raw_path, 'w') as _rf:
+                json.dump({
+                    'fetched_at': ts,
+                    'run_id': run_id,
+                    'dataset_id': dataset_id,
+                    'usernames_requested': usernames,
+                    'posts_per_profile_cap': results_limit,
+                    'newer_than': newer_than_date,
+                    'post_count': len(posts),
+                    'posts': posts,
+                }, _rf, default=str)
+            print(f"  💾 Raw Apify dump saved: {raw_path}")
+        except Exception as e:
+            print(f"  ⚠ Could not save raw Apify dump: {e}")
+
         return posts
 
     except Exception as e:
