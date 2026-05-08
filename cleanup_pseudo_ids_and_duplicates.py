@@ -101,7 +101,37 @@ CANONICAL_PROCESSED_LOG_HEADER = [
 BATCH_SIZE = 100
 BATCH_SLEEP_SEC = 1.5
 
+# Sheets API quota: 60 write requests per minute per user (free tier).
+# We use batch_update (1 call per batch of N rows) and pause between batches
+# to stay well under that. The earlier per-row approach was hitting the cap.
+INTER_BATCH_SLEEP = 1.5
+
 PASSES = ("events-dedup", "pseudo-id-delete", "column-shift")
+
+
+# ─────────────────────────── batched-write helpers ─────────────────────────
+
+
+def _batch_delete_rows(spreadsheet, ws, sheet_rows_desc):
+    """Delete multiple rows in a single API call via Sheets' deleteDimension.
+
+    sheet_rows_desc MUST be in descending order so earlier deletes don't
+    shift the indices of later deletes within the same batch."""
+    sheet_id = ws._properties["sheetId"]
+    requests = [
+        {
+            "deleteDimension": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "ROWS",
+                    "startIndex": r - 1,  # convert 1-based sheet_row to 0-based index
+                    "endIndex": r,
+                }
+            }
+        }
+        for r in sheet_rows_desc
+    ]
+    spreadsheet.batch_update({"requests": requests})
 
 
 # ─────────────────────────── connection ─────────────────────────
@@ -207,20 +237,26 @@ def events_dedup_pass(spreadsheet, dry_run: bool):
     print(f"    Rows to delete:         {len(rows_to_delete)}")
 
     if rows_to_delete and not dry_run:
-        # Delete in reverse order so earlier sheet_row numbers don't shift
         rows_to_delete.sort(reverse=True)
         deleted = 0
+        total_batches = (len(rows_to_delete) + BATCH_SIZE - 1) // BATCH_SIZE
         for batch_start in range(0, len(rows_to_delete), BATCH_SIZE):
             batch = rows_to_delete[batch_start:batch_start + BATCH_SIZE]
-            for sheet_row in batch:
+            try:
+                _batch_delete_rows(spreadsheet, ws, batch)
+                deleted += len(batch)
+                print(f"    ✓ Batch {batch_start // BATCH_SIZE + 1}/{total_batches} — deleted {deleted}/{len(rows_to_delete)}")
+            except Exception as e:
+                print(f"    ✗ Batch {batch_start // BATCH_SIZE + 1}/{total_batches} failed: {e}")
+                time.sleep(15)
                 try:
-                    ws.delete_rows(sheet_row)
-                    deleted += 1
-                except Exception as e:
-                    print(f"    ✗ Failed to delete sheet row {sheet_row}: {e}")
-            print(f"    ✓ Batch {batch_start // BATCH_SIZE + 1} — deleted {deleted}/{len(rows_to_delete)}")
+                    _batch_delete_rows(spreadsheet, ws, batch)
+                    deleted += len(batch)
+                    print(f"    ✓ Batch {batch_start // BATCH_SIZE + 1}/{total_batches} — succeeded on retry ({deleted}/{len(rows_to_delete)})")
+                except Exception as e2:
+                    print(f"    ✗ Batch {batch_start // BATCH_SIZE + 1}/{total_batches} retry also failed: {e2}")
             if batch_start + BATCH_SIZE < len(rows_to_delete):
-                time.sleep(BATCH_SLEEP_SEC)
+                time.sleep(INTER_BATCH_SLEEP)
         print(f"  ✓ events-dedup done: {deleted} rows deleted")
     elif rows_to_delete:
         print(f"  [dry-run] would delete {len(rows_to_delete)} rows")
@@ -317,17 +353,24 @@ def pseudo_id_delete_pass(spreadsheet, dry_run: bool):
     if rows_to_delete and not dry_run:
         rows_to_delete.sort(reverse=True)
         deleted = 0
+        total_batches = (len(rows_to_delete) + BATCH_SIZE - 1) // BATCH_SIZE
         for batch_start in range(0, len(rows_to_delete), BATCH_SIZE):
             batch = rows_to_delete[batch_start:batch_start + BATCH_SIZE]
-            for sheet_row in batch:
+            try:
+                _batch_delete_rows(spreadsheet, ws, batch)
+                deleted += len(batch)
+                print(f"    ✓ Batch {batch_start // BATCH_SIZE + 1}/{total_batches} — deleted {deleted}/{len(rows_to_delete)}")
+            except Exception as e:
+                print(f"    ✗ Batch {batch_start // BATCH_SIZE + 1}/{total_batches} failed: {e}")
+                time.sleep(15)
                 try:
-                    ws.delete_rows(sheet_row)
-                    deleted += 1
-                except Exception as e:
-                    print(f"    ✗ Failed to delete sheet row {sheet_row}: {e}")
-            print(f"    ✓ Batch {batch_start // BATCH_SIZE + 1} — deleted {deleted}/{len(rows_to_delete)}")
+                    _batch_delete_rows(spreadsheet, ws, batch)
+                    deleted += len(batch)
+                    print(f"    ✓ Batch {batch_start // BATCH_SIZE + 1}/{total_batches} — succeeded on retry ({deleted}/{len(rows_to_delete)})")
+                except Exception as e2:
+                    print(f"    ✗ Batch {batch_start // BATCH_SIZE + 1}/{total_batches} retry also failed: {e2}")
             if batch_start + BATCH_SIZE < len(rows_to_delete):
-                time.sleep(BATCH_SLEEP_SEC)
+                time.sleep(INTER_BATCH_SLEEP)
         print(f"  ✓ pseudo-id-delete done: {deleted} rows deleted")
     elif rows_to_delete:
         print(f"  [dry-run] would delete {len(rows_to_delete)} rows")
@@ -436,18 +479,32 @@ def column_shift_pass(spreadsheet, dry_run: bool):
 
         if rows_to_shift:
             shifted = 0
+            total_batches = (len(rows_to_shift) + BATCH_SIZE - 1) // BATCH_SIZE
             for batch_start in range(0, len(rows_to_shift), BATCH_SIZE):
                 batch = rows_to_shift[batch_start:batch_start + BATCH_SIZE]
-                # Use batch_update for efficiency: build cell-range updates
-                for sheet_row, new_row in batch:
+                # batch_update: send all N row-updates in ONE API call.
+                # Was previously N separate ws.update() calls per batch,
+                # which hit Sheets' 60-writes-per-minute quota.
+                payload = [
+                    {"range": f"A{sheet_row}:G{sheet_row}", "values": [new_row]}
+                    for sheet_row, new_row in batch
+                ]
+                try:
+                    ws.batch_update(payload, value_input_option="RAW")
+                    shifted += len(batch)
+                    print(f"    ✓ Batch {batch_start // BATCH_SIZE + 1}/{total_batches} — shifted {shifted}/{len(rows_to_shift)}")
+                except Exception as e:
+                    print(f"    ✗ Batch {batch_start // BATCH_SIZE + 1}/{total_batches} failed: {e}")
+                    # Retry once with a longer pause in case of transient quota
+                    time.sleep(15)
                     try:
-                        ws.update(f"A{sheet_row}:G{sheet_row}", [new_row], value_input_option="RAW")
-                        shifted += 1
-                    except Exception as e:
-                        print(f"    ✗ Failed to shift sheet row {sheet_row}: {e}")
-                print(f"    ✓ Batch {batch_start // BATCH_SIZE + 1} — shifted {shifted}/{len(rows_to_shift)}")
+                        ws.batch_update(payload, value_input_option="RAW")
+                        shifted += len(batch)
+                        print(f"    ✓ Batch {batch_start // BATCH_SIZE + 1}/{total_batches} — succeeded on retry ({shifted}/{len(rows_to_shift)})")
+                    except Exception as e2:
+                        print(f"    ✗ Batch {batch_start // BATCH_SIZE + 1}/{total_batches} retry also failed: {e2}")
                 if batch_start + BATCH_SIZE < len(rows_to_shift):
-                    time.sleep(BATCH_SLEEP_SEC)
+                    time.sleep(INTER_BATCH_SLEEP)
             print(f"  ✓ column-shift done: {shifted} rows shifted")
         else:
             print(f"  No rows needed shifting.")
