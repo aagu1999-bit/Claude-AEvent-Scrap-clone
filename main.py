@@ -218,6 +218,27 @@ class InstagramEventPipeline:
                 entry['post_url'] = f"https://www.instagram.com/p/{pid}/"
             self.post_results[pid] = entry
 
+    def _note_apify_shell_record(self, post, post_num):
+        """Track an Apify shell record (no id/shortCode = account returned no
+        posts). Aggregated for the per-run report and the anomaly summary.
+
+        Inferring the affected account is best-effort: shell records have
+        an empty ownerUsername but the inputUrl field usually points at
+        the profile, e.g. 'https://www.instagram.com/dj_peters42'."""
+        with self.lock:
+            self.stats.setdefault('apify_shell_records', 0)
+            self.stats['apify_shell_records'] += 1
+            # Best-effort extraction of the account name from the inputUrl
+            input_url = (post.get('inputUrl') or post.get('url') or '').strip()
+            account = ''
+            if input_url:
+                # Strip query/fragment, take last non-empty path segment
+                u = input_url.split('?', 1)[0].split('#', 1)[0].rstrip('/')
+                account = u.rsplit('/', 1)[-1] if '/' in u else u
+            if not hasattr(self, '_shell_accounts'):
+                self._shell_accounts = {}
+            self._shell_accounts[account] = self._shell_accounts.get(account, 0) + 1
+
     def _write_anomaly_summary(self):
         """Dump per-post outcomes for everything that did NOT produce events,
         plus per-account scrape→extract counts. Runs at process exit (atexit)
@@ -244,6 +265,7 @@ class InstagramEventPipeline:
                            if not isinstance(v, dict)},
                 'per_account': per_account,
                 'anomalies': anomalies,
+                'apify_shell_accounts': dict(getattr(self, '_shell_accounts', {})),
             }
             with open(out_path, 'w') as f:
                 json.dump(summary, f, indent=2, default=str)
@@ -583,7 +605,20 @@ class InstagramEventPipeline:
         return ""
 
     def process_post(self, post, post_num, total):
-        pid = post.get('id') or post.get('shortCode') or f'post_{post_num}'
+        pid = post.get('id') or post.get('shortCode')
+
+        # Apify shell-record check: when an account returns no posts (private,
+        # suspended, deleted, typo'd handle, or zero-recent-posts), Apify
+        # returns a placeholder entry with no id, no shortCode, no caption,
+        # and no owner. The 'url' field points at the profile URL itself.
+        # Previously we'd fabricate a pseudo-ID like f'post_{post_num}' and
+        # process the empty post anyway, polluting Processed_Log with
+        # post_NNN rows that can never collide with real Instagram IDs.
+        # Now we skip these at the entry and track which accounts are dead
+        # so the operator can clean up their accounts list. See ADR 0008.
+        if not pid:
+            self._note_apify_shell_record(post, post_num)
+            return None
 
         # Atomic check-and-claim: add pid to the dedup set inside the same
         # lock block as the existence check. Without this, two concurrent
@@ -1020,6 +1055,18 @@ class InstagramEventPipeline:
             print(f"  • no_events_found: {tag_counts.get('no_events_found', 0)}")
             print(f"  • ocr_failed:      {tag_counts.get('ocr_failed', 0)}")
             print(f"  • gemini_error:    {tag_counts.get('gemini_error', 0)}")
+
+        shell_accounts = getattr(self, '_shell_accounts', {})
+        if shell_accounts:
+            print(f"\n⚠ APIFY RETURNED EMPTY (SHELL) RESPONSES FOR {sum(shell_accounts.values())} POSTS")
+            print(f"   across {len(shell_accounts)} accounts. These accounts produced")
+            print(f"   no posts at all — likely dead, private, suspended, or typo'd.")
+            print(f"   Top affected accounts (review your Accounts tab):")
+            top = sorted(shell_accounts.items(), key=lambda kv: -kv[1])[:20]
+            for acct, n in top:
+                print(f"     {n:4d}×  {acct or '(no inputUrl)'}")
+            if len(shell_accounts) > 20:
+                print(f"     ... and {len(shell_accounts) - 20} more (full list in anomaly summary)")
 
     def save_data(self, events, post_log):
         if post_log and self.sheets_client and self.log_worksheet:
