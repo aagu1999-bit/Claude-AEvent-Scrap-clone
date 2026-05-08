@@ -3,6 +3,19 @@
 Notable changes to the Instagram event extraction pipeline. Newest first.
 Each entry is dated and links to a decision record where the *why* is non-obvious.
 
+## 2026-05-08 (incremental Processed_Log writes)
+
+### Changed
+- **`Processed_Log` is now written incrementally during the run**, not only
+  at end-of-run. Previously, if a run was killed before `save_data()` ran
+  (e.g., the May 7 18:24-26 kills), 100% of that run's dedup work was lost
+  and re-processed on the next run. Now the pipeline flushes
+  `post_results` entries every 50 new posts via a new
+  `_flush_processed_log()` helper. A killed run now preserves
+  ~950+ of every 1,000 processed posts' dedup state. The final
+  `save_data()` does a `force=True` flush to capture the remainder. See
+  [docs/decisions/0010-incremental-processed-log-writes.md](docs/decisions/0010-incremental-processed-log-writes.md).
+
 ## 2026-05-08 (lessons doc)
 
 ### Added

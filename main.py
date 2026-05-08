@@ -139,6 +139,17 @@ class InstagramEventPipeline:
         self.run_id = datetime.now().strftime('%Y%m%d_%H%M%S')
         self._setup_run_log()
 
+        # Incremental Processed_Log flushing — see ADR 0010.
+        # post_results entries get flushed to the Sheet's Processed_Log tab
+        # periodically during the run (every PL_FLUSH_THRESHOLD new entries)
+        # so that if the run is killed before save_data() completes, the
+        # dedup work that DID happen is preserved. Without this, every
+        # killed run loses 100% of its dedup state and re-processes all
+        # those posts on the next run.
+        self._flushed_pids = set()
+        self._flush_lock = threading.Lock()
+        self.PL_FLUSH_THRESHOLD = 50
+
         self.stats = {
             'total_posts': 0,
             'processed': 0,
@@ -217,6 +228,57 @@ class InstagramEventPipeline:
                     entry['error'] = str(error)[:300]
                 entry['post_url'] = f"https://www.instagram.com/p/{pid}/"
             self.post_results[pid] = entry
+
+    def _flush_processed_log(self, force=False):
+        """Append any post_results entries that haven't been written to
+        Processed_Log yet. Called periodically during the run + once at
+        the end of save_data() with force=True.
+
+        Called frequently (potentially after each processed post). The
+        threshold check makes most calls cheap — only fires the API call
+        when there's enough pending work or force=True.
+
+        Thread safety:
+        - self._flush_lock serializes flush attempts so we don't double-write
+        - self.lock guards the snapshot read of self.post_results and the
+          subsequent update of self._flushed_pids
+        - Worker threads can keep adding to post_results during the network
+          call; they're picked up in the next flush.
+        """
+        if not self.sheets_client or not self.log_worksheet:
+            return
+
+        with self._flush_lock:
+            # Snapshot pending entries under the main lock
+            with self.lock:
+                pending = {
+                    pid: dict(info) for pid, info in self.post_results.items()
+                    if pid not in self._flushed_pids
+                }
+
+            if not pending:
+                return
+            if not force and len(pending) < self.PL_FLUSH_THRESHOLD:
+                return
+
+            date_processed = str(datetime.now().date())
+            log_rows = [
+                [pid, info.get('account', ''), date_processed, "Auto-Bot", "",
+                 info.get('result', ''), info.get('post_date', '')]
+                for pid, info in pending.items()
+            ]
+
+            try:
+                self.log_worksheet.append_rows(log_rows)
+                # Mark these pids as flushed so we don't re-write next call
+                with self.lock:
+                    self._flushed_pids.update(pending.keys())
+                if force:
+                    print(f"  ✓ Flushed {len(pending)} entries to Processed_Log (final)")
+            except Exception as e:
+                # Don't crash the pipeline on a flush failure; the next flush
+                # (or save_data's force=True final call) will retry these.
+                print(f"  ⚠ Processed_Log flush error ({len(pending)} pending): {e}")
 
     def _note_apify_shell_record(self, post, post_num):
         """Track an Apify shell record (no id/shortCode = account returned no
@@ -976,10 +1038,16 @@ class InstagramEventPipeline:
                         future.result(timeout=120)
                     except Exception as e:
                         print(f"⚠ Worker error: {e}")
+                    # Periodic flush — threshold check inside makes most
+                    # calls cheap, so this is safe to call on every post.
+                    # Without this, killed runs lose 100% of their dedup
+                    # state. See ADR 0010.
+                    self._flush_processed_log(force=False)
         else:
             print("\n📋 Processing sequentially...\n")
             for i, post in enumerate(posts):
                 self.process_post(post, i + 1, total)
+                self._flush_processed_log(force=False)
 
         elapsed = time.time() - start_time
         self.save_checkpoint()
@@ -1069,23 +1137,19 @@ class InstagramEventPipeline:
                 print(f"     ... and {len(shell_accounts) - 20} more (full list in anomaly summary)")
 
     def save_data(self, events, post_log):
-        if post_log and self.sheets_client and self.log_worksheet:
-            try:
-                date_processed = str(datetime.now().date())
-                log_rows = [
-                    [pid, info.get('account', ''), date_processed, "Auto-Bot", "",
-                     info.get('result', ''), info.get('post_date', '')]
-                    for pid, info in post_log.items()
-                ]
-                self.log_worksheet.append_rows(log_rows)
+        # Final Processed_Log flush. Most entries are already there from
+        # incremental flushes during the run (see ADR 0010); this picks up
+        # the tail end. force=True ignores the threshold check so even a
+        # small remainder gets written.
+        if self.sheets_client and self.log_worksheet:
+            self._flush_processed_log(force=True)
+            if self.post_results:
                 tag_counts = {}
-                for info in post_log.values():
+                for info in self.post_results.values():
                     tag = info.get('result', '')
                     tag_counts[tag] = tag_counts.get(tag, 0) + 1
                 summary = ', '.join(f"{v} {k}" for k, v in sorted(tag_counts.items()))
-                print(f"✓ Logged {len(post_log)} post IDs to Processed_Log ({summary})")
-            except Exception as e:
-                print(f"⚠ Processed_Log write error: {e}")
+                print(f"✓ Processed_Log: {len(self.post_results)} entries total this run ({summary})")
 
         if not events:
             print("No new events found.")
