@@ -17,15 +17,18 @@ Instagram_Events_Master Sheet:
    Both Schema A (Auto-Bot) and Schema B (Migration Script) variants get
    deleted.
 
-3. **Processed_Log column drift** — Migration Script rows wrote columns
-   one position to the left of the canonical Auto-Bot schema. Real-ID
-   migration rows get their columns shifted right to match Schema A:
+3. **Processed_Log column drift** — historically, three different schemas
+   have written to this tab. Real-ID rows in the drifted schemas get
+   their columns shifted right to match canonical Schema A:
 
-       Schema A (canonical, Auto-Bot):
-         Post ID | Account | Date Processed | Source   | Notes | Result | Post Date
+       Schema A (canonical, current Auto-Bot path):
+         Post ID | Account | Date Processed | Source="Auto-Bot" | Notes | Result | Post Date
 
        Schema B (drifted, Migration Script):
          Post ID | (date)  | "Migration Script" | "Imported from checkpoint" | empty | empty | empty
+
+       Schema C (drifted, older Auto-Bot path):
+         Post ID | (date)  | "Auto-Bot" | empty | empty | empty | empty
 
    Detection is by content fingerprint, not row position — so future
    schema variants land in an "unknown" bucket rather than getting
@@ -236,27 +239,44 @@ def events_dedup_pass(spreadsheet, dry_run: bool):
 
 
 def _classify_pl_row(row, header):
-    """Return ('schema_a', 'schema_b_pseudo', 'schema_b_real', 'unknown')
-    based on content fingerprints, not column positions."""
+    """Return ('schema_a', 'schema_b_pseudo', 'schema_b_real',
+    'schema_c_pseudo', 'schema_c_real', 'unknown') based on content
+    fingerprints, not column positions.
+
+    Three known schemas that have written to Processed_Log over time:
+      Schema A (canonical, current code):
+        col0=Post ID, col1=Account, col2=Date Processed,
+        col3="Auto-Bot", col4=Notes, col5=Result, col6=Post Date
+
+      Schema B (Migration Script, drifted left by 1):
+        col0=Post ID, col1=date, col2="Migration Script",
+        col3="Imported from checkpoint", col4-6 empty
+
+      Schema C (older Auto-Bot path, drifted left by 1):
+        col0=Post ID, col1=date, col2="Auto-Bot",
+        col3-6 empty
+    """
     if not row or len(row) < 4:
         return "unknown"
     pid = row[0].strip() if row else ""
     is_pseudo = pid.startswith("post_")
 
-    # Fingerprint Schema B: "Migration Script" in col 2, "Imported from checkpoint" in col 3
     col2 = row[2].strip() if len(row) > 2 else ""
     col3 = row[3].strip() if len(row) > 3 else ""
-    is_schema_b = "Migration Script" in col2 or "Imported from checkpoint" in col3
 
-    # Fingerprint Schema A: "Auto-Bot" in col 3
-    is_schema_a = col3 == "Auto-Bot"
+    # Fingerprints, ordered most-specific first to disambiguate
+    is_schema_b = "Migration Script" in col2 or "Imported from checkpoint" in col3
+    is_schema_a = col3 == "Auto-Bot"                          # canonical: Auto-Bot at col3
+    is_schema_c = col2 == "Auto-Bot" and col3 == ""           # drifted: Auto-Bot at col2, col3 empty
 
     if is_schema_b:
         return "schema_b_pseudo" if is_pseudo else "schema_b_real"
+    if is_schema_c:
+        return "schema_c_pseudo" if is_pseudo else "schema_c_real"
     if is_schema_a:
         return "schema_a"
     if is_pseudo:
-        return "schema_a"  # treat as schema A for deletion purposes
+        return "schema_a"  # treat unmatched pseudo as schema A for deletion purposes
     return "unknown"
 
 
@@ -274,12 +294,15 @@ def pseudo_id_delete_pass(spreadsheet, dry_run: bool):
     rows_to_delete = []  # 1-based sheet row numbers
     n_schema_a_pseudo = 0
     n_schema_b_pseudo = 0
+    n_schema_c_pseudo = 0
     for i, r in enumerate(rows[1:], start=2):
         if not r or not r[0].strip().startswith("post_"):
             continue
         cls = _classify_pl_row(r, header)
         if cls == "schema_b_pseudo":
             n_schema_b_pseudo += 1
+        elif cls == "schema_c_pseudo":
+            n_schema_c_pseudo += 1
         else:
             n_schema_a_pseudo += 1
         rows_to_delete.append(i)
@@ -288,6 +311,7 @@ def pseudo_id_delete_pass(spreadsheet, dry_run: bool):
     print(f"    Total Processed_Log data rows: {len(rows) - 1}")
     print(f"    Schema A pseudo-IDs (Auto-Bot etc): {n_schema_a_pseudo}")
     print(f"    Schema B pseudo-IDs (Migration):    {n_schema_b_pseudo}")
+    print(f"    Schema C pseudo-IDs (older path):   {n_schema_c_pseudo}")
     print(f"    Total pseudo-IDs to delete:         {len(rows_to_delete)}")
 
     if rows_to_delete and not dry_run:
@@ -348,6 +372,7 @@ def column_shift_pass(spreadsheet, dry_run: bool):
     rows_to_shift = []  # list of (sheet_row, new_row_values)
     n_schema_a = 0
     n_schema_b_real = 0
+    n_schema_c_real = 0
     n_unknown = 0
     for i, r in enumerate(rows[1:], start=2):
         if not r or not r[0].strip():
@@ -361,7 +386,7 @@ def column_shift_pass(spreadsheet, dry_run: bool):
         elif cls == "schema_b_real":
             n_schema_b_real += 1
             # Build the canonical-aligned new row
-            old_col1 = r[1].strip() if len(r) > 1 else ""  # old "Account" cell — really the date
+            old_col1 = r[1].strip() if len(r) > 1 else ""  # the date
             new_row = [
                 r[0].strip(),               # Post ID (unchanged)
                 "",                         # Account (we don't have it)
@@ -372,15 +397,30 @@ def column_shift_pass(spreadsheet, dry_run: bool):
                 "",                         # Post Date (empty)
             ]
             rows_to_shift.append((i, new_row))
+        elif cls == "schema_c_real":
+            n_schema_c_real += 1
+            # Schema C: same shift as Schema B, but Source="Auto-Bot" and Notes empty
+            old_col1 = r[1].strip() if len(r) > 1 else ""  # the date
+            new_row = [
+                r[0].strip(),               # Post ID (unchanged)
+                "",                         # Account (we don't have it)
+                old_col1,                   # Date Processed (was in old col 1)
+                "Auto-Bot",                 # Source (canonicalised — was Auto-Bot in col2)
+                "",                         # Notes (Schema C had no notes)
+                "",                         # Result (Schema C had no preserved result)
+                "",                         # Post Date (empty)
+            ]
+            rows_to_shift.append((i, new_row))
         else:
             n_unknown += 1
 
     header_needs_update = current_header != CANONICAL_PROCESSED_LOG_HEADER
 
     print(f"  Pass 3/3 — Processed_Log column-shift")
-    print(f"    Total non-pseudo rows: {n_schema_a + n_schema_b_real + n_unknown}")
-    print(f"    Schema A (no shift needed): {n_schema_a}")
-    print(f"    Schema B real-ID (will shift): {n_schema_b_real}")
+    print(f"    Total non-pseudo rows: {n_schema_a + n_schema_b_real + n_schema_c_real + n_unknown}")
+    print(f"    Schema A (no shift needed):              {n_schema_a}")
+    print(f"    Schema B real-ID (will shift, Migration): {n_schema_b_real}")
+    print(f"    Schema C real-ID (will shift, Auto-Bot):  {n_schema_c_real}")
     print(f"    Unknown schema (skipped, manual review): {n_unknown}")
     print(f"    Current header: {current_header}")
     print(f"    Canonical header: {CANONICAL_PROCESSED_LOG_HEADER}")
@@ -425,6 +465,7 @@ def column_shift_pass(spreadsheet, dry_run: bool):
         "total": n_total,
         "schema_a": n_schema_a,
         "schema_b_real": n_schema_b_real,
+        "schema_c_real": n_schema_c_real,
         "unknown": n_unknown,
         "shifted": 0 if dry_run else len(rows_to_shift),
         "header_changed": header_needs_update and not dry_run,

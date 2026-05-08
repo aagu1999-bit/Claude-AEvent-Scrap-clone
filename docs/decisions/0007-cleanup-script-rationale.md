@@ -33,18 +33,24 @@ real posts in dedup — they're inert. But they consume rows and cause
 audit ambiguity.
 
 **3. Column drift in `Processed_Log`.**
-Two distinct row schemas have been written to the same tab:
+Three distinct row schemas have been written to the same tab:
 
-- **Schema A (Auto-Bot, current code path):** matches canonical header
-  `Post ID, Account, Date Processed, Source, Notes, Result, Post Date`.
-- **Schema B (Migration Script):** drifted one column to the left —
-  what should be `Date Processed` is in the `Account` column,
-  what should be `Source` is in `Date Processed`, etc.
+- **Schema A (canonical, current Auto-Bot code path):** matches
+  canonical header `Post ID, Account, Date Processed, Source, Notes,
+  Result, Post Date`. Source value is `"Auto-Bot"` at col 3.
+- **Schema B (Migration Script):** drifted one column left — what
+  should be `Date Processed` is in `Account`, what should be `Source`
+  is in `Date Processed`, with values `"Migration Script"` and
+  `"Imported from checkpoint"`.
+- **Schema C (older Auto-Bot code path):** also drifted one column
+  left — `"Auto-Bot"` appears in col 2 instead of col 3, and the rest
+  of the row is empty. Likely from an earlier version of `save_data()`
+  that wrote columns differently before the format stabilized.
 
-Detection by content fingerprint (presence of "Migration Script" and
-"Imported from checkpoint" string literals), not by row position, so
-future undocumented schema variants land in an "unknown" bucket rather
-than getting silently broken.
+Detection by content fingerprint (presence of `"Migration Script"`,
+`"Imported from checkpoint"`, or `"Auto-Bot"` in specific positions),
+not by row position, so future undocumented schema variants land in
+an "unknown" bucket rather than getting silently broken.
 
 ## Decision
 
@@ -63,15 +69,27 @@ count: ~3,189 rows. Safe because pseudo-IDs cannot match any real
 Instagram post.
 
 ### Pass 3 — `Processed_Log` column-shift
-For real-ID rows classified as Schema B by content fingerprint, rewrite
-the row to match canonical Schema A:
+For real-ID rows classified as Schema B or Schema C by content
+fingerprint, rewrite the row to match canonical Schema A. Both schemas
+have the same shift pattern (right by 1) but different post-shift
+content:
+
+**Schema B → canonical:**
 - `Post ID` → unchanged
-- `Account` → empty (we don't have it; the migration source didn't store it)
+- `Account` → empty (we don't have it; migration source didn't store it)
 - `Date Processed` ← whatever was in old col 1 (the actual date)
 - `Source` ← `"Migration Script"` (canonicalised)
 - `Notes` ← `"Imported from checkpoint"` (canonicalised)
-- `Result` → empty (no extraction was actually done — this is just
-  history dedup data, not an extraction outcome)
+- `Result` → empty
+- `Post Date` → empty
+
+**Schema C → canonical:**
+- `Post ID` → unchanged
+- `Account` → empty
+- `Date Processed` ← whatever was in old col 1 (the date)
+- `Source` ← `"Auto-Bot"` (was in col 2, moved to col 3)
+- `Notes` → empty (Schema C had nothing here)
+- `Result` → empty
 - `Post Date` → empty
 
 Header is also rewritten to canonical (`Date Processed` replaces the
