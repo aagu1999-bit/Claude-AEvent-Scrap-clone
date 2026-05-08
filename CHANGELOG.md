@@ -3,6 +3,22 @@
 Notable changes to the Instagram event extraction pipeline. Newest first.
 Each entry is dated and links to a decision record where the *why* is non-obvious.
 
+## 2026-05-08 (cleanup script)
+
+### Added
+- **`cleanup_pseudo_ids_and_duplicates.py`** — one-off utility that addresses
+  three accumulated data-quality issues: composite-key duplicates in
+  `All_Events` (~503 excess rows), pseudo-ID rows in `Processed_Log`
+  (~3,189 rows), and column-drift between Schema A (Auto-Bot) and Schema B
+  (Migration Script) row variants. Default mode is dry-run; `--apply`
+  required for writes. Backups of both tabs are written before any
+  destructive operation. See
+  [docs/decisions/0007-cleanup-script-rationale.md](docs/decisions/0007-cleanup-script-rationale.md).
+
+  Recommended order: merge the ADR 0005 (Mode-scoping) and ADR 0006
+  (race-condition) PRs first to stop the bleed, wait for one clean weekly
+  run, then run this cleanup against the resulting state.
+
 ## 2026-05-07 (later)
 
 ### Added
