@@ -16,6 +16,37 @@ Each entry is dated and links to a decision record where the *why* is non-obviou
   `save_data()` does a `force=True` flush to capture the remainder. See
   [docs/decisions/0010-incremental-processed-log-writes.md](docs/decisions/0010-incremental-processed-log-writes.md).
 
+## 2026-05-08 (lessons doc)
+
+### Added
+- **`docs/decisions/0009-pipeline-reliability-lessons.md`** — fourteen
+  transferable lessons from the May 7-8 incident investigation. Future
+  agents working on this pipeline (or similar data-extraction systems)
+  should read this before starting any non-trivial investigation.
+  Specifics of May 7-8 are evidence; this doc is the takeaway.
+
+## 2026-05-08 (skip Apify shell records)
+
+### Fixed
+- **No more new pseudo-ID rows in `Processed_Log`.** When Apify returns a
+  "shell" record (account that produced no posts — private, suspended,
+  deleted, typo'd, or zero recent posts), `process_post()` previously
+  fabricated a synthetic ID like `post_142` and processed the empty record
+  anyway. Now those records are detected at entry and skipped before any
+  OCR/Gemini work happens, with the affected account surfaced in the run
+  report.
+
+### Added
+- **Dead-handle visibility in the per-run report.** When shell records are
+  detected, the final report block lists the top 20 affected accounts by
+  frequency so the operator can review their `Accounts` tab. Full
+  per-account map is in `anomalies_<ts>.json` under `apify_shell_accounts`.
+- New stat key `apify_shell_records` counts shell entries per run.
+
+See [docs/decisions/0008-skip-apify-shell-records.md](docs/decisions/0008-skip-apify-shell-records.md)
+for the empirical evidence (133 of 4,014 dataset entries on 2026-05-08
+were shells) and the rationale.
+
 ## 2026-05-08 (race-condition fix)
 
 ### Fixed
