@@ -576,11 +576,18 @@ class InstagramEventPipeline:
     def process_post(self, post, post_num, total):
         pid = post.get('id') or post.get('shortCode') or f'post_{post_num}'
 
+        # Atomic check-and-claim: add pid to the dedup set inside the same
+        # lock block as the existence check. Without this, two concurrent
+        # threads with the same pid (e.g. from a duplicated source list) can
+        # both pass the check before either thread reaches the
+        # results.extend / post_results write 10-30 seconds later, producing
+        # duplicate event rows in All_Events. See ADR 0006.
         with self.lock:
             if pid in self.processed_posts:
                 self.stats['skipped_history'] += 1
                 print(f"  [{post_num}/{total}] @{post.get('ownerUsername', '')} | {pid} - Already processed, skipping")
                 return None
+            self.processed_posts.add(pid)
 
         caption = post.get('caption', '') or post.get('text', '')
         user = post.get('ownerUsername', '')

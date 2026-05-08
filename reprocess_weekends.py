@@ -420,6 +420,26 @@ def run_pipeline_on_fresh_data(fresh_posts):
     # Clear history so the re-scraped posts are processed fresh, not skipped
     pipeline.processed_posts = set()
 
+    # Dedup the input list by post ID before passing to the pipeline. Apify
+    # sometimes returns the same post twice in a single dataset, which —
+    # combined with cleared processed_posts — used to produce duplicate
+    # event rows in All_Events. The atomic check-and-claim in process_post
+    # catches the same-pid race; this catches the same-pid-listed-twice
+    # case before threads even start. See ADR 0006.
+    seen_pids = set()
+    deduped = []
+    for p in fresh_posts:
+        pid = p.get('id') or p.get('shortCode')
+        if pid and pid in seen_pids:
+            continue
+        if pid:
+            seen_pids.add(pid)
+        deduped.append(p)
+    if len(deduped) < len(fresh_posts):
+        print(f"  ↳ Deduped fresh_posts: {len(fresh_posts)} → {len(deduped)} "
+              f"(removed {len(fresh_posts) - len(deduped)} duplicate post IDs)")
+    fresh_posts = deduped
+
     results, post_log = pipeline.run_pipeline(fresh_posts)
     pipeline.save_data(results, post_log)
 
