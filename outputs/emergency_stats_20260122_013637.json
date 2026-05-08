@@ -1,0 +1,18 @@
+{
+  "total_posts": 2038,
+  "processed": 32788,
+  "events_found": 17167,
+  "posts_with_events": 9086,
+  "multi_event_posts": 2583,
+  "max_events_in_post": 37,
+  "calendar_posts": 626,
+  "ocr_success": 25482,
+  "ocr_failed": 7311,
+  "vision_errors": {
+    "Bad image data.": 752,
+    "Requested entity was not found.": 5
+  },
+  "gemini_errors": 67,
+  "download_errors": 2018,
+  "parallel_workers": 3
+}

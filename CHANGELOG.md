@@ -22,6 +22,24 @@ Each entry is dated and links to a decision record where the *why* is non-obviou
 ### TODO (separate PR-C)
 - One-off cleanup script for the existing duplicate rows in `All_Events`.
   Backed up to a `Cleanup_Backup` tab before deletion.
+## 2026-05-08
+
+### Added
+- **`docs/config.md`** — full reference for every setting in `config.json`,
+  grouped by Mode 1 / Mode 2 / Universal scope. Future agents should read
+  this before editing config defaults.
+
+### Changed
+- **`history_max_age_days` is now Mode-1 only.** Previously applied
+  universally on every pipeline start. In Mode 2 (static `instagram_data_url`),
+  this caused posts to silently re-enter processing each week as they aged
+  past the cutoff, generating duplicate rows in `All_Events`. The cutoff
+  now applies only when `apify_enabled: true`. See
+  [docs/decisions/0005-config-mode-scoping.md](docs/decisions/0005-config-mode-scoping.md).
+- **Scheduler timezone is now explicit (`America/New_York`).** Previously
+  `start_scheduler()` used `datetime.now()` with no timezone, picking up the
+  Replit container's undeclared local TZ. To change, edit `SCHEDULE_TZ` in
+  `main.py` `start_scheduler()`.
 
 ## 2026-05-07 (later)
 

@@ -1,0 +1,20 @@
+{
+  "total_posts": 3555,
+  "processed": 202,
+  "skipped_history": 3353,
+  "skipped_no_data": 0,
+  "events_found": 34,
+  "posts_with_events": 23,
+  "posts_no_events": 174,
+  "multi_event_posts": 5,
+  "max_events_in_post": 7,
+  "calendar_posts": 2,
+  "gemini_errors": 5,
+  "ocr_success": 68,
+  "ocr_failed": 302,
+  "download_errors": 8,
+  "vision_errors": {},
+  "carousel_posts": 36,
+  "total_slides_ocrd": 370,
+  "slides_with_text": 68
+}
