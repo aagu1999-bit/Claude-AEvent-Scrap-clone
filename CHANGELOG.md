@@ -3,6 +3,25 @@
 Notable changes to the Instagram event extraction pipeline. Newest first.
 Each entry is dated and links to a decision record where the *why* is non-obvious.
 
+## 2026-05-08 (race-condition fix)
+
+### Fixed
+- **Duplicate `(POST ID, EVENT NAME, DATE)` rows in `All_Events`** caused by
+  a race condition in `process_post()`. The dedup check and the dedup add
+  were in two separate lock blocks separated by 10–30s of OCR/Gemini work,
+  so concurrent threads with the same post ID could both pass the check.
+  The May 8 reprocess produced 47 duplicate composite keys (55 excess rows)
+  via this path. Fix: atomic check-and-claim — `processed_posts.add(pid)`
+  now happens inside the same lock block as the existence check, so the
+  second thread sees the claimed pid and skips. See
+  [docs/decisions/0006-dedup-race-condition.md](docs/decisions/0006-dedup-race-condition.md).
+- **Duplicate post IDs in `reprocess_weekends.py` source list** are now
+  removed before the pipeline starts. Belt to the atomic-claim's suspenders
+  — handles the case where the same post appears twice in the input list.
+
+### TODO (separate PR-C)
+- One-off cleanup script for the existing duplicate rows in `All_Events`.
+  Backed up to a `Cleanup_Backup` tab before deletion.
 ## 2026-05-08
 
 ### Added
