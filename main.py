@@ -385,8 +385,17 @@ class InstagramEventPipeline:
                 acct_in_col1 = "Account" in updated_header and updated_header.index("Account") == 1
                 OLD_RESULT_COL, OLD_POST_DATE_COL, OLD_DATE_PROCESSED_COL = 4, 5, 1
 
-                max_age_days = int(CONF.get("history_max_age_days", 30))
-                cutoff = (datetime.now() - timedelta(days=max_age_days)).date()
+                # history_max_age_days is intended for live Apify auto-runs (Mode 1)
+                # only. In Mode 2 (apify_enabled: false), the pipeline reads a fixed
+                # static instagram_data_url, so applying the age cutoff causes the same
+                # posts to drop out of dedup every week and re-process — generating
+                # duplicate rows in All_Events. See docs/decisions/0005-config-mode-scoping.md.
+                apify_live = bool(CONF.get("apify_enabled", False))
+                if apify_live:
+                    max_age_days = int(CONF.get("history_max_age_days", 30))
+                    cutoff = (datetime.now() - timedelta(days=max_age_days)).date()
+                else:
+                    cutoff = None  # Mode 2: keep full Processed_Log dedup history
 
                 retry_tags = {'ocr_failed', 'gemini_error'}
                 skip_count = 0
@@ -424,7 +433,7 @@ class InstagramEventPipeline:
                         except ValueError:
                             pass
 
-                    if row_date and row_date < cutoff:
+                    if cutoff is not None and row_date and row_date < cutoff:
                         self.processed_posts.add(pid)
                         skip_count += 1
                         continue
@@ -1115,12 +1124,19 @@ class InstagramEventPipeline:
         target_day = CONF["schedule_day"]
         target_time = CONF["schedule_time"]
 
+        # schedule_time is interpreted in this timezone. Hardcoded to America/New_York
+        # because the Replit container's local TZ is undeclared and was producing
+        # surprising firing times. To change, edit SCHEDULE_TZ here. See
+        # docs/decisions/0005-config-mode-scoping.md.
+        from zoneinfo import ZoneInfo
+        SCHEDULE_TZ = ZoneInfo("America/New_York")
+
         print(f"\n⏰ BOT STARTED.")
-        print(f"   Target: Every {target_day} at {target_time}")
+        print(f"   Target: Every {target_day} at {target_time} ({SCHEDULE_TZ})")
         print("   Status: Waiting...")
 
         while True:
-            now = datetime.now()
+            now = datetime.now(SCHEDULE_TZ)
             day = now.strftime("%A")
             hm = now.strftime("%H:%M")
 
