@@ -78,6 +78,7 @@ See docs/decisions/0007-cleanup-script-rationale.md for the full reasoning.
 """
 
 import argparse
+import re
 import sys
 import time
 from datetime import datetime
@@ -85,6 +86,9 @@ from pathlib import Path
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 SERVICE_ACCOUNT_FILE = "apt-mark-468506-u9-ec44cabc7335 copy.json"
@@ -280,9 +284,10 @@ def _classify_pl_row(row, header):
     fingerprints, not column positions.
 
     Three known schemas that have written to Processed_Log over time:
-      Schema A (canonical, current code):
-        col0=Post ID, col1=Account, col2=Date Processed,
-        col3="Auto-Bot", col4=Notes, col5=Result, col6=Post Date
+      Schema A (canonical — date in col2):
+        col0=Post ID, col1=Account, col2=Date Processed (YYYY-MM-DD),
+        col3=Source ("Auto-Bot" / "Migration Script" / etc.),
+        col4=Notes, col5=Result, col6=Post Date
 
       Schema B (Migration Script, drifted left by 1):
         col0=Post ID, col1=date, col2="Migration Script",
@@ -291,6 +296,11 @@ def _classify_pl_row(row, header):
       Schema C (older Auto-Bot path, drifted left by 1):
         col0=Post ID, col1=date, col2="Auto-Bot",
         col3-6 empty
+
+    Detection priority: canonical first (col2 is a date), then drift
+    fingerprints. This means previously-shifted rows correctly classify
+    as canonical even though col3 may not be "Auto-Bot" anymore (e.g.
+    a shifted Schema B row ends up with col3="Migration Script").
     """
     if not row or len(row) < 4:
         return "unknown"
@@ -300,17 +310,20 @@ def _classify_pl_row(row, header):
     col2 = row[2].strip() if len(row) > 2 else ""
     col3 = row[3].strip() if len(row) > 3 else ""
 
-    # Fingerprints, ordered most-specific first to disambiguate
+    # Canonical: col2 is a date string (Date Processed in the right column)
+    if _DATE_RE.match(col2):
+        return "schema_a" if not is_pseudo else "schema_a"  # canonical regardless of pseudo
+
+    # Schema B drift: "Migration Script" anywhere in col2/col3 of a non-canonical row
     is_schema_b = "Migration Script" in col2 or "Imported from checkpoint" in col3
-    is_schema_a = col3 == "Auto-Bot"                          # canonical: Auto-Bot at col3
-    is_schema_c = col2 == "Auto-Bot" and col3 == ""           # drifted: Auto-Bot at col2, col3 empty
+
+    # Schema C drift: "Auto-Bot" sitting in col2 (not col3) and col3 empty
+    is_schema_c = col2 == "Auto-Bot" and col3 == ""
 
     if is_schema_b:
         return "schema_b_pseudo" if is_pseudo else "schema_b_real"
     if is_schema_c:
         return "schema_c_pseudo" if is_pseudo else "schema_c_real"
-    if is_schema_a:
-        return "schema_a"
     if is_pseudo:
         return "schema_a"  # treat unmatched pseudo as schema A for deletion purposes
     return "unknown"
