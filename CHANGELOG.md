@@ -3,6 +3,15 @@
 Notable changes to the Instagram event extraction pipeline. Newest first.
 Each entry is dated and links to a decision record where the *why* is non-obvious.
 
+## 2026-05-08 (lessons doc)
+
+### Added
+- **`docs/decisions/0009-pipeline-reliability-lessons.md`** — fourteen
+  transferable lessons from the May 7-8 incident investigation. Future
+  agents working on this pipeline (or similar data-extraction systems)
+  should read this before starting any non-trivial investigation.
+  Specifics of May 7-8 are evidence; this doc is the takeaway.
+
 ## 2026-05-08 (skip Apify shell records)
 
 ### Fixed
