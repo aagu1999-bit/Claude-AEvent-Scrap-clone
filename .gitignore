@@ -50,6 +50,7 @@ pipeline_checkpoint.pkl
 *.json
 !package.json
 !promotion_blocklist.json
+!data/*.json
 service-account*.json
 credentials*.json
 
