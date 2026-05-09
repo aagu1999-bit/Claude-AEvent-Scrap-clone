@@ -632,6 +632,11 @@ def process_one_post(ctx: dict, post: dict, max_tier: str = TIER_PRO_IMAGE) -> t
             print(f"  ↳ flags fired ({sorted(all_flags)}); escalating to {nt}")
             current_tier = nt
         else:
+            # Final tier reached (or no escalation needed). Surface
+            # informational flags before settling so user sees auto-fixes.
+            non_escalating = sorted(f for f in all_flags if f not in ESCALATION_FLAGS)
+            if non_escalating:
+                print(f"  ↳ informational flags: {non_escalating}")
             # Final result
             for ev, fl in zip(events, flags_per_event):
                 ev['quality_flags'] = ",".join(sorted(set(fl)))
@@ -792,6 +797,20 @@ def run_extract_mode(args):
 
         print(f"  ✓ {len(events)} event(s) (tier={tier_used})")
         stats['extracted'] += len(events)
+        for idx, ev in enumerate(events, 1):
+            name = ev.get('event_name', '(unnamed)')
+            date = ev.get('date', '?')
+            venue = ev.get('venue_name', '?') or '—'
+            city = ev.get('city', '?') or '—'
+            region = ev.get('section_of_nj', '') or '—'
+            conf = ev.get('confidence', '?')
+            flags = ev.get('quality_flags', '')
+            print(f"    {idx}. {name}")
+            print(f"       date={date}  time={ev.get('start_time','—') or '—'}  venue={venue}  city={city}  region={region}  conf={conf}")
+            if flags:
+                print(f"       🚩 FLAGS: {flags}")
+            else:
+                print(f"       ✓ clean (no flags)")
         for ev in events:
             if ev.get('quality_flags'):
                 stats['flagged'] += 1
