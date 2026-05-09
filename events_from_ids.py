@@ -373,16 +373,29 @@ def ocr_one_image(vision_client, image_url: str, stats: dict = None, timeout=15)
         return ""
 
 
-def ocr_post(vision_client, post: dict, stats: dict = None) -> tuple:
+def ocr_post(vision_client, post: dict, stats: dict = None, verbose_slides: bool = False) -> tuple:
     """Run OCR on all images for a post. Returns (combined_ocr_text, num_slides).
-    Times itself into stats['phase_timings']['ocr'] when stats provided."""
+    Times itself into stats['phase_timings']['ocr'] when stats provided.
+
+    For multi-slide posts (>=3 slides) prints a per-slide breakdown so we
+    can see whether the post genuinely has multi-event data spread across
+    slides vs. a single flyer surrounded by promo/decoration images.
+    Critical for diagnosing CAROUSEL_LOW_EVENTS without guessing."""
     urls = collect_carousel_urls(post)
     if not urls:
         return "", 0
     t0 = time.perf_counter()
     parts = []
+    show_breakdown = verbose_slides or len(urls) >= 3
     for i, url in enumerate(urls, 1):
         text = ocr_one_image(vision_client, url, stats=stats)
+        if show_breakdown:
+            n = len(text or '')
+            if n == 0:
+                print(f"      Slide {i}/{len(urls)}: 0 chars (no text)")
+            else:
+                preview = (text or '').replace('\n', ' ')[:60]
+                print(f"      Slide {i}/{len(urls)}: {n} chars  | {preview}")
         if text:
             if len(urls) > 1:
                 parts.append(f"[SLIDE {i} of {len(urls)}]\n{text}")
