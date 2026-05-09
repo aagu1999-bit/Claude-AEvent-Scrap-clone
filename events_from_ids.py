@@ -414,11 +414,14 @@ def enrich_events(events: list, post: dict, post_date_str: str, has_ocr: bool, i
 # ─────────────────────────────────────────────────────────────────
 
 def extract_tier_flash_text(ctx: dict, post: dict) -> tuple:
-    """Tier 1: Flash-Lite + OCR text. Returns (events, slide_count, ocr_len, has_ocr)."""
+    """Tier 1: Flash-Lite + OCR text. Returns (events, slide_count, ocr_len, has_ocr).
+    Stores OCR text back on post['_ocr_text'] so downstream sanity checks can
+    use it (date↔day, calendar-low-events both need source text)."""
     print(f"  [Tier 1: Flash-Lite + OCR text]")
 
     # OCR
     ocr_text, num_slides = ocr_post(ctx['vision_client'], post)
+    post['_ocr_text'] = ocr_text  # surface for sanity checks
     has_ocr = bool(ocr_text)
     if has_ocr:
         print(f"    ✓ OCR: {len(ocr_text)} chars across {num_slides} slide(s)")
@@ -531,12 +534,39 @@ def check_low_confidence(event: dict) -> Optional[str]:
     return "LOW_CONFIDENCE" if conf < LOW_CONFIDENCE_THRESHOLD else None
 
 
-def check_calendar_low_events(caption: str, num_events: int) -> Optional[str]:
+def _count_distinct_dates(text: str) -> int:
+    """Count distinct date-shaped tokens in text. Used to distinguish
+    real calendar posts (multiple dates) from single-event posts that
+    happen to mention 'schedule'/'every'/etc."""
+    if not text:
+        return 0
+    found = set()
+    # M/D, MM/DD, M/D/YY, MM/DD/YYYY
+    for m in re.finditer(r'\b(\d{1,2})/(\d{1,2})(?:/\d{2,4})?\b', text):
+        found.add((m.group(1).zfill(2), m.group(2).zfill(2)))
+    # M.D with strict bounds (avoid catching "$5.99" decimals)
+    for m in re.finditer(r'\b(0?[1-9]|1[0-2])\.(0?[1-9]|[12]\d|3[01])\b', text):
+        found.add((m.group(1).zfill(2), m.group(2).zfill(2)))
+    # Month name + day: "May 8", "MAY 8TH", "Jun 12"
+    months = r'(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)'
+    for m in re.finditer(rf'\b{months}\w*\s+(\d{{1,2}})(?:st|nd|rd|th)?\b', text, re.IGNORECASE):
+        found.add(("month", m.group(1)))
+    return len(found)
+
+
+def check_calendar_low_events(caption: str, ocr_text: str, num_events: int) -> Optional[str]:
+    """Fire only when (caption keyword OR OCR keyword) AND ≥2 distinct
+    date tokens appear across caption+OCR. Single-event posts that mention
+    'schedule' once shouldn't trip this — they need multi-date evidence."""
     if num_events > 1:
         return None
-    if any(kw in (caption or '').lower() for kw in CALENDAR_KEYWORDS):
-        return "CALENDAR_LOW_EVENTS"
-    return None
+    combined = ((caption or '') + ' ' + (ocr_text or '')).lower()
+    if not any(kw in combined for kw in CALENDAR_KEYWORDS):
+        return None
+    # Require ≥2 distinct dates in source — that's what makes it a calendar
+    if _count_distinct_dates(combined) < 2:
+        return None
+    return "CALENDAR_LOW_EVENTS"
 
 
 def check_carousel_low_events(slide_count: int, num_events: int) -> Optional[str]:
@@ -613,7 +643,9 @@ def process_one_post(ctx: dict, post: dict, max_tier: str = TIER_PRO_IMAGE) -> t
         # Post-level flags (apply to all events)
         post_flags = []
         for f in [
-            check_calendar_low_events(post.get('caption', ''), len(events)),
+            check_calendar_low_events(post.get('caption', ''),
+                                      post.get('_ocr_text', ''),
+                                      len(events)),
             check_carousel_low_events(slide_count, len(events)),
             check_ocr_rich_low_events(ocr_len, len(events)),
             check_account_pattern(post.get('ownerUsername', ''), len(events), ctx['account_avg']),
