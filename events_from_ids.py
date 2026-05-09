@@ -205,12 +205,13 @@ def init_stats() -> dict:
             'sheet_write': 0.0,
         },
         'counts': {
-            'queue_size':         0,
-            'processed':          0,
-            'extracted_events':   0,
-            'events_with_flags':  0,
-            'no_events':          0,
-            'missing_in_apify':   0,
+            'queue_size':           0,
+            'processed':            0,
+            'extracted_events':     0,
+            'events_with_flags':    0,
+            'no_events':            0,
+            'missing_in_apify':     0,
+            'already_in_all_events': 0,
         },
         'tiers_used':         Counter(),  # final tier per post
         'flag_distribution':  Counter(),  # per-flag occurrence count
@@ -221,6 +222,16 @@ def init_stats() -> dict:
             'flash_text':   0,
             'flash_image':  0,
             'pro_image':    0,
+        },
+        # Region-lookup visibility — distinguishes "Gemini got it right"
+        # from "we corrected it" so we can see if the safety net is working
+        # vs Gemini happening to be lucky.
+        'region_lookup': {
+            'hits':            0,  # event city was in NJ lookup
+            'autofixed':       0,    # we corrected the region
+            'already_correct': 0,    # Gemini agreed with lookup
+            'non_nj_cleared':  0,    # city tagged NON_NJ; region cleared
+            'unknown_city':    0,    # city not in lookup at all
         },
     }
 
@@ -252,6 +263,7 @@ def write_run_summary(stats: dict, args, wall_time: float, run_id: str):
         'skip_reasons':        dict(stats['skip_reasons']),
         'per_account_events':  dict(stats['per_account_events'].most_common(50)),
         'api_call_counts':     dict(stats['api_call_counts']),
+        'region_lookup':       dict(stats['region_lookup']),
         'estimated_cost_usd':  round(estimate_cost(stats['api_call_counts']), 4),
     }
     out_path = EXTRACT_RUNS_DIR / f"{run_id}.json"
@@ -602,22 +614,36 @@ def check_venue_city(event: dict, venue_lookup: dict) -> Optional[str]:
     return None
 
 
-def check_region_against_lookup(event: dict, region_lookup: dict) -> Optional[str]:
-    """Auto-fix region using canonical lookup. Mutates event in-place."""
+def check_region_against_lookup(event: dict, region_lookup: dict, stats: dict = None) -> Optional[str]:
+    """Auto-fix region using canonical lookup. Mutates event in-place.
+    Updates stats['region_lookup'] counters when stats is provided so we can
+    see whether Gemini's getting it right on its own vs being corrected."""
+    rl = stats['region_lookup'] if stats else None
     city = (event.get('city') or '').strip().upper()
     if not city:
         return None
     canonical = region_lookup.get(city)
     if canonical is None:
+        if rl is not None:
+            rl['unknown_city'] += 1
         return "CITY_NOT_IN_NJ_LOOKUP"
     if canonical == "NON_NJ":
         if event.get('section_of_nj'):
             event['section_of_nj'] = ""
+        if rl is not None:
+            rl['non_nj_cleared'] += 1
         return "CITY_NOT_IN_NJ_LOOKUP"
+    # City IS in NJ lookup — register the hit
+    if rl is not None:
+        rl['hits'] += 1
     current = (event.get('section_of_nj') or '').strip().upper()
     if current != canonical:
         event['section_of_nj'] = canonical
+        if rl is not None:
+            rl['autofixed'] += 1
         return "REGION_AUTOFIXED"
+    if rl is not None:
+        rl['already_correct'] += 1
     return None
 
 
@@ -725,7 +751,7 @@ def process_one_post(ctx: dict, post: dict, max_tier: str = TIER_PRO_IMAGE) -> t
         flags_per_event = []
         for ev in events:
             row_flags = []
-            f = check_region_against_lookup(ev, ctx['region_lookup'])
+            f = check_region_against_lookup(ev, ctx['region_lookup'], stats=ctx.get('stats'))
             if f: row_flags.append(f)
             f = check_date_day_match(ev, source_text)
             if f: row_flags.append(f)
@@ -910,12 +936,33 @@ def run_extract_mode(args):
     # Find true last data row (row_count is sheet capacity, not data extent)
     next_row = len(ws.col_values(1)) + 1 if not args.dry_run else 99999
 
+    # Dedup against existing All_Events: skip queue posts that already have
+    # rows in the sheet. Belt-and-suspenders against stale orphan queues
+    # (the queue is a snapshot in time; rerunning the tool against the same
+    # queue should be safe). Add --force-reextract later if the workflow
+    # needs to override this.
+    print(f"\n  Loading existing All_Events post IDs for dedup...")
+    existing_data = ws.get_all_values()
+    existing_pids = set()
+    if existing_data:
+        post_id_idx = ALL_EVENTS_HEADER.index("POST ID")
+        for row in existing_data[1:]:
+            if len(row) > post_id_idx and row[post_id_idx].strip():
+                existing_pids.add(row[post_id_idx].strip())
+    print(f"    {len(existing_pids)} unique post IDs already in All_Events")
+
     pending_rows = []
 
     for i, queue_row in enumerate(queue, 1):
         pid = queue_row.get('post_id', '').strip()
         if not pid:
             stats['skip_reasons']['empty_post_id_in_queue'] += 1
+            continue
+
+        if pid in existing_pids:
+            print(f"\n[{i}/{len(queue)}] {pid} — already in All_Events, skipping")
+            stats['counts']['already_in_all_events'] += 1
+            stats['skip_reasons']['already_in_all_events'] += 1
             continue
 
         post = apify_lookup.get(pid)
@@ -994,6 +1041,7 @@ def run_extract_mode(args):
     print(f"  Events with flags:      {c['events_with_flags']}")
     print(f"  Posts no events:        {c['no_events']}")
     print(f"  Posts missing in Apify: {c['missing_in_apify']}")
+    print(f"  Posts already in sheet: {c['already_in_all_events']}")
 
     if stats['tiers_used']:
         print(f"\n  Tier usage:")
@@ -1006,6 +1054,17 @@ def run_extract_mode(args):
         print(f"\n  Flag distribution:")
         for flag, n in stats['flag_distribution'].most_common():
             print(f"    {flag:<28} {n:>4}")
+
+    # Region lookup — distinguishes "Gemini got it right" from "we corrected it"
+    rl = stats['region_lookup']
+    if rl['hits'] or rl['unknown_city'] or rl['non_nj_cleared']:
+        autofix_pct = 100 * rl['autofixed'] / max(rl['hits'], 1)
+        print(f"\n  Region lookup activity:")
+        print(f"    NJ cities matched lookup: {rl['hits']}")
+        print(f"      ↳ Gemini already correct: {rl['already_correct']}")
+        print(f"      ↳ region auto-fixed:      {rl['autofixed']}  ({autofix_pct:.0f}% of NJ hits)")
+        print(f"    NON_NJ cleared:           {rl['non_nj_cleared']}")
+        print(f"    Unknown to lookup:        {rl['unknown_city']}")
 
     if stats['skip_reasons']:
         print(f"\n  Skip reasons:")
