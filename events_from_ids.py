@@ -48,6 +48,7 @@ import re
 import sys
 import time
 import urllib.request
+from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -123,6 +124,18 @@ APIFY_DATASET_URL = (
 MODEL_FLASH_LITE = "gemini-2.5-flash-lite"
 MODEL_PRO = "gemini-2.5-pro"
 
+# Rough per-call cost estimates (USD). Vendor pricing changes — these are
+# back-of-envelope figures for run-summary visibility, not billing-grade
+# accuracy. Update as pricing evolves.
+COST_PER_CALL = {
+    'vision':       0.0015,   # Cloud Vision text_detection per image
+    'flash_text':   0.0005,   # Gemini 2.5 Flash-Lite (text input only)
+    'flash_image':  0.0010,   # Gemini 2.5 Flash-Lite (image input)
+    'pro_image':    0.0080,   # Gemini 2.5 Pro (image input)
+}
+
+EXTRACT_RUNS_DIR = Path("outputs/extract_runs")
+
 
 # ─────────────────────────────────────────────────────────────────
 # Setup
@@ -172,13 +185,79 @@ def ensure_schema(ws, dry_run=False):
             return
         print("  Adding QUALITY_FLAGS column to All_Events header...")
         col_letter = chr(ord('A') + len(ALL_EVENTS_HEADER) - 1)
-        ws.update(f"{col_letter}1", [["QUALITY_FLAGS"]])
+        # gspread 6.x argument order: values first, range_name second
+        ws.update(values=[["QUALITY_FLAGS"]], range_name=f"{col_letter}1")
         return
     if dry_run:
         print(f"  [dry-run] header mismatch (have {len(current)} cols, expected {len(ALL_EVENTS_HEADER)}) — would rewrite")
         return
     print("  Rewriting All_Events header to canonical schema...")
-    ws.update("A1", [ALL_EVENTS_HEADER], value_input_option="USER_ENTERED")
+    ws.update(values=[ALL_EVENTS_HEADER], range_name="A1", value_input_option="USER_ENTERED")
+
+
+def init_stats() -> dict:
+    """Bundle of per-run telemetry. Mutated throughout the run; serialized at end."""
+    return {
+        'phase_timings': {
+            'apify_load':  0.0,
+            'ocr':         0.0,
+            'gemini':      0.0,
+            'sheet_write': 0.0,
+        },
+        'counts': {
+            'queue_size':         0,
+            'processed':          0,
+            'extracted_events':   0,
+            'events_with_flags':  0,
+            'no_events':          0,
+            'missing_in_apify':   0,
+        },
+        'tiers_used':         Counter(),  # final tier per post
+        'flag_distribution':  Counter(),  # per-flag occurrence count
+        'skip_reasons':       Counter(),
+        'per_account_events': Counter(),  # handle -> events extracted
+        'api_call_counts': {
+            'vision':       0,
+            'flash_text':   0,
+            'flash_image':  0,
+            'pro_image':    0,
+        },
+    }
+
+
+def estimate_cost(api_call_counts: dict) -> float:
+    """Rough USD estimate from per-call counts. See COST_PER_CALL caveat."""
+    return sum(api_call_counts.get(k, 0) * COST_PER_CALL.get(k, 0)
+               for k in COST_PER_CALL)
+
+
+def write_run_summary(stats: dict, args, wall_time: float, run_id: str):
+    """Persist run summary as JSON for future audit / cross-run analysis."""
+    EXTRACT_RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    out = {
+        'run_id':              run_id,
+        'tag':                 args.tag,
+        'run_timestamp':       datetime.now().isoformat(),
+        'wall_time_seconds':   round(wall_time, 2),
+        'mode':                'extract',
+        'queue_csv':           args.from_ids,
+        'source_datasets':     args.source_datasets.split(',') if args.source_datasets else [],
+        'max_tier':            args.max_tier,
+        'limit':               args.limit,
+        'dry_run':             args.dry_run,
+        'phase_timings_seconds': {k: round(v, 2) for k, v in stats['phase_timings'].items()},
+        'counts':              dict(stats['counts']),
+        'tiers_used':          dict(stats['tiers_used']),
+        'flag_distribution':   dict(stats['flag_distribution']),
+        'skip_reasons':        dict(stats['skip_reasons']),
+        'per_account_events':  dict(stats['per_account_events'].most_common(50)),
+        'api_call_counts':     dict(stats['api_call_counts']),
+        'estimated_cost_usd':  round(estimate_cost(stats['api_call_counts']), 4),
+    }
+    out_path = EXTRACT_RUNS_DIR / f"{run_id}.json"
+    with open(out_path, 'w') as f:
+        json.dump(out, f, indent=2, sort_keys=True)
+    return out_path
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -255,8 +334,9 @@ def collect_carousel_urls(post: dict) -> list:
     return urls
 
 
-def ocr_one_image(vision_client, image_url: str, timeout=15) -> str:
-    """Download image and run OCR. Returns text or '' on any failure."""
+def ocr_one_image(vision_client, image_url: str, stats: dict = None, timeout=15) -> str:
+    """Download image and run OCR. Returns text or '' on any failure.
+    Increments stats['api_call_counts']['vision'] on each text_detection call."""
     if not image_url:
         return ""
     try:
@@ -268,6 +348,8 @@ def ocr_one_image(vision_client, image_url: str, timeout=15) -> str:
         if r.status_code != 200:
             return ""
         image = vision.Image(content=r.content)
+        if stats is not None:
+            stats['api_call_counts']['vision'] += 1
         resp = vision_client.text_detection(image=image)
         if resp.error.message:
             return ""
@@ -279,19 +361,23 @@ def ocr_one_image(vision_client, image_url: str, timeout=15) -> str:
         return ""
 
 
-def ocr_post(vision_client, post: dict) -> tuple:
-    """Run OCR on all images for a post. Returns (combined_ocr_text, num_slides)."""
+def ocr_post(vision_client, post: dict, stats: dict = None) -> tuple:
+    """Run OCR on all images for a post. Returns (combined_ocr_text, num_slides).
+    Times itself into stats['phase_timings']['ocr'] when stats provided."""
     urls = collect_carousel_urls(post)
     if not urls:
         return "", 0
+    t0 = time.perf_counter()
     parts = []
     for i, url in enumerate(urls, 1):
-        text = ocr_one_image(vision_client, url)
+        text = ocr_one_image(vision_client, url, stats=stats)
         if text:
             if len(urls) > 1:
                 parts.append(f"[SLIDE {i} of {len(urls)}]\n{text}")
             else:
                 parts.append(text)
+    if stats is not None:
+        stats['phase_timings']['ocr'] += time.perf_counter() - t0
     return "\n\n".join(parts), len(urls)
 
 
@@ -354,8 +440,12 @@ def build_prompt(post: dict, ocr_text: str, post_date: datetime) -> str:
         """
 
 
-def call_gemini(model, prompt: str) -> Optional[dict]:
-    """Call Gemini and parse JSON response. Returns dict or None on failure."""
+def call_gemini(model, prompt: str, stats: dict = None, tier: str = 'flash_text') -> Optional[dict]:
+    """Call Gemini and parse JSON response. Returns dict or None on failure.
+    Tracks api_call_counts[tier] and phase_timings['gemini'] when stats given."""
+    if stats is not None:
+        stats['api_call_counts'][tier] = stats['api_call_counts'].get(tier, 0) + 1
+    t0 = time.perf_counter()
     try:
         resp = model.generate_content(prompt)
         if not resp:
@@ -364,6 +454,9 @@ def call_gemini(model, prompt: str) -> Optional[dict]:
     except Exception as e:
         print(f"    ✗ Gemini error: {str(e)[:120]}")
         return None
+    finally:
+        if stats is not None:
+            stats['phase_timings']['gemini'] += time.perf_counter() - t0
     clean = re.sub(r'```json\s*|```', '', text).strip()
     try:
         return json.loads(clean)
@@ -419,8 +512,10 @@ def extract_tier_flash_text(ctx: dict, post: dict) -> tuple:
     use it (date↔day, calendar-low-events both need source text)."""
     print(f"  [Tier 1: Flash-Lite + OCR text]")
 
+    stats = ctx.get('stats')
+
     # OCR
-    ocr_text, num_slides = ocr_post(ctx['vision_client'], post)
+    ocr_text, num_slides = ocr_post(ctx['vision_client'], post, stats=stats)
     post['_ocr_text'] = ocr_text  # surface for sanity checks
     has_ocr = bool(ocr_text)
     if has_ocr:
@@ -433,7 +528,7 @@ def extract_tier_flash_text(ctx: dict, post: dict) -> tuple:
 
     # Build prompt + call Flash-Lite
     prompt = build_prompt(post, ocr_text, post_date)
-    data = call_gemini(ctx['model_flash'], prompt)
+    data = call_gemini(ctx['model_flash'], prompt, stats=stats, tier='flash_text')
     if not data:
         return [], num_slides, len(ocr_text), has_ocr
 
@@ -749,7 +844,11 @@ def append_with_formatting(ws, rows: list, start_row: int, dry_run: bool = False
 # ─────────────────────────────────────────────────────────────────
 
 def run_extract_mode(args):
+    run_start = time.perf_counter()
+    run_id = args.tag or datetime.now().strftime("extract_%Y%m%d_%H%M%S")
+
     print(f"━━━ EXTRACT MODE ━━━")
+    print(f"  Run ID:           {run_id}")
     print(f"  Input CSV:        {args.from_ids}")
     print(f"  Source datasets:  {args.source_datasets}")
     print(f"  Max tier:         {args.max_tier}")
@@ -762,6 +861,8 @@ def run_extract_mode(args):
         print("❌ --source-datasets is required for extract mode", file=sys.stderr)
         sys.exit(1)
 
+    stats = init_stats()
+
     # Load orphan queue
     queue_path = Path(args.from_ids)
     if not queue_path.exists():
@@ -771,12 +872,15 @@ def run_extract_mode(args):
         queue = list(csv.DictReader(f))
     if args.limit:
         queue = queue[:args.limit]
+    stats['counts']['queue_size'] = len(queue)
     print(f"  Queue rows: {len(queue)}")
 
-    # Load datasets
+    # Load datasets (timed)
     print(f"\n  Loading Apify datasets...")
+    t0 = time.perf_counter()
     ds_ids = [s.strip() for s in args.source_datasets.split(',') if s.strip()]
     apify_lookup = load_apify_datasets(ds_ids)
+    stats['phase_timings']['apify_load'] = time.perf_counter() - t0
 
     # Load lookups
     region_lookup = load_nj_municipalities()
@@ -791,44 +895,52 @@ def run_extract_mode(args):
 
     ctx = {
         'vision_client': vision_client,
-        'model_flash': model_flash,
-        'model_pro': None,  # lazy-init when first Tier 3 call happens
+        'model_flash':   model_flash,
+        'model_pro':     None,  # lazy-init when first Tier 3 call happens
         'region_lookup': region_lookup,
-        'venue_lookup': venue_lookup,
-        'account_avg': {},  # TODO: derive from history
+        'venue_lookup':  venue_lookup,
+        'account_avg':   {},
+        'stats':         stats,  # mutated by tier handlers
     }
 
-    # Setup sheet (unless dry-run-only)
+    # Setup sheet
     sh = setup_sheet()
     ws = sh.worksheet(ALL_EVENTS_TAB)
     ensure_schema(ws, dry_run=args.dry_run)
-    next_row = ws.row_count + 1 if not args.dry_run else 99999  # placeholder
+    # Find true last data row (row_count is sheet capacity, not data extent)
+    next_row = len(ws.col_values(1)) + 1 if not args.dry_run else 99999
 
-    # Process posts
     pending_rows = []
-    stats = {'processed': 0, 'extracted': 0, 'no_events': 0, 'missing_in_apify': 0, 'flagged': 0}
 
     for i, queue_row in enumerate(queue, 1):
         pid = queue_row.get('post_id', '').strip()
         if not pid:
+            stats['skip_reasons']['empty_post_id_in_queue'] += 1
             continue
+
         post = apify_lookup.get(pid)
         if not post:
             print(f"\n[{i}/{len(queue)}] {pid} — NOT in any source dataset, skipping")
-            stats['missing_in_apify'] += 1
+            stats['counts']['missing_in_apify'] += 1
+            stats['skip_reasons']['missing_in_apify'] += 1
             continue
 
-        print(f"\n[{i}/{len(queue)}] {pid}  @{post.get('ownerUsername', '?')}")
+        account = post.get('ownerUsername', '?')
+        print(f"\n[{i}/{len(queue)}] {pid}  @{account}")
         events, tier_used = process_one_post(ctx, post, max_tier=args.max_tier)
-        stats['processed'] += 1
+        stats['counts']['processed'] += 1
+        stats['tiers_used'][tier_used] += 1
 
         if not events:
             print(f"  ↳ No events extracted (tier={tier_used})")
-            stats['no_events'] += 1
+            stats['counts']['no_events'] += 1
+            stats['skip_reasons']['gemini_returned_no_events'] += 1
             continue
 
         print(f"  ✓ {len(events)} event(s) (tier={tier_used})")
-        stats['extracted'] += len(events)
+        stats['counts']['extracted_events'] += len(events)
+        stats['per_account_events'][account] += len(events)
+
         for idx, ev in enumerate(events, 1):
             name = ev.get('event_name', '(unnamed)')
             date = ev.get('date', '?')
@@ -841,17 +953,21 @@ def run_extract_mode(args):
             print(f"       date={date}  time={ev.get('start_time','—') or '—'}  venue={venue}  city={city}  region={region}  conf={conf}")
             if flags:
                 print(f"       🚩 FLAGS: {flags}")
+                stats['counts']['events_with_flags'] += 1
+                for flag in flags.split(','):
+                    f = flag.strip()
+                    if f:
+                        stats['flag_distribution'][f] += 1
             else:
                 print(f"       ✓ clean (no flags)")
-        for ev in events:
-            if ev.get('quality_flags'):
-                stats['flagged'] += 1
             pending_rows.append(event_to_row(ev, run_tag=args.tag))
 
-        # Incremental flush
+        # Incremental flush — kill-resilient batches
         if len(pending_rows) >= BATCH_SIZE:
+            tw = time.perf_counter()
             append_with_formatting(ws, pending_rows, next_row,
                                    dry_run=args.dry_run, no_format=args.no_formatting)
+            stats['phase_timings']['sheet_write'] += time.perf_counter() - tw
             if not args.dry_run:
                 next_row += len(pending_rows)
             pending_rows = []
@@ -859,15 +975,62 @@ def run_extract_mode(args):
 
     # Final flush
     if pending_rows:
+        tw = time.perf_counter()
         append_with_formatting(ws, pending_rows, next_row,
                                dry_run=args.dry_run, no_format=args.no_formatting)
+        stats['phase_timings']['sheet_write'] += time.perf_counter() - tw
 
+    # ──────────────────────────────────────────────────────────
+    # Summary report
+    # ──────────────────────────────────────────────────────────
+    wall = time.perf_counter() - run_start
     print(f"\n━━━ SUMMARY ━━━")
-    print(f"  Posts processed:        {stats['processed']}")
-    print(f"  Events extracted:       {stats['extracted']}")
-    print(f"  Events with flags:      {stats['flagged']}")
-    print(f"  Posts no events:        {stats['no_events']}")
-    print(f"  Posts missing in Apify: {stats['missing_in_apify']}")
+
+    c = stats['counts']
+    print(f"  Wall time:              {wall:.1f}s")
+    print(f"  Queue rows:             {c['queue_size']}")
+    print(f"  Posts processed:        {c['processed']}")
+    print(f"  Events extracted:       {c['extracted_events']}")
+    print(f"  Events with flags:      {c['events_with_flags']}")
+    print(f"  Posts no events:        {c['no_events']}")
+    print(f"  Posts missing in Apify: {c['missing_in_apify']}")
+
+    if stats['tiers_used']:
+        print(f"\n  Tier usage:")
+        for tier in (TIER_FLASH_TEXT, TIER_FLASH_IMAGE, TIER_PRO_IMAGE):
+            n = stats['tiers_used'].get(tier, 0)
+            pct = 100 * n / max(c['processed'], 1)
+            print(f"    {tier:<14} {n:>4}  ({pct:.0f}%)")
+
+    if stats['flag_distribution']:
+        print(f"\n  Flag distribution:")
+        for flag, n in stats['flag_distribution'].most_common():
+            print(f"    {flag:<28} {n:>4}")
+
+    if stats['skip_reasons']:
+        print(f"\n  Skip reasons:")
+        for reason, n in stats['skip_reasons'].most_common():
+            print(f"    {reason:<32} {n:>4}")
+
+    if stats['per_account_events']:
+        print(f"\n  Top accounts by events extracted:")
+        for handle, n in stats['per_account_events'].most_common(10):
+            print(f"    @{handle:<28} {n:>4}")
+
+    print(f"\n  Phase timings (s):")
+    for phase, t in stats['phase_timings'].items():
+        print(f"    {phase:<14} {t:>7.1f}")
+
+    print(f"\n  API calls + estimated cost:")
+    for kind, n in stats['api_call_counts'].items():
+        cost = n * COST_PER_CALL.get(kind, 0)
+        print(f"    {kind:<14} {n:>5}  ≈ ${cost:.4f}")
+    total_cost = estimate_cost(stats['api_call_counts'])
+    print(f"    {'TOTAL':<14} {'':>5}  ≈ ${total_cost:.4f}")
+
+    # Write JSON summary (always, even on dry-run, for repeatable audits)
+    summary_path = write_run_summary(stats, args, wall, run_id)
+    print(f"\n✓ Run summary saved: {summary_path}")
 
 
 # ─────────────────────────────────────────────────────────────────
