@@ -920,8 +920,16 @@ def process_one_post(ctx: dict, post: dict, max_tier: str = TIER_PRO_IMAGE) -> t
     """Run a post through the tier ladder. Returns (events_with_flags, tier_used).
 
     Starts at TIER_FLASH_CAPTION (cheapest probe — caption only, no Vision)
-    and escalates only when needed."""
-    current_tier = TIER_FLASH_CAPTION
+    and escalates only when needed.
+
+    Smart skip: if the post has no caption text, Tier 1 (caption-only) has
+    nothing to work with — skip directly to TIER_FLASH_IMAGE so we don't
+    waste an API call on guaranteed-empty input."""
+    if not (post.get('caption') or '').strip():
+        print(f"  ↳ no caption — starting at flash_image (skipping Tier 1)")
+        current_tier = TIER_FLASH_IMAGE
+    else:
+        current_tier = TIER_FLASH_CAPTION
     final_events = []
 
     while current_tier is not None:
