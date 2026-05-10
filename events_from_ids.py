@@ -91,13 +91,47 @@ TIER_FLASH_IMAGE   = "flash_image"     # Flash-Lite multimodal (preserves spatia
 TIER_PRO_IMAGE     = "pro_image"       # Pro multimodal — last resort for stubborn cases
 
 # Ladder order — escalation goes left-to-right
-TIER_LADDER = [TIER_FLASH_CAPTION, TIER_FLASH_TEXT, TIER_FLASH_IMAGE, TIER_PRO_IMAGE]
+# Reasoning:
+#   1. flash_caption  — cheapest probe (no API costs beyond one Flash text call)
+#   2. flash_image    — single Flash multimodal call, dramatically cheaper than
+#                       OCR-per-slide on multi-slide posts AND preserves spatial
+#                       layout (addresses kinnectnj-class column-grid bugs)
+#   3. flash_text     — OCR + Flash text. More expensive on carousels but
+#                       useful for diagnosis (per-slide breakdown is visible)
+#   4. pro_image      — Pro multimodal, last resort for stubborn cases
+TIER_LADDER = [TIER_FLASH_CAPTION, TIER_FLASH_IMAGE, TIER_FLASH_TEXT, TIER_PRO_IMAGE]
 
 LOW_CONFIDENCE_THRESHOLD = 0.5
 CALENDAR_KEYWORDS = ("calendar", "lineup", "schedule", "weekly", "monthly",
                      "weekend", "series", "every")
 
 FLAG_BG_COLOR = {"red": 1.0, "green": 0.97, "blue": 0.78}  # light yellow
+
+# Per-cell formatting: when a flag fires, which sheet column(s) should be
+# highlighted on that row? Uses ALL_EVENTS_HEADER labels (resolved to
+# column letters at runtime). Post-level flags map to QUALITY_FLAGS only
+# (no specific field — concern is about the post overall) so the flag
+# column itself becomes the visual signal.
+FLAG_TO_COLUMNS = {
+    'DATE_DAY_MISMATCH':     ['DATE'],
+    'VENUE_CITY_MISMATCH':   ['VENUE NAME', 'CITY'],
+    'CITY_NOT_IN_NJ_LOOKUP': ['CITY', 'SECTION OF NJ'],
+    'REGION_AUTOFIXED':      ['SECTION OF NJ'],
+    'LOW_CONFIDENCE':        ['CONFIDENCE'],
+    # Post-level flags (about the post as a whole, not a specific field):
+    'CALENDAR_LOW_EVENTS':   ['QUALITY_FLAGS'],
+    'CAROUSEL_LOW_EVENTS':   ['QUALITY_FLAGS'],
+    'OCR_RICH_LOW_EVENTS':   ['QUALITY_FLAGS'],
+    'ACCOUNT_PATTERN_DROP':  ['QUALITY_FLAGS'],
+}
+
+
+def _col_letter(header_label: str) -> str:
+    """Convert ALL_EVENTS_HEADER label -> A1 column letter (A, B, ..., AA, AB...)."""
+    idx = ALL_EVENTS_HEADER.index(header_label)
+    if idx < 26:
+        return chr(ord('A') + idx)
+    return chr(ord('A') + (idx // 26) - 1) + chr(ord('A') + (idx % 26))
 
 # Day-name → weekday number (Mon=0)
 DAY_NAMES = {
@@ -379,19 +413,51 @@ def ocr_one_image(vision_client, image_url: str, stats: dict = None, timeout=15)
         return ""
 
 
+def download_post_images(post: dict, max_images: int = 20, timeout: int = 15) -> list:
+    """Download images for a post — returns list of (bytes, mime_type) tuples.
+    Used by flash_image / pro_image tiers (multimodal Gemini takes bytes
+    directly; no Vision API roundtrip needed). Skips images that fail.
+    Caps at max_images to avoid token blowup on huge carousels."""
+    urls = collect_carousel_urls(post)[:max_images]
+    images = []
+    headers = {
+        'User-Agent': 'Mozilla/5.0',
+        'Accept': 'image/webp,image/*,*/*;q=0.8',
+    }
+    for url in urls:
+        try:
+            r = requests.get(url, headers=headers, timeout=timeout)
+            if r.status_code != 200:
+                continue
+            mime = r.headers.get('Content-Type', 'image/jpeg').split(';')[0].strip()
+            # Gemini accepts image/jpeg, image/png, image/webp, image/heic, image/heif
+            if mime not in ('image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'):
+                mime = 'image/jpeg'  # best-effort default
+            images.append((r.content, mime))
+        except Exception:
+            continue
+    return images
+
+
 def ocr_post(vision_client, post: dict, stats: dict = None, verbose_slides: bool = False) -> tuple:
-    """Run OCR on all images for a post. Returns (combined_ocr_text, num_slides).
+    """Run OCR on all images for a post. Returns (combined_ocr_text, num_slides, slides_with_text).
     Times itself into stats['phase_timings']['ocr'] when stats provided.
 
-    For multi-slide posts (>=3 slides) prints a per-slide breakdown so we
-    can see whether the post genuinely has multi-event data spread across
-    slides vs. a single flyer surrounded by promo/decoration images.
-    Critical for diagnosing CAROUSEL_LOW_EVENTS without guessing."""
+    Returns three values:
+      - combined_ocr_text: concatenated OCR output, with [SLIDE N of M] markers
+      - num_slides: total slides processed
+      - slides_with_text: count of slides that produced non-empty OCR
+
+    The slides_with_text count is used by CAROUSEL_LOW_EVENTS to distinguish
+    "carousel of decorative photos + 1 flyer" (where 1-event extraction is
+    correct) from "multiple slides each with event content" (where 1-event
+    extraction probably missed events)."""
     urls = collect_carousel_urls(post)
     if not urls:
-        return "", 0
+        return "", 0, 0
     t0 = time.perf_counter()
     parts = []
+    slides_with_text = 0
     show_breakdown = verbose_slides or len(urls) >= 3
     for i, url in enumerate(urls, 1):
         text = ocr_one_image(vision_client, url, stats=stats)
@@ -403,13 +469,14 @@ def ocr_post(vision_client, post: dict, stats: dict = None, verbose_slides: bool
                 preview = (text or '').replace('\n', ' ')[:60]
                 print(f"      Slide {i}/{len(urls)}: {n} chars  | {preview}")
         if text:
+            slides_with_text += 1
             if len(urls) > 1:
                 parts.append(f"[SLIDE {i} of {len(urls)}]\n{text}")
             else:
                 parts.append(text)
     if stats is not None:
         stats['phase_timings']['ocr'] += time.perf_counter() - t0
-    return "\n\n".join(parts), len(urls)
+    return "\n\n".join(parts), len(urls), slides_with_text
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -471,12 +538,15 @@ def build_prompt(post: dict, ocr_text: str, post_date: datetime) -> str:
         """
 
 
-def call_gemini(model, prompt: str, stats: dict = None, tier: str = 'flash_text') -> Optional[dict]:
+def call_gemini(model, prompt, stats: dict = None, tier: str = 'flash_text') -> Optional[dict]:
     """Call Gemini and parse JSON response. Returns dict or None on failure.
+    Accepts either a string prompt (text-only) or a list mixing text and
+    image dicts for multimodal calls — generate_content() handles both.
     Tracks api_call_counts[tier] and phase_timings['gemini'] when stats given."""
     if stats is not None:
         stats['api_call_counts'][tier] = stats['api_call_counts'].get(tier, 0) + 1
     t0 = time.perf_counter()
+    text = None
     try:
         resp = model.generate_content(prompt)
         if not resp:
@@ -488,6 +558,8 @@ def call_gemini(model, prompt: str, stats: dict = None, tier: str = 'flash_text'
     finally:
         if stats is not None:
             stats['phase_timings']['gemini'] += time.perf_counter() - t0
+    if text is None:
+        return None
     clean = re.sub(r'```json\s*|```', '', text).strip()
     try:
         return json.loads(clean)
@@ -576,11 +648,12 @@ def extract_tier_flash_text(ctx: dict, post: dict) -> tuple:
     stats = ctx.get('stats')
 
     # OCR
-    ocr_text, num_slides = ocr_post(ctx['vision_client'], post, stats=stats)
+    ocr_text, num_slides, slides_with_text = ocr_post(ctx['vision_client'], post, stats=stats)
     post['_ocr_text'] = ocr_text  # surface for sanity checks
+    post['_slides_with_text'] = slides_with_text  # surface for CAROUSEL check
     has_ocr = bool(ocr_text)
     if has_ocr:
-        print(f"    ✓ OCR: {len(ocr_text)} chars across {num_slides} slide(s)")
+        print(f"    ✓ OCR: {len(ocr_text)} chars across {num_slides} slide(s) ({slides_with_text} with text)")
     else:
         print(f"    ⚠ No OCR text")
 
@@ -600,15 +673,54 @@ def extract_tier_flash_text(ctx: dict, post: dict) -> tuple:
 
 
 def extract_tier_flash_image(ctx: dict, post: dict) -> tuple:
-    """Tier 3: Flash-Lite multimodal. TODO — implement after lower tiers verified."""
-    print(f"  [Tier 3: Flash-Lite + image — NOT YET IMPLEMENTED, falling back to Tier 2]")
-    return extract_tier_flash_text(ctx, post)
+    """Tier 2: Flash-Lite multimodal. Sends caption + post images directly to
+    Gemini (no Vision OCR) — single API call regardless of slide count, and
+    preserves spatial layout (addresses kinnectnj-class column-grid bugs).
+
+    Returns (events, slide_count, ocr_len, has_ocr).
+    Note: ocr_len=0, has_ocr=False because this tier doesn't do OCR. Subsequent
+    sanity checks that depend on OCR text won't fire (intentional — escalation
+    to flash_text would re-introduce them if needed)."""
+    print(f"  [Tier 2: Flash-Lite multimodal (image)]")
+    stats = ctx.get('stats')
+
+    images = download_post_images(post)
+    num_slides = len(collect_carousel_urls(post))
+    if not images:
+        print(f"    ⚠ No images downloadable — falling back to caption-only handling")
+        post['_ocr_text'] = ""
+        post_date = parse_post_date(post)
+        prompt = build_prompt(post, "", post_date)
+        data = call_gemini(ctx['model_flash'], prompt, stats=stats, tier='flash_caption')
+        if not data:
+            return [], num_slides, 0, False
+        events = data.get('events', [])
+        is_calendar = data.get('is_calendar_post', False)
+        return enrich_events(events, post, post_date.strftime('%Y-%m-%d'),
+                             has_ocr=False, is_calendar=is_calendar), num_slides, 0, False
+
+    print(f"    ✓ {len(images)} image(s) prepared for multimodal")
+    post['_ocr_text'] = ""  # consistent interface; this tier doesn't have OCR text
+    post_date = parse_post_date(post)
+    prompt = build_prompt(post, "", post_date)
+
+    # Multimodal payload: prompt text + each image as a content part
+    content = [prompt] + [{'mime_type': mime, 'data': data} for data, mime in images]
+    resp_data = call_gemini(ctx['model_flash'], content, stats=stats, tier='flash_image')
+    if not resp_data:
+        return [], num_slides, 0, False
+
+    events = resp_data.get('events', [])
+    is_calendar = resp_data.get('is_calendar_post', False)
+    enriched = enrich_events(events, post, post_date.strftime('%Y-%m-%d'),
+                             has_ocr=False, is_calendar=is_calendar)
+    return enriched, num_slides, 0, False
 
 
 def extract_tier_pro_image(ctx: dict, post: dict) -> tuple:
-    """Tier 4: Pro multimodal. TODO — implement after lower tiers verified."""
-    print(f"  [Tier 4: Pro + image — NOT YET IMPLEMENTED, falling back to Tier 2]")
-    return extract_tier_flash_text(ctx, post)
+    """Tier 4: Pro multimodal. TODO — implementation pending; falls back to flash_image."""
+    print(f"  [Tier 4: Pro + image — NOT YET IMPLEMENTED, falling back to Tier 2 (flash_image)]")
+    return extract_tier_flash_image(ctx, post)
 
 
 TIER_HANDLERS = {
@@ -740,16 +852,30 @@ def check_calendar_low_events(caption: str, ocr_text: str, num_events: int) -> O
     return "CALENDAR_LOW_EVENTS"
 
 
-def check_carousel_low_events(slide_count: int, num_events: int) -> Optional[str]:
-    if slide_count >= 3 and num_events <= 1:
+def check_carousel_low_events(slide_count: int, slides_with_text: int, num_events: int) -> Optional[str]:
+    """Fire only when 3+ slides actually have text content AND ≤1 event extracted.
+    Counting raw slide_count was too noisy — promotional carousels often have
+    1 flyer + many decoration photos, where 1 event is the right answer.
+    Requiring 3+ slides with text means there's actually multiple text regions
+    that each could plausibly contain an event."""
+    if slide_count >= 3 and slides_with_text >= 3 and num_events <= 1:
         return "CAROUSEL_LOW_EVENTS"
     return None
 
 
-def check_ocr_rich_low_events(ocr_len: int, num_events: int) -> Optional[str]:
-    if ocr_len >= 1500 and num_events <= 1:
-        return "OCR_RICH_LOW_EVENTS"
-    return None
+def check_ocr_rich_low_events(ocr_text: str, num_events: int) -> Optional[str]:
+    """Fire only when OCR text is long AND contains ≥2 distinct dates AND
+    ≤1 event extracted. The keyword/length-only version fired on long
+    descriptive captions (e.g., 'thanks to our community...') with no
+    actual missed events. Multiple distinct dates is the structural
+    signal that real multi-event content was likely missed."""
+    if num_events > 1:
+        return None
+    if not ocr_text or len(ocr_text) < 1500:
+        return None
+    if _count_distinct_dates(ocr_text) < 2:
+        return None
+    return "OCR_RICH_LOW_EVENTS"
 
 
 def check_account_pattern(account: str, num_events: int, account_avg: dict) -> Optional[str]:
@@ -818,13 +944,14 @@ def process_one_post(ctx: dict, post: dict, max_tier: str = TIER_PRO_IMAGE) -> t
             flags_per_event.append(row_flags)
 
         # Post-level flags (apply to all events)
+        slides_with_text = post.get('_slides_with_text', 0)
         post_flags = []
         for f in [
             check_calendar_low_events(post.get('caption', ''),
                                       post.get('_ocr_text', ''),
                                       len(events)),
-            check_carousel_low_events(slide_count, len(events)),
-            check_ocr_rich_low_events(ocr_len, len(events)),
+            check_carousel_low_events(slide_count, slides_with_text, len(events)),
+            check_ocr_rich_low_events(post.get('_ocr_text', ''), len(events)),
             check_account_pattern(post.get('ownerUsername', ''), len(events), ctx['account_avg']),
         ]:
             if f: post_flags.append(f)
@@ -909,28 +1036,70 @@ def event_to_row(event: dict, run_tag: str = "") -> list:
 
 
 def append_with_formatting(ws, rows: list, start_row: int, dry_run: bool = False, no_format: bool = False):
-    """Append rows + apply light yellow to flagged ones."""
+    """Append rows + apply per-cell light yellow based on which flag fired.
+
+    Per-cell coloring (vs. whole-row) lets the user visually identify exactly
+    which field is uncertain — date cell yellow = date is suspect, city cell
+    yellow = city is uncertain, etc. Post-level flags color the QUALITY_FLAGS
+    cell itself, since they're not about a specific field.
+
+    Uses gspread's batch_format to apply all formatting in one API call (vs.
+    one ws.format() per row, which used to hit rate limits)."""
     if not rows:
         return
+
+    # Compute per-row cells to highlight up front (used by both dry-run and live)
+    per_row_cells = []
+    for r in rows:
+        flags_str = r[QUALITY_FLAGS_COL_IDX]
+        if not flags_str:
+            per_row_cells.append(set())
+            continue
+        cells = set()
+        for f in flags_str.split(','):
+            f = f.strip()
+            if f in FLAG_TO_COLUMNS:
+                cells.update(FLAG_TO_COLUMNS[f])
+        per_row_cells.append(cells)
+
     if dry_run:
         print(f"  [dry-run] would append {len(rows)} rows starting at row {start_row}")
-        flagged = [i for i, r in enumerate(rows) if r[QUALITY_FLAGS_COL_IDX]]
-        if flagged:
-            print(f"  [dry-run] would format {len(flagged)} flagged row(s) light yellow")
+        cell_count = sum(len(c) for c in per_row_cells)
+        if cell_count:
+            print(f"  [dry-run] would format {cell_count} cells light yellow (per-flag)")
         return
+
     ws.append_rows(rows, value_input_option="USER_ENTERED")
     if no_format:
         return
-    flagged = [i for i, r in enumerate(rows) if r[QUALITY_FLAGS_COL_IDX]]
-    last_col = chr(ord('A') + len(ALL_EVENTS_HEADER) - 1)
-    for offset in flagged:
-        row_num = start_row + offset
-        a1 = f"A{row_num}:{last_col}{row_num}"
-        try:
-            ws.format(a1, {"backgroundColor": FLAG_BG_COLOR})
-            time.sleep(0.3)
-        except Exception as e:
-            print(f"    ⚠ Format failed for row {row_num}: {str(e)[:80]}")
+
+    # Build batch_format request: one entry per (row, cell) flagged
+    format_requests = []
+    for i, cells in enumerate(per_row_cells):
+        if not cells:
+            continue
+        row_num = start_row + i
+        for col_label in cells:
+            letter = _col_letter(col_label)
+            format_requests.append({
+                'range': f'{letter}{row_num}',
+                'format': {'backgroundColor': FLAG_BG_COLOR},
+            })
+
+    if not format_requests:
+        return
+    try:
+        ws.batch_format(format_requests)
+    except AttributeError:
+        # Older gspread without batch_format — fall back to per-cell calls
+        for fr in format_requests:
+            try:
+                ws.format(fr['range'], fr['format'])
+                time.sleep(0.3)
+            except Exception as e2:
+                print(f"    ⚠ Format failed for {fr['range']}: {str(e2)[:80]}")
+    except Exception as e:
+        print(f"    ⚠ batch_format failed: {str(e)[:120]}")
 
 
 # ─────────────────────────────────────────────────────────────────
