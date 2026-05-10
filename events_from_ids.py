@@ -71,16 +71,22 @@ ALL_EVENTS_TAB = "All_Events"
 NJ_MUNICIPALITIES_JSON = "data/nj_municipalities.json"
 VENUE_CITY_CANONICAL_JSON = "data/venue_city_canonical.json"
 
-# Sheet schema — matches save_data() in main.py + new QUALITY_FLAGS column
+# Sheet schema — extends what save_data() in main.py produces with two new
+# columns at the end: QUALITY_FLAGS and RECURRENCE_PATTERN. Appending at end
+# (vs inserting in the middle) makes the migration trivial — append columns
+# to existing sheets without shifting any data.
 ALL_EVENTS_HEADER = [
     "INSTAGRAM HANDLE", "EVENT NAME", "DATE", "START TIME",
     "VENUE NAME", "CITY", "SECTION OF NJ", "NEWSLETTER DESCRIPTION",
     "INSTAGRAM POST URL", "DISPLAY URL", "POST URL", "INSTAGRAM PROFILE URL",
     "EVENT TYPE", "ACCOUNT NAME", "DESCRIPTION", "PERFORMER", "PRICE",
     "CONFIDENCE", "POST ID", "HAD OCR", "FROM CALENDAR",
-    "IS RECURRING", "PROCESSED TIMESTAMP", "QUALITY_FLAGS",
+    "IS RECURRING", "PROCESSED TIMESTAMP",
+    "QUALITY_FLAGS",        # added today: per-row sanity-check fingerprint
+    "RECURRENCE_PATTERN",   # added today: e.g., "Mon-Fri", "Every Saturday", "Daily"
 ]
 QUALITY_FLAGS_COL_IDX = ALL_EVENTS_HEADER.index("QUALITY_FLAGS")
+RECURRENCE_PATTERN_COL_IDX = ALL_EVENTS_HEADER.index("RECURRENCE_PATTERN")
 
 BATCH_SIZE = 25
 BATCH_DELAY_SEC = 1.5
@@ -214,23 +220,45 @@ def setup_gemini(model_name: str, api_key: Optional[str] = None):
     return genai.GenerativeModel(model_name)
 
 
+def _idx_to_col_letter(idx: int) -> str:
+    """0-indexed column number -> A1 letter ('A', 'B', ..., 'Z', 'AA', 'AB', ...)."""
+    if idx < 26:
+        return chr(ord('A') + idx)
+    return chr(ord('A') + (idx // 26) - 1) + chr(ord('A') + (idx % 26))
+
+
 def ensure_schema(ws, dry_run=False):
-    current = ws.row_values(1)
+    """Bring All_Events header to ALL_EVENTS_HEADER. Handles three cases:
+    1. Already canonical → no-op
+    2. Current is a prefix (missing trailing columns) → append the missing ones
+       (this is the safe migration path — preserves existing row data)
+    3. Mid-row mismatch (column shifted/renamed) → full rewrite (loud)
+    """
+    current = [c.strip() for c in ws.row_values(1)]
     if current == ALL_EVENTS_HEADER:
         return
-    if len(current) == len(ALL_EVENTS_HEADER) - 1:
-        if dry_run:
-            print("  [dry-run] would add QUALITY_FLAGS column to All_Events header")
+
+    # Prefix-match: current header matches the start of the canonical, just
+    # missing some columns at the end. Safe to append.
+    if (len(current) <= len(ALL_EVENTS_HEADER)
+            and ALL_EVENTS_HEADER[:len(current)] == current):
+        missing = ALL_EVENTS_HEADER[len(current):]
+        if not missing:
             return
-        print("  Adding QUALITY_FLAGS column to All_Events header...")
-        col_letter = chr(ord('A') + len(ALL_EVENTS_HEADER) - 1)
-        # gspread 6.x argument order: values first, range_name second
-        ws.update(values=[["QUALITY_FLAGS"]], range_name=f"{col_letter}1")
+        if dry_run:
+            print(f"  [dry-run] would append {len(missing)} column(s): {missing}")
+            return
+        print(f"  Appending {len(missing)} column(s) to All_Events: {missing}")
+        start_col = _idx_to_col_letter(len(current))
+        ws.update(values=[missing], range_name=f"{start_col}1")
         return
+
+    # Otherwise: header has unexpected drift — rewrite (preserves data, may
+    # cause column-meaning mismatch on existing rows; warn loudly)
     if dry_run:
-        print(f"  [dry-run] header mismatch (have {len(current)} cols, expected {len(ALL_EVENTS_HEADER)}) — would rewrite")
+        print(f"  [dry-run] header has drift: have {len(current)} cols, expected {len(ALL_EVENTS_HEADER)} — would rewrite (CAUTION: existing rows may misalign)")
         return
-    print("  Rewriting All_Events header to canonical schema...")
+    print(f"  ⚠ Rewriting All_Events header (drift from canonical) — {len(current)} → {len(ALL_EVENTS_HEADER)} cols")
     ws.update(values=[ALL_EVENTS_HEADER], range_name="A1", value_input_option="USER_ENTERED")
 
 
@@ -484,17 +512,21 @@ def ocr_post(vision_client, post: dict, stats: dict = None, verbose_slides: bool
 # ─────────────────────────────────────────────────────────────────
 
 def build_prompt(post: dict, ocr_text: str, post_date: datetime) -> str:
-    """Same prompt as main.py:784. One source of truth via copy for now;
-    when prompt audit (A6) lands, both sites will update together."""
+    """Construct the extraction prompt sent to Gemini. A6 prompt audit
+    introduced 6 categories of guidance: anti-hallucination, spatial layout,
+    explicit relative-date resolution, recurring/multi-day handling,
+    city specificity, and confidence scale documentation."""
     user = post.get('ownerUsername', '')
     owner_full_name = post.get('ownerFullName', '')
     location_name = post.get('locationName', '') or post.get('location', '')
     caption = post.get('caption', '') or post.get('text', '')
+    post_date_str = post_date.strftime('%Y-%m-%d')
+    post_day_name = post_date.strftime('%A')
 
     return f"""
         Extract ALL events from this Instagram post. A post may contain MULTIPLE events.
 
-        POST DATE: {post_date.strftime('%Y-%m-%d')} (use this to resolve relative and recurring dates)
+        POST DATE: {post_date_str} ({post_day_name}) — your anchor for relative dates
         ACCOUNT: @{user} ({owner_full_name})
         LOCATION TAG: {location_name}
 
@@ -504,31 +536,104 @@ def build_prompt(post: dict, ocr_text: str, post_date: datetime) -> str:
         Each slide may show different events (e.g. a weekly calendar spread across slides).
         Extract events from ALL slides.
 
-        EXTRACTION INSTRUCTIONS:
-        1. Look for MULTIPLE events - calendars, weekly lineups, event series
-        2. Common patterns: "Monday: Jazz Night, Tuesday: Open Mic"
-        3. Monthly calendars: "Dec 15 - Band Name, Dec 22 - Holiday Party"
-        4. Each date/event combination should be a separate event
-        5. If location_name exists, use it as venue for ALL events
+        ════════════════════════════════════════════════════
+        EXTRACTION GUIDANCE
+        ════════════════════════════════════════════════════
 
-        DATE PARSING — handle ALL formats and convert to YYYY-MM-DD:
+        ANTI-HALLUCINATION (critical):
+        Each event's name, date, venue, and city MUST appear in (or be a clear
+        paraphrase of) the caption or OCR text. Do NOT invent details. If a
+        required field cannot be found in the source, leave it BLANK rather
+        than guessing.
+
+        SPATIAL LAYOUT (multi-column flyers):
+        If the post has a grid or table layout (e.g., 2-column event list),
+        preserve each event's pairing with its corresponding venue and time.
+        Do NOT shuffle these fields across rows of the grid. Read each
+        cell/box as a self-contained unit.
+
+        MULTIPLE EVENTS:
+        - Calendars, weekly lineups, event series → extract each
+        - "Monday: Jazz Night, Tuesday: Open Mic" → 2 events
+        - "Dec 15 - Band, Dec 22 - Party" → 2 events
+        - If a single recurring deal applies to a day RANGE (e.g.
+          "Mon-Fri Happy Hour"), extract as ONE event (see RECURRING below),
+          NOT one event per day.
+
+        ════════════════════════════════════════════════════
+        DATE HANDLING
+        ════════════════════════════════════════════════════
+
+        DATE PARSING — handle these formats and convert to YYYY-MM-DD:
         - Shorthand: "3.13.26", "3.13", "3/13", "March 13th", "Mar 13"
-        - Day refs: "this Saturday", "next Friday", "tonight" → calculate from POST DATE
         - Year shorthand: "26" means 2026, "25" means 2025
+        - "<day> <date>": e.g., "Friday May 9" — use the explicit date.
+          (If day-of-week conflicts with date, prefer the date.)
 
-        RECURRING EVENTS — if no specific one-time date:
-        - "Every Saturday", "Weekly Thursdays", "EVERY SATURDAY & SUNDAY"
-        → Calculate NEXT occurrence ON OR AFTER POST DATE, set "is_recurring": true
+        RELATIVE DATE RESOLUTION (POST DATE = {post_date_str}, {post_day_name}):
+        - "today" / "tonight" → POST DATE
+        - "tomorrow" → POST DATE + 1 day
+        - "this <day>":
+            • If POST DATE falls on that day → use POST DATE itself
+            • Otherwise → next occurrence within 6 days
+        - "next <day>" → strictly AFTER this <day> (typically following week)
+        - "this weekend":
+            • If POST DATE is Fri/Sat/Sun → that weekend (Sat or Sun)
+            • Otherwise → upcoming Saturday/Sunday
+        - "next weekend" → the weekend AFTER this weekend
 
-        REQUIREMENTS:
-        1. event_name: Max 40 characters
-        2. newsletter_description: one-sentence punchy teaser
-        3. section_of_nj: North/Central/South based on city/county
-        4. start_time: Strict 12-hour format (e.g. 2:00 PM)
+        ════════════════════════════════════════════════════
+        RECURRING / MULTI-DAY EVENTS
+        ════════════════════════════════════════════════════
 
-        Return JSON with "events" list containing:
-        event_name, date (YYYY-MM-DD), start_time, venue_name, city, section_of_nj,
-        newsletter_description, event_type, description, performer, price, confidence, is_recurring
+        Extract as ONE event (NOT multiple) with is_recurring=true when:
+        - "Every <day>" — "Every Saturday", "Every Friday night"
+        - Day RANGE — "Mon-Fri", "Wednesday-Saturday", "Mon through Fri"
+        - Shorthand — "weekday", "weeknight" (= Mon-Fri), "weekend" (= Sat-Sun)
+        - Ongoing offers — "Daily happy hour", "Trivia Tuesdays", "$5 marg mon-fri"
+
+        For these:
+        - date: NEXT occurrence on or after POST DATE
+        - is_recurring: true
+        - recurrence_pattern: short pattern like "Mon-Fri", "Every Saturday",
+          "Daily", "Weekend", "Mon/Wed/Fri"
+
+        DATE RANGES (one-time events spanning multiple days):
+        - "Sale May 5-12" → ONE event, date=2026-05-05, is_recurring=false
+        - Include the date range in the description.
+
+        ════════════════════════════════════════════════════
+        FIELD REQUIREMENTS
+        ════════════════════════════════════════════════════
+
+        1. event_name: Max 40 characters. If natural name is longer, create a
+           shorter marketable version that captures the essence.
+        2. newsletter_description: one-sentence punchy teaser for a newsletter.
+        3. city: SPECIFIC NJ municipality (e.g., "Newark", "Jersey City",
+           "Madison", "Asbury Park"). NEVER use the state name "New Jersey",
+           "NJ", or generic "NJ area". If the city cannot be determined,
+           leave it BLANK.
+        4. section_of_nj: North / Central / South based on the city's county:
+           - North = Bergen, Essex, Hudson, Morris, Passaic, Sussex, Warren
+           - Central = Hunterdon, Mercer, Middlesex, Monmouth, Somerset, Union
+           - South = Atlantic, Burlington, Camden, Cape May, Cumberland,
+                    Gloucester, Ocean, Salem
+           If city is empty or out-of-state, leave section_of_nj BLANK.
+        5. start_time: Strict 12-hour format (e.g., "2:00 PM"). Blank if not stated.
+        6. confidence: Float between 0.0 and 1.0 (NOT a percentage):
+           • 0.9-1.0 = explicit info (date, venue, time clearly stated)
+           • 0.7-0.9 = mostly stated; minor inference required
+           • 0.5-0.7 = significant inference; some fields ambiguous
+           • < 0.5 = guesswork; consider whether to extract at all
+
+        ════════════════════════════════════════════════════
+        OUTPUT FORMAT
+        ════════════════════════════════════════════════════
+
+        Return JSON with "events" list. Each event has these fields:
+        event_name, date (YYYY-MM-DD), start_time, venue_name, city,
+        section_of_nj, newsletter_description, event_type, description,
+        performer, price, confidence, is_recurring, recurrence_pattern
 
         Also include:
         "total_events_found": number,
@@ -735,9 +840,53 @@ TIER_HANDLERS = {
 # Sanity checks
 # ─────────────────────────────────────────────────────────────────
 
+def _expand_day_ranges(text: str) -> set:
+    """Detect day ranges in text and return the set of weekday numbers
+    they cover. Without this, 'Mon-Fri' would be parsed as just {Mon, Fri}
+    instead of {Mon, Tue, Wed, Thu, Fri}, which produces false positives
+    on DATE_DAY_MISMATCH for recurring deals across a range."""
+    days = set()
+    src = text.lower()
+
+    # Hyphen patterns: "mon-fri", "wednesday - saturday", "mon — sat"
+    for m in re.finditer(r'\b([a-z]+)\s*[-–—]\s*([a-z]+)\b', src):
+        s = DAY_NAMES.get(m.group(1))
+        e = DAY_NAMES.get(m.group(2))
+        if s is not None and e is not None:
+            i = s
+            for _ in range(7):
+                days.add(i)
+                if i == e:
+                    break
+                i = (i + 1) % 7
+
+    # "X to Y" / "X through Y" / "X thru Y"
+    for m in re.finditer(r'\b([a-z]+)\s+(?:to|through|thru)\s+([a-z]+)\b', src):
+        s = DAY_NAMES.get(m.group(1))
+        e = DAY_NAMES.get(m.group(2))
+        if s is not None and e is not None:
+            i = s
+            for _ in range(7):
+                days.add(i)
+                if i == e:
+                    break
+                i = (i + 1) % 7
+
+    # Shortcut tokens
+    if re.search(r'\bweekend\b', src):
+        days.update({5, 6})
+    if re.search(r'\bweek(?:day|night)s?\b', src):
+        days.update({0, 1, 2, 3, 4})
+    if re.search(r'\bdaily\b', src):
+        days.update({0, 1, 2, 3, 4, 5, 6})
+
+    return days
+
+
 def check_date_day_match(event: dict, source_text: str) -> Optional[str]:
-    """If source mentions a day name and extracted date doesn't fall on
-    that day, flag it."""
+    """Flag if extracted date doesn't fall on a day that the source text
+    indicates. Handles day ranges (mon-fri, weekend, daily) so it doesn't
+    fire false positives on multi-day recurring deals."""
     date_str = event.get('date', '')
     if not date_str or not source_text:
         return None
@@ -748,11 +897,15 @@ def check_date_day_match(event: dict, source_text: str) -> Optional[str]:
     actual_day = d.weekday()  # 0=Mon
 
     src_lower = source_text.lower()
+
+    # Direct day-name mentions
     mentioned_days = set()
     for name, num in DAY_NAMES.items():
-        # word-boundary match
         if re.search(rf'\b{name}\b', src_lower):
             mentioned_days.add(num)
+
+    # Expand to include day ranges (mon-fri, weekend, daily, etc.)
+    mentioned_days.update(_expand_day_ranges(src_lower))
 
     if not mentioned_days:
         return None
@@ -1039,6 +1192,7 @@ def event_to_row(event: dict, run_tag: str = "") -> list:
         "IS RECURRING": up(event.get('is_recurring', '')),
         "PROCESSED TIMESTAMP": event.get('processed_timestamp', ''),
         "QUALITY_FLAGS": event.get('quality_flags', ''),
+        "RECURRENCE_PATTERN": up(event.get('recurrence_pattern', '')),
     }
     return [fields[col] for col in ALL_EVENTS_HEADER]
 
