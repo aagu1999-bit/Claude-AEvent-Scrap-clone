@@ -1222,11 +1222,21 @@ def process_one_post(ctx: dict, post: dict, max_tier: str = TIER_PRO_IMAGE) -> t
         nt = next_tier(current_tier)
 
         # Escalate if either:
-        #  (a) any escalation flag fired, OR
-        #  (b) we got 0 events at a non-final tier (cheap probe missed —
-        #      worth trying the more expensive tier once)
+        #  (a) any escalation flag fired (ALWAYS escalates, including to Pro), OR
+        #  (b) we got 0 events at a non-final, non-Pro tier (the cheap probe
+        #      missed — worth trying a more expensive non-Pro tier once)
+        #
+        # Critical: we DO NOT escalate to Tier 4 (Pro) just because earlier
+        # tiers returned 0 events. If Tier 1+2+3 all returned 0 events with
+        # no quality flags, the post likely has no event content (Reels with
+        # empty captions, recap posts, etc.) — Pro can't manufacture events
+        # from nothing, and Pro is ~8× more expensive than Flash-Lite. Only
+        # specific quality concerns (a flag firing) earn Pro budget.
+        # Discovered via tier4_test (PR #8): 5 of 6 captionless-Reel posts
+        # escalated all the way to Pro on zero_events with no flags, all
+        # produced 0 events at Pro too. Wasted ~$0.04 on a 10-post test.
         flag_escalate = should_escalate(list(all_flags))
-        zero_event_escalate = (len(events) == 0)
+        zero_event_escalate = (len(events) == 0 and nt != TIER_PRO_IMAGE)
         can_escalate = nt is not None and current_tier != max_tier
 
         if can_escalate and (flag_escalate or zero_event_escalate):
