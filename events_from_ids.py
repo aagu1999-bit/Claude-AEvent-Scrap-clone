@@ -324,8 +324,14 @@ def estimate_cost(api_call_counts: dict) -> float:
                for k in COST_PER_CALL)
 
 
-def write_run_summary(stats: dict, args, wall_time: float, run_id: str):
-    """Persist run summary as JSON for future audit / cross-run analysis."""
+def write_run_summary(stats: dict, args, wall_time: float, run_id: str,
+                      interrupted: bool = False):
+    """Persist run summary as JSON for future audit / cross-run analysis.
+
+    Set interrupted=True when called from the SIGINT path — adds an
+    'interrupted' flag and 'completion_status' field to the JSON so
+    downstream tools (merge_extract_runs.py, audits) can distinguish
+    partial summaries from complete ones."""
     EXTRACT_RUNS_DIR.mkdir(parents=True, exist_ok=True)
     out = {
         'run_id':              run_id,
@@ -333,6 +339,8 @@ def write_run_summary(stats: dict, args, wall_time: float, run_id: str):
         'run_timestamp':       datetime.now().isoformat(),
         'wall_time_seconds':   round(wall_time, 2),
         'mode':                'extract',
+        'completion_status':   'interrupted' if interrupted else 'completed',
+        'interrupted':         interrupted,
         'queue_csv':           args.from_ids,
         'source_datasets':     args.source_datasets.split(',') if args.source_datasets else [],
         'max_tier':            args.max_tier,
@@ -1636,27 +1644,42 @@ def run_extract_mode(args):
 
     # Drive the work pool. ThreadPoolExecutor handles 1+ workers cleanly
     # — at workers=1, behavior is effectively serial (slight overhead).
-    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-        # Submit all and wait. We use list(map) because we don't need
-        # incremental result handling — workers update shared state directly.
-        list(pool.map(process_one_queue_row, list(enumerate(queue, 1))))
+    # KeyboardInterrupt is caught so Ctrl+C still flushes pending rows AND
+    # writes a (partial) JSON summary marked interrupted=true. Otherwise a
+    # killed run loses ALL telemetry and up to BATCH_SIZE in-memory events.
+    interrupted = False
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+            # Submit all and wait. We use list(map) because we don't need
+            # incremental result handling — workers update shared state directly.
+            list(pool.map(process_one_queue_row, list(enumerate(queue, 1))))
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\n\n⚠ INTERRUPTED (Ctrl+C) — flushing pending rows and writing partial summary...")
 
-    # Final flush of any leftover rows
+    # Final flush of any leftover rows — runs regardless of interrupt, so
+    # the in-memory batch lands in the sheet before we exit
     with pending_lock:
         if pending_rows:
-            tw = time.perf_counter()
-            batch = list(pending_rows)
-            pending_rows.clear()
-            start_row = state['next_row']
-            append_with_formatting(ws, batch, start_row,
-                                   dry_run=args.dry_run, no_format=args.no_formatting)
-            stats['phase_timings']['sheet_write'] += time.perf_counter() - tw
+            try:
+                tw = time.perf_counter()
+                batch = list(pending_rows)
+                pending_rows.clear()
+                start_row = state['next_row']
+                append_with_formatting(ws, batch, start_row,
+                                       dry_run=args.dry_run, no_format=args.no_formatting)
+                stats['phase_timings']['sheet_write'] += time.perf_counter() - tw
+                if interrupted:
+                    print(f"  ✓ Flushed {len(batch)} pending events to All_Events before exit")
+            except Exception as e:
+                print(f"  ⚠ Final flush failed: {e}")
 
     # ──────────────────────────────────────────────────────────
     # Summary report
     # ──────────────────────────────────────────────────────────
     wall = time.perf_counter() - run_start
-    print(f"\n━━━ SUMMARY ━━━")
+    status_banner = "━━━ SUMMARY (INTERRUPTED — PARTIAL) ━━━" if interrupted else "━━━ SUMMARY ━━━"
+    print(f"\n{status_banner}")
 
     c = stats['counts']
     print(f"  Wall time:              {wall:.1f}s")
@@ -1713,7 +1736,7 @@ def run_extract_mode(args):
     print(f"    {'TOTAL':<14} {'':>5}  ≈ ${total_cost:.4f}")
 
     # Write JSON summary (always, even on dry-run, for repeatable audits)
-    summary_path = write_run_summary(stats, args, wall, run_id)
+    summary_path = write_run_summary(stats, args, wall, run_id, interrupted=interrupted)
     print(f"\n✓ Run summary saved: {summary_path}")
 
 
