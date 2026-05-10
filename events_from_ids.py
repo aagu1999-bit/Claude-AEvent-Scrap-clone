@@ -121,6 +121,8 @@ FLAG_BG_COLOR = {"red": 1.0, "green": 0.97, "blue": 0.78}  # light yellow
 FLAG_TO_COLUMNS = {
     'DATE_DAY_MISMATCH':     ['DATE'],
     'MISSING_DATE':          ['DATE'],
+    'PAST_DATE':             ['DATE'],
+    'FAR_FUTURE_DATE':       ['DATE'],
     'VENUE_CITY_MISMATCH':   ['VENUE NAME', 'CITY'],
     'CITY_NOT_IN_NJ_LOOKUP': ['CITY', 'SECTION OF NJ'],
     'REGION_AUTOFIXED':      ['SECTION OF NJ'],
@@ -130,6 +132,7 @@ FLAG_TO_COLUMNS = {
     'CAROUSEL_LOW_EVENTS':   ['QUALITY_FLAGS'],
     'OCR_RICH_LOW_EVENTS':   ['QUALITY_FLAGS'],
     'ACCOUNT_PATTERN_DROP':  ['QUALITY_FLAGS'],
+    'NO_GROUNDING':          ['QUALITY_FLAGS'],
 }
 
 
@@ -621,6 +624,8 @@ def build_prompt(post: dict, ocr_text: str, post_date: datetime) -> str:
                     Gloucester, Ocean, Salem
            If city is empty or out-of-state, leave section_of_nj BLANK.
         5. start_time: Strict 12-hour format (e.g., "2:00 PM"). Blank if not stated.
+           If source gives a TIME RANGE ("4-7 PM", "11AM-3PM", "6 to 10pm"),
+           use the START of the range here. Put the full range in description.
         6. confidence: Float between 0.0 and 1.0 (NOT a percentage):
            • 0.9-1.0 = explicit info (date, venue, time clearly stated)
            • 0.7-0.9 = mostly stated; minor inference required
@@ -824,9 +829,54 @@ def extract_tier_flash_image(ctx: dict, post: dict) -> tuple:
 
 
 def extract_tier_pro_image(ctx: dict, post: dict) -> tuple:
-    """Tier 4: Pro multimodal. TODO — implementation pending; falls back to flash_image."""
-    print(f"  [Tier 4: Pro + image — NOT YET IMPLEMENTED, falling back to Tier 2 (flash_image)]")
-    return extract_tier_flash_image(ctx, post)
+    """Tier 4: Pro multimodal. Last resort for cases that flash_image still
+    flags. Same input shape as flash_image (caption + all images, single
+    multimodal call) but uses Gemini 2.5 Pro for higher-quality reasoning.
+
+    Pro is dramatically more expensive than Flash-Lite (~8× per call), so
+    this should only fire on a small minority of posts that escalate
+    through Tiers 1-3 with persistent flags. The cost discipline is
+    enforced by the tier ladder; the model itself does not gate."""
+    print(f"  [Tier 4: Pro multimodal (image)]")
+    stats = ctx.get('stats')
+
+    # Lazy-init the Pro model — most runs never hit this tier, so paying
+    # the import/setup cost only when needed
+    if ctx.get('model_pro') is None:
+        ctx['model_pro'] = setup_gemini(MODEL_PRO)
+
+    images = download_post_images(post)
+    num_slides = len(collect_carousel_urls(post))
+    if not images:
+        print(f"    ⚠ No images downloadable — falling back to caption-only on Pro")
+        post['_ocr_text'] = ""
+        post_date = parse_post_date(post)
+        prompt = build_prompt(post, "", post_date)
+        # Caption-only on Pro is still tracked under pro_image (it's the same
+        # tier-4 attempt, just without images available)
+        data = call_gemini(ctx['model_pro'], prompt, stats=stats, tier='pro_image')
+        if not data:
+            return [], num_slides, 0, False
+        events = data.get('events', [])
+        is_calendar = data.get('is_calendar_post', False)
+        return enrich_events(events, post, post_date.strftime('%Y-%m-%d'),
+                             has_ocr=False, is_calendar=is_calendar), num_slides, 0, False
+
+    print(f"    ✓ {len(images)} image(s) prepared for Pro multimodal")
+    post['_ocr_text'] = ""
+    post_date = parse_post_date(post)
+    prompt = build_prompt(post, "", post_date)
+
+    content = [prompt] + [{'mime_type': mime, 'data': data} for data, mime in images]
+    resp_data = call_gemini(ctx['model_pro'], content, stats=stats, tier='pro_image')
+    if not resp_data:
+        return [], num_slides, 0, False
+
+    events = resp_data.get('events', [])
+    is_calendar = resp_data.get('is_calendar_post', False)
+    enriched = enrich_events(events, post, post_date.strftime('%Y-%m-%d'),
+                             has_ocr=False, is_calendar=is_calendar)
+    return enriched, num_slides, 0, False
 
 
 TIER_HANDLERS = {
@@ -985,6 +1035,32 @@ def check_missing_date(event: dict) -> Optional[str]:
     return None
 
 
+def check_date_sanity(event: dict, post_date: datetime) -> Optional[str]:
+    """Fire when extracted date is implausibly far from POST DATE.
+
+    PAST_DATE: extracted date is more than 7 days BEFORE post date.
+      Event posts shouldn't be advertising past events. Could be a date
+      typo (e.g., "5/7" misparsed as last year), a recap post, or a
+      genuine "Save the date" post about something that happened.
+
+    FAR_FUTURE_DATE: extracted date is more than 365 days AFTER post date.
+      Most NJ event promo posts are within a year. Beyond suggests a typo
+      (e.g., "2026" → "2027" mistake) or a multi-year planned event."""
+    date_str = event.get('date')
+    if not date_str:
+        return None
+    try:
+        d = datetime.strptime(str(date_str)[:10], '%Y-%m-%d')
+    except (ValueError, TypeError):
+        return None
+    delta = (d - post_date).days
+    if delta < -7:
+        return "PAST_DATE"
+    if delta > 365:
+        return "FAR_FUTURE_DATE"
+    return None
+
+
 def _count_distinct_dates(text: str) -> int:
     """Count distinct date-shaped tokens in text. Used to distinguish
     real calendar posts (multiple dates) from single-event posts that
@@ -1053,6 +1129,23 @@ def check_account_pattern(account: str, num_events: int, account_avg: dict) -> O
     return None
 
 
+def check_no_grounding(caption: str, ocr_text: str, num_events: int) -> Optional[str]:
+    """Fire when events were extracted but neither caption nor OCR text
+    contained meaningful content. This catches Gemini hallucinating from
+    metadata-only context (account name + Instagram location tag) when
+    the post itself has no event content. Surfaced via tier4_capped_test:
+    blutheartist_ Reels with empty caption + empty OCR produced 3 named
+    events at a specific Bayonne venue — almost certainly hallucinated
+    from the location tag rather than extracted from real source content."""
+    if num_events == 0:
+        return None
+    if (caption or '').strip():
+        return None
+    if (ocr_text or '').strip():
+        return None
+    return "NO_GROUNDING"
+
+
 def should_escalate(flags: list) -> bool:
     return any(f in ESCALATION_FLAGS for f in flags)
 
@@ -1106,6 +1199,7 @@ def process_one_post(ctx: dict, post: dict, max_tier: str = TIER_PRO_IMAGE) -> t
 
         # Per-event flags
         source_text = (post.get('caption') or '') + ' ' + (post.get('_ocr_text') or '')
+        post_date = parse_post_date(post)
         flags_per_event = []
         for ev in events:
             row_flags = []
@@ -1119,6 +1213,8 @@ def process_one_post(ctx: dict, post: dict, max_tier: str = TIER_PRO_IMAGE) -> t
             if f: row_flags.append(f)
             f = check_missing_date(ev)
             if f: row_flags.append(f)
+            f = check_date_sanity(ev, post_date)
+            if f: row_flags.append(f)
             flags_per_event.append(row_flags)
 
         # Post-level flags (apply to all events)
@@ -1131,6 +1227,7 @@ def process_one_post(ctx: dict, post: dict, max_tier: str = TIER_PRO_IMAGE) -> t
             check_carousel_low_events(slide_count, slides_with_text, len(events)),
             check_ocr_rich_low_events(post.get('_ocr_text', ''), len(events)),
             check_account_pattern(post.get('ownerUsername', ''), len(events), ctx['account_avg']),
+            check_no_grounding(post.get('caption', ''), post.get('_ocr_text', ''), len(events)),
         ]:
             if f: post_flags.append(f)
 
@@ -1144,11 +1241,21 @@ def process_one_post(ctx: dict, post: dict, max_tier: str = TIER_PRO_IMAGE) -> t
         nt = next_tier(current_tier)
 
         # Escalate if either:
-        #  (a) any escalation flag fired, OR
-        #  (b) we got 0 events at a non-final tier (cheap probe missed —
-        #      worth trying the more expensive tier once)
+        #  (a) any escalation flag fired (ALWAYS escalates, including to Pro), OR
+        #  (b) we got 0 events at a non-final, non-Pro tier (the cheap probe
+        #      missed — worth trying a more expensive non-Pro tier once)
+        #
+        # Critical: we DO NOT escalate to Tier 4 (Pro) just because earlier
+        # tiers returned 0 events. If Tier 1+2+3 all returned 0 events with
+        # no quality flags, the post likely has no event content (Reels with
+        # empty captions, recap posts, etc.) — Pro can't manufacture events
+        # from nothing, and Pro is ~8× more expensive than Flash-Lite. Only
+        # specific quality concerns (a flag firing) earn Pro budget.
+        # Discovered via tier4_test (PR #8): 5 of 6 captionless-Reel posts
+        # escalated all the way to Pro on zero_events with no flags, all
+        # produced 0 events at Pro too. Wasted ~$0.04 on a 10-post test.
         flag_escalate = should_escalate(list(all_flags))
-        zero_event_escalate = (len(events) == 0)
+        zero_event_escalate = (len(events) == 0 and nt != TIER_PRO_IMAGE)
         can_escalate = nt is not None and current_tier != max_tier
 
         if can_escalate and (flag_escalate or zero_event_escalate):
