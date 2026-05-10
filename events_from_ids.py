@@ -120,6 +120,7 @@ FLAG_BG_COLOR = {"red": 1.0, "green": 0.97, "blue": 0.78}  # light yellow
 # column itself becomes the visual signal.
 FLAG_TO_COLUMNS = {
     'DATE_DAY_MISMATCH':     ['DATE'],
+    'MISSING_DATE':          ['DATE'],
     'VENUE_CITY_MISMATCH':   ['VENUE NAME', 'CITY'],
     'CITY_NOT_IN_NJ_LOOKUP': ['CITY', 'SECTION OF NJ'],
     'REGION_AUTOFIXED':      ['SECTION OF NJ'],
@@ -970,6 +971,20 @@ def check_low_confidence(event: dict) -> Optional[str]:
     return "LOW_CONFIDENCE" if conf < LOW_CONFIDENCE_THRESHOLD else None
 
 
+def check_missing_date(event: dict) -> Optional[str]:
+    """Fire when an event was extracted without a date. Date is essential
+    for an event row to be actionable — flagging surfaces these for human
+    review without preventing the row from being saved (the venue + name
+    info may still be useful as a recovery breadcrumb)."""
+    date = event.get('date')
+    if date is None:
+        return "MISSING_DATE"
+    s = str(date).strip().lower()
+    if s == '' or s in ('none', 'null', 'tbd', 'tba'):
+        return "MISSING_DATE"
+    return None
+
+
 def _count_distinct_dates(text: str) -> int:
     """Count distinct date-shaped tokens in text. Used to distinguish
     real calendar posts (multiple dates) from single-event posts that
@@ -1101,6 +1116,8 @@ def process_one_post(ctx: dict, post: dict, max_tier: str = TIER_PRO_IMAGE) -> t
             f = check_venue_city(ev, ctx['venue_lookup'])
             if f: row_flags.append(f)
             f = check_low_confidence(ev)
+            if f: row_flags.append(f)
+            f = check_missing_date(ev)
             if f: row_flags.append(f)
             flags_per_event.append(row_flags)
 
@@ -1372,7 +1389,9 @@ def run_extract_mode(args):
             continue
 
         account = post.get('ownerUsername', '?')
-        print(f"\n[{i}/{len(queue)}] {pid}  @{account}")
+        shortcode = post.get('shortCode', '') or post.get('shortcode', '')
+        ig_url = f"https://instagram.com/p/{shortcode}/" if shortcode else "(no shortcode)"
+        print(f"\n[{i}/{len(queue)}] {pid}  @{account}  {ig_url}")
         events, tier_used = process_one_post(ctx, post, max_tier=args.max_tier)
         stats['counts']['processed'] += 1
         stats['tiers_used'][tier_used] += 1
