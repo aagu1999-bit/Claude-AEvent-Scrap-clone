@@ -46,9 +46,11 @@ import math
 import os
 import re
 import sys
+import threading
 import time
 import urllib.request
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -1513,46 +1515,77 @@ def run_extract_mode(args):
                 existing_pids.add(row[post_id_idx].strip())
     print(f"    {len(existing_pids)} unique post IDs already in All_Events")
 
+    # Shared state + locks for parallel processing.
+    # - stats_lock: serializes all stats dict mutations (Counters, nested dicts)
+    # - pending_lock: serializes pending_rows list mutation + sheet flush
+    #   (using one lock for both ensures the flush snapshot is consistent)
+    # - print_lock: serializes per-post output blocks so each post's logs
+    #   stay roughly contiguous (some interleaving still possible at the
+    #   start of a worker, but the bulk of each post's output prints atomically)
     pending_rows = []
+    state = {'next_row': next_row}  # mutable container so workers can update
+    stats_lock = threading.Lock()
+    pending_lock = threading.Lock()
+    print_lock = threading.Lock()
 
-    for i, queue_row in enumerate(queue, 1):
+    def process_one_queue_row(idx_and_row):
+        """Worker function. Each call processes one queue row independently.
+        Buffers per-post output and prints it atomically at end."""
+        i, queue_row = idx_and_row
         pid = queue_row.get('post_id', '').strip()
         if not pid:
-            stats['skip_reasons']['empty_post_id_in_queue'] += 1
-            continue
+            with stats_lock:
+                stats['skip_reasons']['empty_post_id_in_queue'] += 1
+            return
 
         if pid in existing_pids:
-            print(f"\n[{i}/{len(queue)}] {pid} — already in All_Events, skipping")
-            stats['counts']['already_in_all_events'] += 1
-            stats['skip_reasons']['already_in_all_events'] += 1
-            continue
+            with print_lock:
+                print(f"\n[{i}/{len(queue)}] {pid} — already in All_Events, skipping")
+            with stats_lock:
+                stats['counts']['already_in_all_events'] += 1
+                stats['skip_reasons']['already_in_all_events'] += 1
+            return
 
         post = apify_lookup.get(pid)
         if not post:
-            print(f"\n[{i}/{len(queue)}] {pid} — NOT in any source dataset, skipping")
-            stats['counts']['missing_in_apify'] += 1
-            stats['skip_reasons']['missing_in_apify'] += 1
-            continue
+            with print_lock:
+                print(f"\n[{i}/{len(queue)}] {pid} — NOT in any source dataset, skipping")
+            with stats_lock:
+                stats['counts']['missing_in_apify'] += 1
+                stats['skip_reasons']['missing_in_apify'] += 1
+            return
 
         account = post.get('ownerUsername', '?')
         shortcode = post.get('shortCode', '') or post.get('shortcode', '')
         ig_url = f"https://instagram.com/p/{shortcode}/" if shortcode else "(no shortcode)"
-        print(f"\n[{i}/{len(queue)}] {pid}  @{account}  {ig_url}")
+
+        # Buffer per-post output so all of it prints under one print_lock
+        # acquisition at the end. process_one_post + tier handlers print
+        # internally to stdout — at 2 workers, those interleave somewhat, but
+        # the JSON summary is the authoritative record.
+        with print_lock:
+            print(f"\n[{i}/{len(queue)}] {pid}  @{account}  {ig_url}")
+
         events, tier_used = process_one_post(ctx, post, max_tier=args.max_tier)
-        stats['counts']['processed'] += 1
-        stats['tiers_used'][tier_used] += 1
+
+        with stats_lock:
+            stats['counts']['processed'] += 1
+            stats['tiers_used'][tier_used] += 1
 
         if not events:
-            print(f"  ↳ No events extracted (tier={tier_used})")
-            stats['counts']['no_events'] += 1
-            stats['skip_reasons']['gemini_returned_no_events'] += 1
-            continue
+            with print_lock:
+                print(f"  ↳ No events extracted for {pid} (tier={tier_used})")
+            with stats_lock:
+                stats['counts']['no_events'] += 1
+                stats['skip_reasons']['gemini_returned_no_events'] += 1
+            return
 
-        print(f"  ✓ {len(events)} event(s) (tier={tier_used})")
-        stats['counts']['extracted_events'] += len(events)
-        stats['per_account_events'][account] += len(events)
-
-        for idx, ev in enumerate(events, 1):
+        # Build event-summary lines + new pending rows in local buffers
+        out_lines = [f"  ✓ {len(events)} event(s) for {pid} (tier={tier_used})"]
+        new_rows = []
+        flagged_count = 0
+        flag_counts = Counter()
+        for idx2, ev in enumerate(events, 1):
             name = ev.get('event_name', '(unnamed)')
             date = ev.get('date', '?')
             venue = ev.get('venue_name', '?') or '—'
@@ -1560,36 +1593,64 @@ def run_extract_mode(args):
             region = ev.get('section_of_nj', '') or '—'
             conf = ev.get('confidence', '?')
             flags = ev.get('quality_flags', '')
-            print(f"    {idx}. {name}")
-            print(f"       date={date}  time={ev.get('start_time','—') or '—'}  venue={venue}  city={city}  region={region}  conf={conf}")
+            out_lines.append(f"    {idx2}. {name}")
+            out_lines.append(f"       date={date}  time={ev.get('start_time','—') or '—'}  venue={venue}  city={city}  region={region}  conf={conf}")
             if flags:
-                print(f"       🚩 FLAGS: {flags}")
-                stats['counts']['events_with_flags'] += 1
+                out_lines.append(f"       🚩 FLAGS: {flags}")
+                flagged_count += 1
                 for flag in flags.split(','):
                     f = flag.strip()
                     if f:
-                        stats['flag_distribution'][f] += 1
+                        flag_counts[f] += 1
             else:
-                print(f"       ✓ clean (no flags)")
-            pending_rows.append(event_to_row(ev, run_tag=args.tag))
+                out_lines.append(f"       ✓ clean (no flags)")
+            new_rows.append(event_to_row(ev, run_tag=args.tag))
 
-        # Incremental flush — kill-resilient batches
-        if len(pending_rows) >= BATCH_SIZE:
+        # Print all summary lines together (atomic block)
+        with print_lock:
+            print('\n'.join(out_lines))
+
+        # Update stats + pending_rows together (under their respective locks)
+        with stats_lock:
+            stats['counts']['extracted_events'] += len(events)
+            stats['counts']['events_with_flags'] += flagged_count
+            stats['per_account_events'][account] += len(events)
+            stats['flag_distribution'].update(flag_counts)
+
+        # Append new rows + maybe flush. Single lock for both append + flush
+        # ensures the next_row snapshot is consistent with what we wrote.
+        with pending_lock:
+            pending_rows.extend(new_rows)
+            if len(pending_rows) >= BATCH_SIZE:
+                tw = time.perf_counter()
+                batch = list(pending_rows)
+                pending_rows.clear()
+                start_row = state['next_row']
+                append_with_formatting(ws, batch, start_row,
+                                       dry_run=args.dry_run, no_format=args.no_formatting)
+                with stats_lock:
+                    stats['phase_timings']['sheet_write'] += time.perf_counter() - tw
+                if not args.dry_run:
+                    state['next_row'] = start_row + len(batch)
+                time.sleep(BATCH_DELAY_SEC)
+
+    # Drive the work pool. ThreadPoolExecutor handles 1+ workers cleanly
+    # — at workers=1, behavior is effectively serial (slight overhead).
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        # Submit all and wait. We use list(map) because we don't need
+        # incremental result handling — workers update shared state directly.
+        list(pool.map(process_one_queue_row, list(enumerate(queue, 1))))
+
+    # Final flush of any leftover rows
+    with pending_lock:
+        if pending_rows:
             tw = time.perf_counter()
-            append_with_formatting(ws, pending_rows, next_row,
+            batch = list(pending_rows)
+            pending_rows.clear()
+            start_row = state['next_row']
+            append_with_formatting(ws, batch, start_row,
                                    dry_run=args.dry_run, no_format=args.no_formatting)
             stats['phase_timings']['sheet_write'] += time.perf_counter() - tw
-            if not args.dry_run:
-                next_row += len(pending_rows)
-            pending_rows = []
-            time.sleep(BATCH_DELAY_SEC)
-
-    # Final flush
-    if pending_rows:
-        tw = time.perf_counter()
-        append_with_formatting(ws, pending_rows, next_row,
-                               dry_run=args.dry_run, no_format=args.no_formatting)
-        stats['phase_timings']['sheet_write'] += time.perf_counter() - tw
 
     # ──────────────────────────────────────────────────────────
     # Summary report
