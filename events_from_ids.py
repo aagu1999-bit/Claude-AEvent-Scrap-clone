@@ -185,6 +185,14 @@ COST_PER_CALL = {
 
 EXTRACT_RUNS_DIR = Path("outputs/extract_runs")
 
+# Apify datasets are immutable once published, so caching them locally is
+# always safe — and protects us if Apify wipes a dataset later (which DID
+# happen during today's investigation: the original 4,441-entry dataset
+# at 3YcD7sSCliQhCw87m is now down to 3 entries). Keep a permanent local
+# copy so future audits, re-runs, and recovery work always have access
+# to the exact source data the run consumed.
+APIFY_CACHE_DIR = Path("outputs/apify_cache")
+
 
 # ─────────────────────────────────────────────────────────────────
 # Setup
@@ -365,18 +373,49 @@ def load_venue_canonical() -> dict:
 
 
 def load_apify_datasets(dataset_ids: list) -> dict:
-    """Load multiple Apify datasets, return dict of post_id -> post."""
+    """Load multiple Apify datasets, return dict of post_id -> post.
+
+    Uses a local file cache (outputs/apify_cache/<dataset_id>.json) to
+    avoid re-fetching. Apify datasets are immutable once published, so
+    cache hit is always safe. Cache also serves as a permanent local
+    archive — we discovered today that Apify can wipe datasets
+    (3YcD7sSCliQhCw87m went from 4,441 entries to 3 entries between
+    morning and afternoon). The cache protects us from that."""
+    APIFY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     lookup = {}
     for ds_id in dataset_ids:
-        url = APIFY_DATASET_URL.format(ds_id=ds_id)
-        print(f"  Fetching {ds_id}...")
-        try:
-            with urllib.request.urlopen(url, timeout=60) as r:
-                data = json.load(r)
-            print(f"    ✓ {len(data)} posts")
-        except Exception as e:
-            print(f"    ✗ Failed: {e}")
-            continue
+        cache_path = APIFY_CACHE_DIR / f"{ds_id}.json"
+        data = None
+
+        # Try cache first
+        if cache_path.exists():
+            try:
+                with open(cache_path) as f:
+                    data = json.load(f)
+                print(f"  Loaded {ds_id} from cache  ✓ {len(data)} posts")
+            except Exception as e:
+                print(f"  Cache read failed for {ds_id} ({e}); fetching fresh")
+                data = None
+
+        # Fetch + cache if no valid cache
+        if data is None:
+            url = APIFY_DATASET_URL.format(ds_id=ds_id)
+            print(f"  Fetching {ds_id}...")
+            try:
+                with urllib.request.urlopen(url, timeout=60) as r:
+                    data = json.load(r)
+                print(f"    ✓ {len(data)} posts")
+                # Persist to cache
+                try:
+                    with open(cache_path, 'w') as f:
+                        json.dump(data, f)
+                    print(f"    ✓ Cached to {cache_path} for future runs")
+                except Exception as e:
+                    print(f"    ⚠ Cache write failed: {e}")
+            except Exception as e:
+                print(f"    ✗ Failed: {e}")
+                continue
+
         for p in data:
             pid = p.get('id')
             if pid and pid not in lookup:
