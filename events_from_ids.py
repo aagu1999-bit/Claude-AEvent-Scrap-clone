@@ -85,9 +85,13 @@ QUALITY_FLAGS_COL_IDX = ALL_EVENTS_HEADER.index("QUALITY_FLAGS")
 BATCH_SIZE = 25
 BATCH_DELAY_SEC = 1.5
 
-TIER_FLASH_TEXT = "flash_text"
-TIER_FLASH_IMAGE = "flash_image"
-TIER_PRO_IMAGE = "pro_image"
+TIER_FLASH_CAPTION = "flash_caption"   # caption only, no Vision/OCR — cheapest probe
+TIER_FLASH_TEXT    = "flash_text"      # caption + OCR text — current default workhorse
+TIER_FLASH_IMAGE   = "flash_image"     # Flash-Lite multimodal (preserves spatial layout)
+TIER_PRO_IMAGE     = "pro_image"       # Pro multimodal — last resort for stubborn cases
+
+# Ladder order — escalation goes left-to-right
+TIER_LADDER = [TIER_FLASH_CAPTION, TIER_FLASH_TEXT, TIER_FLASH_IMAGE, TIER_PRO_IMAGE]
 
 LOW_CONFIDENCE_THRESHOLD = 0.5
 CALENDAR_KEYWORDS = ("calendar", "lineup", "schedule", "weekly", "monthly",
@@ -128,10 +132,11 @@ MODEL_PRO = "gemini-2.5-pro"
 # back-of-envelope figures for run-summary visibility, not billing-grade
 # accuracy. Update as pricing evolves.
 COST_PER_CALL = {
-    'vision':       0.0015,   # Cloud Vision text_detection per image
-    'flash_text':   0.0005,   # Gemini 2.5 Flash-Lite (text input only)
-    'flash_image':  0.0010,   # Gemini 2.5 Flash-Lite (image input)
-    'pro_image':    0.0080,   # Gemini 2.5 Pro (image input)
+    'vision':         0.0015,   # Cloud Vision text_detection per image
+    'flash_caption':  0.0005,   # Gemini 2.5 Flash-Lite (caption text only)
+    'flash_text':     0.0005,   # Gemini 2.5 Flash-Lite (caption + OCR text)
+    'flash_image':    0.0010,   # Gemini 2.5 Flash-Lite (image input)
+    'pro_image':      0.0080,   # Gemini 2.5 Pro (image input)
 }
 
 EXTRACT_RUNS_DIR = Path("outputs/extract_runs")
@@ -218,10 +223,11 @@ def init_stats() -> dict:
         'skip_reasons':       Counter(),
         'per_account_events': Counter(),  # handle -> events extracted
         'api_call_counts': {
-            'vision':       0,
-            'flash_text':   0,
-            'flash_image':  0,
-            'pro_image':    0,
+            'vision':         0,
+            'flash_caption':  0,
+            'flash_text':     0,
+            'flash_image':    0,
+            'pro_image':      0,
         },
         # Region-lookup visibility — distinguishes "Gemini got it right"
         # from "we corrected it" so we can see if the safety net is working
@@ -531,11 +537,41 @@ def enrich_events(events: list, post: dict, post_date_str: str, has_ocr: bool, i
 # Tier extractors
 # ─────────────────────────────────────────────────────────────────
 
+def extract_tier_flash_caption_only(ctx: dict, post: dict) -> tuple:
+    """Tier 1: cheapest probe. Flash-Lite on caption only, no OCR/Vision.
+
+    Returns (events, slide_count, ocr_len, has_ocr).
+
+    Why this exists: many posts have all the event info in the caption
+    text. For those, we don't need to spend Vision API calls per slide.
+    If this tier produces events with no flags fired, we save real money.
+    Otherwise the caller escalates to Tier 2 which adds OCR."""
+    print(f"  [Tier 1: Flash-Lite caption-only (no Vision)]")
+    stats = ctx.get('stats')
+
+    # Surface (empty) OCR text on the post so downstream checks have a
+    # consistent interface — caption-only treats ocr_text as ""
+    post['_ocr_text'] = ""
+    num_slides = len(collect_carousel_urls(post))
+
+    post_date = parse_post_date(post)
+    prompt = build_prompt(post, "", post_date)
+    data = call_gemini(ctx['model_flash'], prompt, stats=stats, tier='flash_caption')
+    if not data:
+        return [], num_slides, 0, False
+
+    events = data.get('events', [])
+    is_calendar = data.get('is_calendar_post', False)
+    enriched = enrich_events(events, post, post_date.strftime('%Y-%m-%d'),
+                             has_ocr=False, is_calendar=is_calendar)
+    return enriched, num_slides, 0, False
+
+
 def extract_tier_flash_text(ctx: dict, post: dict) -> tuple:
-    """Tier 1: Flash-Lite + OCR text. Returns (events, slide_count, ocr_len, has_ocr).
+    """Tier 2: Flash-Lite + OCR text. Returns (events, slide_count, ocr_len, has_ocr).
     Stores OCR text back on post['_ocr_text'] so downstream sanity checks can
     use it (date↔day, calendar-low-events both need source text)."""
-    print(f"  [Tier 1: Flash-Lite + OCR text]")
+    print(f"  [Tier 2: Flash-Lite + OCR text]")
 
     stats = ctx.get('stats')
 
@@ -564,21 +600,22 @@ def extract_tier_flash_text(ctx: dict, post: dict) -> tuple:
 
 
 def extract_tier_flash_image(ctx: dict, post: dict) -> tuple:
-    """Tier 2: Flash-Lite multimodal. TODO — implement after Tier 1 verified."""
-    print(f"  [Tier 2: Flash-Lite + image — NOT YET IMPLEMENTED, falling back to Tier 1]")
+    """Tier 3: Flash-Lite multimodal. TODO — implement after lower tiers verified."""
+    print(f"  [Tier 3: Flash-Lite + image — NOT YET IMPLEMENTED, falling back to Tier 2]")
     return extract_tier_flash_text(ctx, post)
 
 
 def extract_tier_pro_image(ctx: dict, post: dict) -> tuple:
-    """Tier 3: Pro multimodal. TODO — implement after Tier 1 verified."""
-    print(f"  [Tier 3: Pro + image — NOT YET IMPLEMENTED, falling back to Tier 1]")
+    """Tier 4: Pro multimodal. TODO — implement after lower tiers verified."""
+    print(f"  [Tier 4: Pro + image — NOT YET IMPLEMENTED, falling back to Tier 2]")
     return extract_tier_flash_text(ctx, post)
 
 
 TIER_HANDLERS = {
-    TIER_FLASH_TEXT: extract_tier_flash_text,
-    TIER_FLASH_IMAGE: extract_tier_flash_image,
-    TIER_PRO_IMAGE: extract_tier_pro_image,
+    TIER_FLASH_CAPTION: extract_tier_flash_caption_only,
+    TIER_FLASH_TEXT:    extract_tier_flash_text,
+    TIER_FLASH_IMAGE:   extract_tier_flash_image,
+    TIER_PRO_IMAGE:     extract_tier_pro_image,
 }
 
 
@@ -727,10 +764,13 @@ def should_escalate(flags: list) -> bool:
 
 
 def next_tier(current: str) -> Optional[str]:
-    if current == TIER_FLASH_TEXT:
-        return TIER_FLASH_IMAGE
-    if current == TIER_FLASH_IMAGE:
-        return TIER_PRO_IMAGE
+    """Return the next tier in the ladder, or None if already at the top."""
+    try:
+        idx = TIER_LADDER.index(current)
+    except ValueError:
+        return None
+    if idx + 1 < len(TIER_LADDER):
+        return TIER_LADDER[idx + 1]
     return None
 
 
@@ -751,8 +791,11 @@ def parse_post_date(post: dict) -> datetime:
 
 
 def process_one_post(ctx: dict, post: dict, max_tier: str = TIER_PRO_IMAGE) -> tuple:
-    """Run a post through the tier ladder. Returns (events_with_flags, tier_used)."""
-    current_tier = TIER_FLASH_TEXT
+    """Run a post through the tier ladder. Returns (events_with_flags, tier_used).
+
+    Starts at TIER_FLASH_CAPTION (cheapest probe — caption only, no Vision)
+    and escalates only when needed."""
+    current_tier = TIER_FLASH_CAPTION
     final_events = []
 
     while current_tier is not None:
@@ -794,8 +837,20 @@ def process_one_post(ctx: dict, post: dict, max_tier: str = TIER_PRO_IMAGE) -> t
         for fl in flags_per_event:
             all_flags.update(fl)
         nt = next_tier(current_tier)
-        if should_escalate(list(all_flags)) and nt and current_tier != max_tier:
-            print(f"  ↳ flags fired ({sorted(all_flags)}); escalating to {nt}")
+
+        # Escalate if either:
+        #  (a) any escalation flag fired, OR
+        #  (b) we got 0 events at a non-final tier (cheap probe missed —
+        #      worth trying the more expensive tier once)
+        flag_escalate = should_escalate(list(all_flags))
+        zero_event_escalate = (len(events) == 0)
+        can_escalate = nt is not None and current_tier != max_tier
+
+        if can_escalate and (flag_escalate or zero_event_escalate):
+            reason = []
+            if flag_escalate: reason.append(f"flags={sorted(all_flags)}")
+            if zero_event_escalate: reason.append("zero_events")
+            print(f"  ↳ escalating to {nt}  ({', '.join(reason)})")
             current_tier = nt
         else:
             # Final tier reached (or no escalation needed). Surface
@@ -1058,7 +1113,7 @@ def run_extract_mode(args):
 
     if stats['tiers_used']:
         print(f"\n  Tier usage:")
-        for tier in (TIER_FLASH_TEXT, TIER_FLASH_IMAGE, TIER_PRO_IMAGE):
+        for tier in TIER_LADDER:
             n = stats['tiers_used'].get(tier, 0)
             pct = 100 * n / max(c['processed'], 1)
             print(f"    {tier:<14} {n:>4}  ({pct:.0f}%)")
@@ -1199,8 +1254,10 @@ def parse_args():
 
     p.add_argument("--source-datasets", default="",
                    help="Comma-separated Apify dataset IDs (extract mode)")
-    p.add_argument("--max-tier", choices=[TIER_FLASH_TEXT, TIER_FLASH_IMAGE, TIER_PRO_IMAGE],
-                   default=TIER_PRO_IMAGE, help="Cap tier escalation (default: pro_image)")
+    p.add_argument("--max-tier",
+                   choices=[TIER_FLASH_CAPTION, TIER_FLASH_TEXT, TIER_FLASH_IMAGE, TIER_PRO_IMAGE],
+                   default=TIER_PRO_IMAGE,
+                   help="Cap tier escalation (default: pro_image — full ladder)")
     p.add_argument("--workers", type=int, default=1, help="Parallel workers (default: 1)")
     p.add_argument("--limit", type=int, default=None,
                    help="Process only first N rows (smoke testing)")
