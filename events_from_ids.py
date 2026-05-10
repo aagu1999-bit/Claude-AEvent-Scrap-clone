@@ -132,6 +132,7 @@ FLAG_TO_COLUMNS = {
     'CAROUSEL_LOW_EVENTS':   ['QUALITY_FLAGS'],
     'OCR_RICH_LOW_EVENTS':   ['QUALITY_FLAGS'],
     'ACCOUNT_PATTERN_DROP':  ['QUALITY_FLAGS'],
+    'NO_GROUNDING':          ['QUALITY_FLAGS'],
 }
 
 
@@ -1128,6 +1129,23 @@ def check_account_pattern(account: str, num_events: int, account_avg: dict) -> O
     return None
 
 
+def check_no_grounding(caption: str, ocr_text: str, num_events: int) -> Optional[str]:
+    """Fire when events were extracted but neither caption nor OCR text
+    contained meaningful content. This catches Gemini hallucinating from
+    metadata-only context (account name + Instagram location tag) when
+    the post itself has no event content. Surfaced via tier4_capped_test:
+    blutheartist_ Reels with empty caption + empty OCR produced 3 named
+    events at a specific Bayonne venue — almost certainly hallucinated
+    from the location tag rather than extracted from real source content."""
+    if num_events == 0:
+        return None
+    if (caption or '').strip():
+        return None
+    if (ocr_text or '').strip():
+        return None
+    return "NO_GROUNDING"
+
+
 def should_escalate(flags: list) -> bool:
     return any(f in ESCALATION_FLAGS for f in flags)
 
@@ -1209,6 +1227,7 @@ def process_one_post(ctx: dict, post: dict, max_tier: str = TIER_PRO_IMAGE) -> t
             check_carousel_low_events(slide_count, slides_with_text, len(events)),
             check_ocr_rich_low_events(post.get('_ocr_text', ''), len(events)),
             check_account_pattern(post.get('ownerUsername', ''), len(events), ctx['account_avg']),
+            check_no_grounding(post.get('caption', ''), post.get('_ocr_text', ''), len(events)),
         ]:
             if f: post_flags.append(f)
 
