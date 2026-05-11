@@ -81,6 +81,8 @@ from extraction_core import (
     check_low_confidence, check_missing_date, check_date_sanity,
     check_calendar_low_events, check_carousel_low_events,
     check_ocr_rich_low_events, check_account_pattern, check_no_grounding,
+    # Prompt builder (PR B — shared source of truth with main.py)
+    build_prompt,
 )
 
 import requests
@@ -501,139 +503,8 @@ def ocr_post(vision_client, post: dict, stats: dict = None, verbose_slides: bool
 # ─────────────────────────────────────────────────────────────────
 # Gemini extraction
 # ─────────────────────────────────────────────────────────────────
-
-def build_prompt(post: dict, ocr_text: str, post_date: datetime) -> str:
-    """Construct the extraction prompt sent to Gemini. A6 prompt audit
-    introduced 6 categories of guidance: anti-hallucination, spatial layout,
-    explicit relative-date resolution, recurring/multi-day handling,
-    city specificity, and confidence scale documentation."""
-    user = post.get('ownerUsername', '')
-    owner_full_name = post.get('ownerFullName', '')
-    location_name = post.get('locationName', '') or post.get('location', '')
-    caption = post.get('caption', '') or post.get('text', '')
-    post_date_str = post_date.strftime('%Y-%m-%d')
-    post_day_name = post_date.strftime('%A')
-
-    return f"""
-        Extract ALL events from this Instagram post. A post may contain MULTIPLE events.
-
-        POST DATE: {post_date_str} ({post_day_name}) — your anchor for relative dates
-        ACCOUNT: @{user} ({owner_full_name})
-        LOCATION TAG: {location_name}
-
-        CAPTION: {caption[:2000]}
-        OCR TEXT FROM IMAGE(S): {ocr_text[:5000]}
-        NOTE: If OCR text contains [SLIDE N of M] markers, this is a carousel post.
-        Each slide may show different events (e.g. a weekly calendar spread across slides).
-        Extract events from ALL slides.
-
-        ════════════════════════════════════════════════════
-        EXTRACTION GUIDANCE
-        ════════════════════════════════════════════════════
-
-        ANTI-HALLUCINATION (critical):
-        Each event's name, date, venue, and city MUST appear in (or be a clear
-        paraphrase of) the caption or OCR text. Do NOT invent details. If a
-        required field cannot be found in the source, leave it BLANK rather
-        than guessing.
-
-        SPATIAL LAYOUT (multi-column flyers):
-        If the post has a grid or table layout (e.g., 2-column event list),
-        preserve each event's pairing with its corresponding venue and time.
-        Do NOT shuffle these fields across rows of the grid. Read each
-        cell/box as a self-contained unit.
-
-        MULTIPLE EVENTS:
-        - Calendars, weekly lineups, event series → extract each
-        - "Monday: Jazz Night, Tuesday: Open Mic" → 2 events
-        - "Dec 15 - Band, Dec 22 - Party" → 2 events
-        - If a single recurring deal applies to a day RANGE (e.g.
-          "Mon-Fri Happy Hour"), extract as ONE event (see RECURRING below),
-          NOT one event per day.
-
-        ════════════════════════════════════════════════════
-        DATE HANDLING
-        ════════════════════════════════════════════════════
-
-        DATE PARSING — handle these formats and convert to YYYY-MM-DD:
-        - Shorthand: "3.13.26", "3.13", "3/13", "March 13th", "Mar 13"
-        - Year shorthand: "26" means 2026, "25" means 2025
-        - "<day> <date>": e.g., "Friday May 9" — use the explicit date.
-          (If day-of-week conflicts with date, prefer the date.)
-
-        RELATIVE DATE RESOLUTION (POST DATE = {post_date_str}, {post_day_name}):
-        - "today" / "tonight" → POST DATE
-        - "tomorrow" → POST DATE + 1 day
-        - "this <day>":
-            • If POST DATE falls on that day → use POST DATE itself
-            • Otherwise → next occurrence within 6 days
-        - "next <day>" → strictly AFTER this <day> (typically following week)
-        - "this weekend":
-            • If POST DATE is Fri/Sat/Sun → that weekend (Sat or Sun)
-            • Otherwise → upcoming Saturday/Sunday
-        - "next weekend" → the weekend AFTER this weekend
-
-        ════════════════════════════════════════════════════
-        RECURRING / MULTI-DAY EVENTS
-        ════════════════════════════════════════════════════
-
-        Extract as ONE event (NOT multiple) with is_recurring=true when:
-        - "Every <day>" — "Every Saturday", "Every Friday night"
-        - Day RANGE — "Mon-Fri", "Wednesday-Saturday", "Mon through Fri"
-        - Shorthand — "weekday", "weeknight" (= Mon-Fri), "weekend" (= Sat-Sun)
-        - Ongoing offers — "Daily happy hour", "Trivia Tuesdays", "$5 marg mon-fri"
-
-        For these:
-        - date: NEXT occurrence on or after POST DATE
-        - is_recurring: true
-        - recurrence_pattern: short pattern like "Mon-Fri", "Every Saturday",
-          "Daily", "Weekend", "Mon/Wed/Fri"
-
-        DATE RANGES (one-time events spanning multiple days):
-        - "Sale May 5-12" → ONE event, date=2026-05-05, is_recurring=false
-        - Include the date range in the description.
-
-        ════════════════════════════════════════════════════
-        FIELD REQUIREMENTS
-        ════════════════════════════════════════════════════
-
-        1. event_name: Max 40 characters. If natural name is longer, create a
-           shorter marketable version that captures the essence.
-        2. newsletter_description: one-sentence punchy teaser for a newsletter.
-        3. city: SPECIFIC NJ municipality (e.g., "Newark", "Jersey City",
-           "Madison", "Asbury Park"). NEVER use the state name "New Jersey",
-           "NJ", or generic "NJ area". If the city cannot be determined,
-           leave it BLANK.
-        4. section_of_nj: North / Central / South based on the city's county:
-           - North = Bergen, Essex, Hudson, Morris, Passaic, Sussex, Warren
-           - Central = Hunterdon, Mercer, Middlesex, Monmouth, Somerset, Union
-           - South = Atlantic, Burlington, Camden, Cape May, Cumberland,
-                    Gloucester, Ocean, Salem
-           If city is empty or out-of-state, leave section_of_nj BLANK.
-        5. start_time: Strict 12-hour format (e.g., "2:00 PM"). Blank if not stated.
-           If source gives a TIME RANGE ("4-7 PM", "11AM-3PM", "6 to 10pm"),
-           use the START of the range here. Put the full range in description.
-        6. confidence: Float between 0.0 and 1.0 (NOT a percentage):
-           • 0.9-1.0 = explicit info (date, venue, time clearly stated)
-           • 0.7-0.9 = mostly stated; minor inference required
-           • 0.5-0.7 = significant inference; some fields ambiguous
-           • < 0.5 = guesswork; consider whether to extract at all
-
-        ════════════════════════════════════════════════════
-        OUTPUT FORMAT
-        ════════════════════════════════════════════════════
-
-        Return JSON with "events" list. Each event has these fields:
-        event_name, date (YYYY-MM-DD), start_time, venue_name, city,
-        section_of_nj, newsletter_description, event_type, description,
-        performer, price, confidence, is_recurring, recurrence_pattern
-
-        Also include:
-        "total_events_found": number,
-        "is_calendar_post": true/false
-
-        If no events found, return: {{"events": [], "total_events_found": 0}}
-        """
+# build_prompt was moved to extraction_core (PR B) so main.py and this
+# tool share the same prompt. Import is at the top of this file.
 
 
 def call_gemini(model, prompt, stats: dict = None, tier: str = 'flash_text') -> Optional[dict]:

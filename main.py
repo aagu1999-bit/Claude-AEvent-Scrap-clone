@@ -45,6 +45,10 @@ from extraction_core import (
     check_no_grounding        as ec_check_no_grounding,
     FLAG_TO_COLUMNS           as ec_FLAG_TO_COLUMNS,
     FLAG_BG_COLOR             as ec_FLAG_BG_COLOR,
+    # PR B — shared prompt builder; replaces the inline f-string in
+    # process_post. Both main.py and events_from_ids.py call this so
+    # extractions stay in lockstep.
+    build_prompt              as ec_build_prompt,
 )
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%I:%M:%S %p')
@@ -951,66 +955,15 @@ class InstagramEventPipeline:
 
         print(f"  ↳ Analyzing with Gemini AI (checking for multiple events)...")
 
-        prompt = f"""
-        Extract ALL events from this Instagram post. A post may contain MULTIPLE events.
-
-        POST DATE: {post_date.strftime('%Y-%m-%d')} (use this to resolve relative and recurring dates)
-        ACCOUNT: @{user} ({owner_full_name})
-        LOCATION TAG: {location_name}
-
-        CAPTION: {caption[:2000]}
-        OCR TEXT FROM IMAGE(S): {ocr_text[:5000]}
-        NOTE: If OCR text contains [SLIDE N of M] markers, this is a carousel post.
-        Each slide may show different events (e.g. a weekly calendar spread across slides).
-        Extract events from ALL slides.
-
-        EXTRACTION INSTRUCTIONS:
-        1. Look for MULTIPLE events - calendars, weekly lineups, event series
-        2. Common patterns: "Monday: Jazz Night, Tuesday: Open Mic"
-        3. Monthly calendars: "Dec 15 - Band Name, Dec 22 - Holiday Party"
-        4. Each date/event combination should be a separate event
-        5. If location_name exists, use it as venue for ALL events
-
-        DATE PARSING — handle ALL of these formats and convert to YYYY-MM-DD:
-        - Shorthand with dots: "3.13.26" or "3.13" → use POST DATE year if year omitted
-        - Shorthand with slashes: "3/13", "3/13/26", "03/13/2026"
-        - Written out: "March 13th", "March 13", "Mar 13"
-        - Day references: "this Saturday", "next Friday", "this weekend" → calculate exact date from POST DATE
-        - Day + date: "Saturday the 13th", "Friday, April 4th"
-        - Relative: "tomorrow", "tonight" → calculate from POST DATE
-        - Month only with context: "this March" → use the month with POST DATE year
-        - Year shorthand: "26" means 2026, "25" means 2025
-
-        RECURRING EVENTS — if the post describes a recurring event with no specific one-time date:
-        - "Every Saturday", "Every weekend", "Every Friday night", "Weekly Thursdays"
-        - "Industry Mondays", "Brunch every Sunday", "EVERY SATURDAY & SUNDAY"
-        → Calculate the NEXT upcoming occurrence of that day ON OR AFTER the POST DATE and use that as the date
-        → Set "is_recurring": true in the event object
-        → Example: POST DATE is Wednesday 2026-03-10, event is "Every Saturday" → date = 2026-03-14
-
-        REQUIREMENTS:
-        1. "event_name": Maximum 40 characters. If the natural event name exceeds 40 characters,
-           create a shorter, marketable version that captures the essence.
-           Examples: "CULTR One Year Anniversary" not "CULTR ONE YEAR ANNIVERSARY CELEBRATION PARTY"
-                     "Jazz & Jamz Night" not "Jesus, Jazz & Jamz Community Celebration Evening"
-        2. "newsletter_description": Create a "HYPE_LINE" - a one-sentence, punchy teaser for a newsletter.
-           Example: "Kick off your weekend with live jazz downtown!"
-        3. "section_of_nj": North/Central/South based on city/county:
-           North = Bergen/Essex/Hudson/Morris/Passaic/Sussex/Warren
-           Central = Hunterdon/Mercer/Middlesex/Monmouth/Somerset/Union
-           South = Atlantic/Burlington/Camden/Cape May/Cumberland/Gloucester/Ocean/Salem
-        4. TIME: Strict 12-hour format (e.g. 2:00 PM).
-
-        Return JSON with "events" list containing:
-        event_name, date (YYYY-MM-DD), start_time, venue_name, city, section_of_nj,
-        newsletter_description, event_type, description, performer, price, confidence, is_recurring
-
-        Also include:
-        "total_events_found": number,
-        "is_calendar_post": true/false
-
-        If no events found, return: {{"events": [], "total_events_found": 0}}
-        """
+        # PR B — prompt comes from extraction_core so main.py and
+        # events_from_ids.py produce identical Gemini outputs. The
+        # old inline prompt was missing 6 categories of guidance
+        # (anti-hallucination, spatial layout, day-range handling,
+        # city specificity, time range, confidence scale documentation)
+        # which caused measurable production drift: 60 hallucinated
+        # "New Jersey" cities and 384 out-of-range confidence values
+        # captured in the 2026-05-11 quality baseline.
+        prompt = ec_build_prompt(post, ocr_text, post_date)
 
         try:
             resp = self.gemini_model.generate_content(prompt)
