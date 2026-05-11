@@ -18,9 +18,17 @@ import signal
 import atexit
 import base64
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# PR F — all timestamps written to Sheets, run logs, and filenames
+# use America/New_York wall clock. Previously bare `datetime.now()` ran
+# in the Replit container's TZ (UTC), so PROCESSED TIMESTAMP / run_id
+# / emergency-save filenames showed UTC times — confusing when the
+# rest of the operation (cron schedule, NJ events, user) is on ET.
+EAST_TZ = ZoneInfo("America/New_York")
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -160,7 +168,7 @@ class InstagramEventPipeline:
         self.max_workers = CONF["max_workers"]
         self.rate_limit_delay = CONF["rate_limit_delay"]
 
-        self.run_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.run_id = datetime.now(EAST_TZ).strftime('%Y%m%d_%H%M%S')
         self._setup_run_log()
 
         # Incremental Processed_Log flushing — see ADR 0010.
@@ -368,7 +376,7 @@ class InstagramEventPipeline:
             if not force and len(pending) < self.PL_FLUSH_THRESHOLD:
                 return
 
-            date_processed = str(datetime.now().date())
+            date_processed = str(datetime.now(EAST_TZ).date())
             log_rows = [
                 [pid, info.get('account', ''), date_processed, "Auto-Bot", "",
                  info.get('result', ''), info.get('post_date', '')]
@@ -433,7 +441,7 @@ class InstagramEventPipeline:
                 'confidence', 'post_id', 'had_ocr', 'from_calendar', 'is_recurring',
                 'processed_timestamp', 'quality_flags', 'recurrence_pattern',
             ]
-            df['processed_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            df['processed_timestamp'] = datetime.now(EAST_TZ).strftime('%Y-%m-%d %H:%M:%S')
             for c in cols:
                 if c not in df.columns:
                     df[c] = ""
@@ -602,7 +610,7 @@ class InstagramEventPipeline:
     def emergency_save(self):
         with self.lock:
             if self.results:
-                ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                ts = datetime.now(EAST_TZ).strftime('%Y%m%d_%H%M%S')
                 df = pd.DataFrame(self.results)
                 csv_file = self.output_dir / f'emergency_events_{ts}.csv'
                 df.to_csv(csv_file, index=False)
@@ -695,7 +703,7 @@ class InstagramEventPipeline:
                 apify_live = bool(CONF.get("apify_enabled", False))
                 if apify_live:
                     max_age_days = int(CONF.get("history_max_age_days", 30))
-                    cutoff = (datetime.now() - timedelta(days=max_age_days)).date()
+                    cutoff = (datetime.now(EAST_TZ) - timedelta(days=max_age_days)).date()
                 else:
                     cutoff = None  # Mode 2: keep full Processed_Log dedup history
 
@@ -928,9 +936,9 @@ class InstagramEventPipeline:
                 else:
                     post_date = datetime.fromisoformat(str(timestamp_val).replace('Z', '+00:00'))
             else:
-                post_date = datetime.now()
+                post_date = datetime.now(EAST_TZ)
         except Exception:
-            post_date = datetime.now()
+            post_date = datetime.now(EAST_TZ)
         post_date_str = post_date.strftime('%Y-%m-%d')
 
         print(f"\n[{post_num}/{total}] Processing post: {pid}")
@@ -1468,7 +1476,7 @@ class InstagramEventPipeline:
             'recurrence_pattern',    # NEW: pattern string for recurring events
         ]
 
-        df['processed_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        df['processed_timestamp'] = datetime.now(EAST_TZ).strftime('%Y-%m-%d %H:%M:%S')
 
         for c in cols:
             if c not in df.columns:
@@ -1482,7 +1490,7 @@ class InstagramEventPipeline:
                 df[col_name] = df[col_name].map(lambda x: str(x).upper() if isinstance(x, str) else x)
         df.columns = [c.upper().replace('_', ' ') for c in df.columns]
 
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        ts = datetime.now(EAST_TZ).strftime('%Y%m%d_%H%M%S')
         csv_file = self.output_dir / f"Events_{ts}.csv"
         df.to_csv(csv_file, index=False)
         print(f"\n✓ Saved CSV: {csv_file} ({len(events)} events)")
@@ -1736,7 +1744,7 @@ def fetch_posts_via_apify():
         return []
 
     newer_than_days = int(CONF.get("apify_newer_than_days", 7))
-    newer_than_date = (datetime.now() - timedelta(days=newer_than_days)).strftime("%Y-%m-%d")
+    newer_than_date = (datetime.now(EAST_TZ) - timedelta(days=newer_than_days)).strftime("%Y-%m-%d")
     results_limit   = int(CONF.get("apify_posts_per_profile", 9))
 
     payload = {
@@ -1800,7 +1808,7 @@ def fetch_posts_via_apify():
         print(f"  ✓ Downloaded {len(posts)} fresh post(s) from Apify")
 
         try:
-            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            ts = datetime.now(EAST_TZ).strftime('%Y%m%d_%H%M%S')
             raw_path = Path("outputs") / f'apify_raw_{ts}.json'
             raw_path.parent.mkdir(parents=True, exist_ok=True)
             with open(raw_path, 'w') as _rf:
@@ -1878,7 +1886,7 @@ def _append_dataset_run_log(ts: str, source: str, url: str, dataset_id: str, pos
 
 def do_force_run(bot):
     print("\n🚀 Force run initiated...\n")
-    run_started_at = datetime.now()
+    run_started_at = datetime.now(EAST_TZ)
     run_ts = run_started_at.strftime('%Y%m%d_%H%M%S')
     bot.setup_sheets()
 
