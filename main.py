@@ -170,6 +170,14 @@ class InstagramEventPipeline:
         self._flush_lock = threading.Lock()
         self.PL_FLUSH_THRESHOLD = 50
 
+        # Index of the next entry in self.results that hasn't yet been
+        # flushed to the All_Events sheet. Mirrors _flushed_pids for the
+        # Processed_Log → keeps event writes in lockstep with dedup-tag
+        # writes so a kill-mid-run never produces "marked done but not
+        # actually saved" orphans (the failure mode we recovered today).
+        self._events_flushed_count = 0
+        self.EVENTS_FLUSH_THRESHOLD = 25
+
         self.stats = {
             'total_posts': 0,
             'processed': 0,
@@ -299,6 +307,107 @@ class InstagramEventPipeline:
                 # Don't crash the pipeline on a flush failure; the next flush
                 # (or save_data's force=True final call) will retry these.
                 print(f"  ⚠ Processed_Log flush error ({len(pending)} pending): {e}")
+
+        # CRITICAL: also flush new events to All_Events. Keeping the two
+        # writes paired prevents orphan creation — a kill between
+        # Processed_Log flush and event flush is what caused today's
+        # 1,843 orphans. Now: every Processed_Log flush is followed by
+        # a sheet flush of the events that produced those dedup tags.
+        self._flush_events_to_sheet(force=force)
+
+    def _flush_events_to_sheet(self, force=False):
+        """Append any new entries in self.results to All_Events.
+
+        Mirrors _flush_processed_log's pattern but for the actual event
+        rows. self._events_flushed_count tracks how far we've written.
+        Threshold-gated to avoid an API call per event; force=True ignores
+        the threshold for the end-of-run flush from save_data().
+
+        Same row-build + sanitize logic as save_data() so columns match.
+        Per-cell quality-flag highlighting is applied after each batch
+        via _apply_quality_flag_formatting (same as save_data path)."""
+        if not self.sheets_client or not self.main_sheet:
+            return
+
+        with self._flush_lock:
+            # Snapshot pending events under main lock
+            with self.lock:
+                start_idx = self._events_flushed_count
+                pending_events = self.results[start_idx:]
+
+            if not pending_events:
+                return
+            if not force and len(pending_events) < self.EVENTS_FLUSH_THRESHOLD:
+                return
+
+            # Build DataFrame for just the pending events. Reuse the same
+            # column list + uppercase + sanitize logic as save_data().
+            try:
+                df = pd.DataFrame(pending_events)
+            except Exception as e:
+                print(f"  ⚠ Could not build DataFrame for incremental flush: {e}")
+                return
+
+            cols = [
+                'instagram_handle', 'event_name', 'date', 'start_time',
+                'venue_name', 'city', 'section_of_nj', 'newsletter_description',
+                'instagram_post_url', 'display_url', 'post_url', 'instagram_profile_url',
+                'event_type', 'account_name', 'description', 'performer', 'price',
+                'confidence', 'post_id', 'had_ocr', 'from_calendar', 'is_recurring',
+                'processed_timestamp', 'quality_flags', 'recurrence_pattern',
+            ]
+            df['processed_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            for c in cols:
+                if c not in df.columns:
+                    df[c] = ""
+            df = df[[c for c in cols if c in df.columns]]
+
+            url_columns = {'instagram_post_url', 'display_url', 'post_url', 'instagram_profile_url'}
+            skip_upper = url_columns | {'processed_timestamp'}
+            for col_name in df.columns:
+                if col_name not in skip_upper:
+                    df[col_name] = df[col_name].map(lambda x: str(x).upper() if isinstance(x, str) else x)
+            df.columns = [c.upper().replace('_', ' ') for c in df.columns]
+
+            def sanitize(val):
+                if val is None:
+                    return ""
+                if isinstance(val, float):
+                    import math
+                    if math.isnan(val) or math.isinf(val):
+                        return ""
+                if isinstance(val, list):
+                    return ", ".join(str(v) for v in val)
+                if isinstance(val, dict):
+                    return str(val)
+                return val
+
+            try:
+                evt_sheet = self.main_sheet.worksheet("All_Events")
+            except gspread.WorksheetNotFound:
+                evt_sheet = self.main_sheet.add_worksheet("All_Events", 5000, 27)
+                evt_sheet.append_row(df.columns.tolist())
+
+            # Track row position for per-cell highlighting AFTER append
+            start_row = len(evt_sheet.col_values(1)) + 1
+            rows = [[sanitize(v) for v in row] for row in df.values.tolist()]
+
+            try:
+                evt_sheet.append_rows(rows)
+                # Mark these events as flushed AFTER successful sheet write
+                with self.lock:
+                    self._events_flushed_count = start_idx + len(pending_events)
+                if force:
+                    print(f"  ✓ Flushed {len(pending_events)} events to All_Events (final)")
+
+                # Apply per-cell quality-flag highlighting on the just-written rows
+                try:
+                    self._apply_quality_flag_formatting(evt_sheet, df, start_row)
+                except Exception as fmt_e:
+                    print(f"  ⚠ Quality-flag formatting failed (non-fatal): {fmt_e}")
+            except Exception as e:
+                # Don't crash; next flush retries (start_idx unchanged)
+                print(f"  ⚠ All_Events flush error ({len(pending_events)} pending): {e}")
 
     def _note_apify_shell_record(self, post, post_num):
         """Track an Apify shell record (no id/shortCode = account returned no
@@ -1349,44 +1458,25 @@ class InstagramEventPipeline:
             if display_cols:
                 print(df[display_cols].head(5).to_string())
 
+        # Orphan-prevention path: events were flushed incrementally to
+        # All_Events alongside each Processed_Log flush (every
+        # EVENTS_FLUSH_THRESHOLD posts via _flush_events_to_sheet). The
+        # force=True call from _flush_processed_log above already drained
+        # any tail-end events that hadn't met the threshold yet.
+        #
+        # Doing a redundant batch append here would create duplicate rows,
+        # so we skip it. CSV/Excel/stats files above remain the local
+        # complete-record backup.
         if self.sheets_client and self.main_sheet:
-            try:
-                try:
-                    evt_sheet = self.main_sheet.worksheet("All_Events")
-                except gspread.WorksheetNotFound:
-                    evt_sheet = self.main_sheet.add_worksheet("All_Events", 5000, 27)
-                    evt_sheet.append_row(df.columns.tolist())
-
-                def sanitize(val):
-                    # gspread serializes via JSON; NaN/Inf are not JSON-compliant
-                    # and cause the entire append to fail. Coerce them to empty string.
-                    if val is None:
-                        return ""
-                    if isinstance(val, float):
-                        import math
-                        if math.isnan(val) or math.isinf(val):
-                            return ""
-                    if isinstance(val, list):
-                        return ", ".join(str(v) for v in val)
-                    if isinstance(val, dict):
-                        return str(val)
-                    return val
-
-                # Track where we're about to write so we can apply per-cell
-                # highlighting after the append succeeds.
-                start_row = len(evt_sheet.col_values(1)) + 1
-
-                rows = [[sanitize(v) for v in row] for row in df.values.tolist()]
-                evt_sheet.append_rows(rows)
-                print(f"✓ Uploaded {len(events)} events to Google Sheets")
-
-                # B5: apply per-cell light-yellow highlighting based on each
-                # event's quality_flags. Uses the canonical FLAG_TO_COLUMNS
-                # mapping from extraction_core so main.py and events_from_ids.py
-                # produce identical visual signals.
-                self._apply_quality_flag_formatting(evt_sheet, df, start_row)
-            except Exception as e:
-                print(f"⚠ Sheets Upload Error: {e}")
+            with self.lock:
+                flushed = self._events_flushed_count
+                total = len(self.results)
+            if flushed >= total:
+                print(f"✓ All {total} events already in Google Sheets via incremental flush")
+            else:
+                print(f"⚠ {total - flushed} events not yet in sheet — incremental flush may have failed")
+                # Try a final force-flush. If it succeeds, we're caught up.
+                self._flush_events_to_sheet(force=True)
 
         try:
             recurring_accounts.refresh(self.main_sheet)
