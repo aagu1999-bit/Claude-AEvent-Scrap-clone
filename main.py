@@ -116,6 +116,42 @@ def load_configuration():
     return config
 
 CONF = load_configuration()
+
+# ─────────────────────────────────────────────────────────────
+# PR H — Scratch-sheet support.
+# When --scratch is passed on the CLI (or SCRATCH_MODE=1 in env,
+# or scratch_mode: true in config.json), main.py redirects ALL
+# sheet reads/writes to an alternate spreadsheet whose name is
+# CONF["scratch_sheet_name"] (default: "Instagram_Events_Scratch").
+#
+# Purpose: validate risky changes (tier escalation backport,
+# prompt experiments, schema migrations) against a sandbox sheet
+# before flipping production. The scratch sheet must exist and
+# be shared with the service account — main.py will not create
+# spreadsheets, only worksheet TABS inside an existing sheet.
+#
+# Loud banner is intentional: confusing your sandbox with prod
+# is the failure mode this is designed to prevent.
+# ─────────────────────────────────────────────────────────────
+SCRATCH_MODE = (
+    "--scratch" in sys.argv
+    or os.environ.get("SCRATCH_MODE", "").strip() == "1"
+    or bool(CONF.get("scratch_mode", False))
+)
+if SCRATCH_MODE:
+    scratch_name = CONF.get("scratch_sheet_name", "Instagram_Events_Scratch")
+    print()
+    print("╔══════════════════════════════════════════════════════════════╗")
+    print("║  ⚠  SCRATCH MODE ENABLED  ⚠                                  ║")
+    print("║                                                              ║")
+    print(f"║  All sheet writes redirected to: {scratch_name:<24}     ║")
+    print("║  Production 'Instagram_Events_Master' will NOT be touched.   ║")
+    print("║                                                              ║")
+    print("║  To disable, remove --scratch flag and SCRATCH_MODE env var. ║")
+    print("╚══════════════════════════════════════════════════════════════╝")
+    print()
+    CONF["sheet_name"] = scratch_name
+
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 SERVICE_ACCOUNT_FILE = "apt-mark-468506-u9-ec44cabc7335 copy.json"
 
