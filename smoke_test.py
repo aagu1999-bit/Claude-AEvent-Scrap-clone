@@ -201,7 +201,11 @@ def test_check_functions(r: Results, ec):
         return
 
     from datetime import datetime as _dt, timedelta as _td
-    today = _dt.now().date()
+    # check_date_sanity signature is (event, post_date: datetime), so pass a
+    # full datetime — not a date. (Earlier version of this test passed
+    # date() and tripped a TypeError inside the function's subtraction.)
+    today_dt = _dt.now()
+    today = today_dt.date()  # kept for human-readable formatting below
 
     # ─── check_missing_date ───
     try:
@@ -228,9 +232,9 @@ def test_check_functions(r: Results, ec):
         past_event = {'date': (today - _td(days=30)).strftime('%Y-%m-%d')}
         future_event = {'date': (today + _td(days=365 * 3)).strftime('%Y-%m-%d')}
         good_event = {'date': (today + _td(days=10)).strftime('%Y-%m-%d')}
-        past = ec.check_date_sanity(past_event, today)
-        future = ec.check_date_sanity(future_event, today)
-        good = ec.check_date_sanity(good_event, today)
+        past = ec.check_date_sanity(past_event, today_dt)
+        future = ec.check_date_sanity(future_event, today_dt)
+        good = ec.check_date_sanity(good_event, today_dt)
         ok = past == 'PAST_DATE' and future == 'FAR_FUTURE_DATE' and good is None
         r.add('check_date_sanity: past → PAST_DATE, far future → FAR_FUTURE_DATE', ok,
               detail=f'past→{past!r}, +3yr→{future!r}, +10d→{good!r}')
@@ -258,9 +262,9 @@ def test_check_functions(r: Results, ec):
 
     # ─── check_no_grounding ───
     try:
-        positive = ec.check_no_grounding(caption='', ocr_text='', n_events=1)
+        positive = ec.check_no_grounding(caption='', ocr_text='', num_events=1)
         negative = ec.check_no_grounding(caption='Live jazz tonight at 8pm',
-                                          ocr_text='', n_events=1)
+                                          ocr_text='', num_events=1)
         ok = positive == 'NO_GROUNDING' and negative is None
         r.add('check_no_grounding: empty caption+OCR with events → NO_GROUNDING', ok,
               detail=f'empty→{positive!r}, has-caption→{negative!r}')
