@@ -47,6 +47,35 @@ Use when:
 - You need a fresh Apify scrape (use `main.py`)
 - You need weekend-specific re-scraping (use `reprocess_weekends.py`)
 
+### `audit_regions.py`
+One-off cleanup for SECTION OF NJ cells in existing All_Events rows that
+were tagged BEFORE the canonical NJ municipalities lookup was added.
+Uses `data/nj_municipalities.json` as the source of truth.
+
+```
+python audit_regions.py                       # preview
+python audit_regions.py --apply                # commit changes
+python audit_regions.py --city NEWARK --apply  # limit to specific cities
+python audit_regions.py --apply --highlight    # also color changed cells yellow
+```
+
+Writes audit CSV to `outputs/audit_regions_<ts>.csv` listing every change.
+
+### `dedup_all_events.py`
+Find and remove exact-duplicate rows from All_Events using composite key
+(POST ID + EVENT NAME + DATE). Keeps the first occurrence, drops later
+duplicates.
+
+```
+python dedup_all_events.py                            # preview all duplicates
+python dedup_all_events.py --apply                     # remove all duplicates
+python dedup_all_events.py --after-row 18400 --apply   # only recent test pollution
+python dedup_all_events.py --after-date 2026-05-09 --apply
+```
+
+Audit CSV at `outputs/dedup_all_events_<ts>.csv`. Deletes in reverse row
+order so row numbers stay valid mid-batch.
+
 ### `merge_extract_runs.py`
 Combines multiple `outputs/extract_runs/<run_id>.json` summaries into one.
 

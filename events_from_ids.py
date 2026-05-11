@@ -803,7 +803,7 @@ def extract_tier_flash_text(ctx: dict, post: dict) -> tuple:
     """Tier 2: Flash-Lite + OCR text. Returns (events, slide_count, ocr_len, has_ocr).
     Stores OCR text back on post['_ocr_text'] so downstream sanity checks can
     use it (date↔day, calendar-low-events both need source text)."""
-    print(f"  [Tier 2: Flash-Lite + OCR text]")
+    print(f"  [Tier 3: Flash-Lite + OCR text]")
 
     stats = ctx.get('stats')
 
