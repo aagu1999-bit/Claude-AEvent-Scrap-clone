@@ -106,11 +106,21 @@ FLAG_TO_COLUMNS = {
     'CITY_NOT_IN_NJ_LOOKUP': ['CITY', 'SECTION OF NJ'],
     'REGION_AUTOFIXED':      ['SECTION OF NJ'],
     'LOW_CONFIDENCE':        ['CONFIDENCE'],
+    # Post-level flags: only the flag cell itself is highlighted, not specific
+    # data fields (since these concerns are about the post overall). The
+    # QUALITY_FLAGS cell becomes the visual signal — its content names the
+    # flag, the highlight provides quick scan-ability.
     'CALENDAR_LOW_EVENTS':   ['QUALITY_FLAGS'],
     'CAROUSEL_LOW_EVENTS':   ['QUALITY_FLAGS'],
     'OCR_RICH_LOW_EVENTS':   ['QUALITY_FLAGS'],
     'ACCOUNT_PATTERN_DROP':  ['QUALITY_FLAGS'],
-    'NO_GROUNDING':          ['QUALITY_FLAGS'],
+    # NO_GROUNDING fires when the source post had no caption + no OCR text,
+    # yet events were extracted. The DESCRIPTION field is the most suspect —
+    # it's the field Gemini fabricates most aggressively when there's nothing
+    # to ground on (vs. structural fields like date/venue which need explicit
+    # source mentions). Highlighting DESCRIPTION points the reviewer at the
+    # field that's most likely hallucinated.
+    'NO_GROUNDING':          ['DESCRIPTION'],
 }
 
 # Flags that should escalate to the next tier (post-level "low events"
