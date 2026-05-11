@@ -55,6 +55,34 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+# Shared extraction logic. See docs/decisions/0012-extraction-core-foundation.md.
+# Pulls the canonical constants, lookup loaders, helpers, and sanity checks
+# from a single source of truth so main.py can adopt the same safety net
+# via a parallel migration (B5 step 3).
+from extraction_core import (
+    # Constants
+    MODEL_FLASH_LITE, MODEL_PRO,
+    COST_PER_CALL,
+    TIER_FLASH_CAPTION, TIER_FLASH_TEXT, TIER_FLASH_IMAGE, TIER_PRO_IMAGE,
+    TIER_LADDER,
+    NJ_MUNICIPALITIES_JSON, VENUE_CITY_CANONICAL_JSON,
+    LOW_CONFIDENCE_THRESHOLD,
+    CALENDAR_KEYWORDS,
+    DAY_NAMES,
+    FLAG_TO_COLUMNS,
+    ESCALATION_FLAGS,
+    FLAG_BG_COLOR,
+    # Lookup loaders
+    load_nj_municipalities, load_venue_canonical,
+    # Cost
+    estimate_cost,
+    # Sanity checks
+    check_date_day_match, check_venue_city, check_region_against_lookup,
+    check_low_confidence, check_missing_date, check_date_sanity,
+    check_calendar_low_events, check_carousel_low_events,
+    check_ocr_rich_low_events, check_account_pattern, check_no_grounding,
+)
+
 import requests
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -63,15 +91,16 @@ from google.cloud import vision
 import google.generativeai as genai
 
 # ─────────────────────────────────────────────────────────────────
-# Constants
+# Tool-local constants (sheet schema, batching, paths)
 # ─────────────────────────────────────────────────────────────────
+# Most cross-tool constants (model IDs, tier ladder, cost-per-call,
+# DAY_NAMES, FLAG_TO_COLUMNS, ESCALATION_FLAGS, FLAG_BG_COLOR, lookup
+# paths, etc.) now come from extraction_core via the top imports.
+# Items here are events_from_ids-specific.
 
 SERVICE_ACCOUNT_FILE = "apt-mark-468506-u9-ec44cabc7335 copy.json"
 SHEET_NAME = "Instagram_Events_Master"
 ALL_EVENTS_TAB = "All_Events"
-
-NJ_MUNICIPALITIES_JSON = "data/nj_municipalities.json"
-VENUE_CITY_CANONICAL_JSON = "data/venue_city_canonical.json"
 
 # Sheet schema — extends what save_data() in main.py produces with two new
 # columns at the end: QUALITY_FLAGS and RECURRENCE_PATTERN. Appending at end
@@ -93,72 +122,6 @@ RECURRENCE_PATTERN_COL_IDX = ALL_EVENTS_HEADER.index("RECURRENCE_PATTERN")
 BATCH_SIZE = 25
 BATCH_DELAY_SEC = 1.5
 
-TIER_FLASH_CAPTION = "flash_caption"   # caption only, no Vision/OCR — cheapest probe
-TIER_FLASH_TEXT    = "flash_text"      # caption + OCR text — current default workhorse
-TIER_FLASH_IMAGE   = "flash_image"     # Flash-Lite multimodal (preserves spatial layout)
-TIER_PRO_IMAGE     = "pro_image"       # Pro multimodal — last resort for stubborn cases
-
-# Ladder order — escalation goes left-to-right
-# Reasoning:
-#   1. flash_caption  — cheapest probe (no API costs beyond one Flash text call)
-#   2. flash_image    — single Flash multimodal call, dramatically cheaper than
-#                       OCR-per-slide on multi-slide posts AND preserves spatial
-#                       layout (addresses kinnectnj-class column-grid bugs)
-#   3. flash_text     — OCR + Flash text. More expensive on carousels but
-#                       useful for diagnosis (per-slide breakdown is visible)
-#   4. pro_image      — Pro multimodal, last resort for stubborn cases
-TIER_LADDER = [TIER_FLASH_CAPTION, TIER_FLASH_IMAGE, TIER_FLASH_TEXT, TIER_PRO_IMAGE]
-
-LOW_CONFIDENCE_THRESHOLD = 0.5
-CALENDAR_KEYWORDS = ("calendar", "lineup", "schedule", "weekly", "monthly",
-                     "weekend", "series", "every")
-
-FLAG_BG_COLOR = {"red": 1.0, "green": 0.97, "blue": 0.78}  # light yellow
-
-# Per-cell formatting: when a flag fires, which sheet column(s) should be
-# highlighted on that row? Uses ALL_EVENTS_HEADER labels (resolved to
-# column letters at runtime). Post-level flags map to QUALITY_FLAGS only
-# (no specific field — concern is about the post overall) so the flag
-# column itself becomes the visual signal.
-FLAG_TO_COLUMNS = {
-    'DATE_DAY_MISMATCH':     ['DATE'],
-    'MISSING_DATE':          ['DATE'],
-    'PAST_DATE':             ['DATE'],
-    'FAR_FUTURE_DATE':       ['DATE'],
-    'VENUE_CITY_MISMATCH':   ['VENUE NAME', 'CITY'],
-    'CITY_NOT_IN_NJ_LOOKUP': ['CITY', 'SECTION OF NJ'],
-    'REGION_AUTOFIXED':      ['SECTION OF NJ'],
-    'LOW_CONFIDENCE':        ['CONFIDENCE'],
-    # Post-level flags (about the post as a whole, not a specific field):
-    'CALENDAR_LOW_EVENTS':   ['QUALITY_FLAGS'],
-    'CAROUSEL_LOW_EVENTS':   ['QUALITY_FLAGS'],
-    'OCR_RICH_LOW_EVENTS':   ['QUALITY_FLAGS'],
-    'ACCOUNT_PATTERN_DROP':  ['QUALITY_FLAGS'],
-    'NO_GROUNDING':          ['QUALITY_FLAGS'],
-}
-
-
-def _col_letter(header_label: str) -> str:
-    """Convert ALL_EVENTS_HEADER label -> A1 column letter (A, B, ..., AA, AB...)."""
-    idx = ALL_EVENTS_HEADER.index(header_label)
-    if idx < 26:
-        return chr(ord('A') + idx)
-    return chr(ord('A') + (idx // 26) - 1) + chr(ord('A') + (idx % 26))
-
-# Day-name → weekday number (Mon=0)
-DAY_NAMES = {
-    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
-    "friday": 4, "saturday": 5, "sunday": 6,
-    "mon": 0, "tue": 1, "tues": 1, "wed": 2, "thu": 3, "thur": 3, "thurs": 3,
-    "fri": 4, "sat": 5, "sun": 6,
-}
-
-ESCALATION_FLAGS = {
-    "DATE_DAY_MISMATCH", "VENUE_CITY_MISMATCH", "CALENDAR_LOW_EVENTS",
-    "CAROUSEL_LOW_EVENTS", "OCR_RICH_LOW_EVENTS", "LOW_CONFIDENCE",
-    "ACCOUNT_PATTERN_DROP",
-}
-
 # Apify dataset URL template
 APIFY_DATASET_URL = (
     "https://api.apify.com/v2/datasets/{ds_id}/items?format=json"
@@ -170,20 +133,13 @@ APIFY_DATASET_URL = (
     "%2CdimensionsWidth%2Cerror&clean=false"
 )
 
-# Gemini model identifiers
-MODEL_FLASH_LITE = "gemini-2.5-flash-lite"
-MODEL_PRO = "gemini-2.5-pro"
 
-# Rough per-call cost estimates (USD). Vendor pricing changes — these are
-# back-of-envelope figures for run-summary visibility, not billing-grade
-# accuracy. Update as pricing evolves.
-COST_PER_CALL = {
-    'vision':         0.0015,   # Cloud Vision text_detection per image
-    'flash_caption':  0.0005,   # Gemini 2.5 Flash-Lite (caption text only)
-    'flash_text':     0.0005,   # Gemini 2.5 Flash-Lite (caption + OCR text)
-    'flash_image':    0.0010,   # Gemini 2.5 Flash-Lite (image input)
-    'pro_image':      0.0080,   # Gemini 2.5 Pro (image input)
-}
+def _col_letter(header_label: str) -> str:
+    """Convert ALL_EVENTS_HEADER label -> A1 column letter (A, B, ..., AA, AB...)."""
+    idx = ALL_EVENTS_HEADER.index(header_label)
+    if idx < 26:
+        return chr(ord('A') + idx)
+    return chr(ord('A') + (idx // 26) - 1) + chr(ord('A') + (idx % 26))
 
 EXTRACT_RUNS_DIR = Path("outputs/extract_runs")
 
@@ -318,12 +274,6 @@ def init_stats() -> dict:
     }
 
 
-def estimate_cost(api_call_counts: dict) -> float:
-    """Rough USD estimate from per-call counts. See COST_PER_CALL caveat."""
-    return sum(api_call_counts.get(k, 0) * COST_PER_CALL.get(k, 0)
-               for k in COST_PER_CALL)
-
-
 def write_run_summary(stats: dict, args, wall_time: float, run_id: str,
                       interrupted: bool = False):
     """Persist run summary as JSON for future audit / cross-run analysis.
@@ -365,21 +315,9 @@ def write_run_summary(stats: dict, args, wall_time: float, run_id: str,
 # ─────────────────────────────────────────────────────────────────
 # Lookups
 # ─────────────────────────────────────────────────────────────────
-
-def load_nj_municipalities() -> dict:
-    p = Path(NJ_MUNICIPALITIES_JSON)
-    if not p.exists():
-        print(f"⚠ {p} missing — region check disabled")
-        return {}
-    return json.loads(p.read_text())
-
-
-def load_venue_canonical() -> dict:
-    p = Path(VENUE_CITY_CANONICAL_JSON)
-    if not p.exists():
-        print(f"⚠ {p} missing — venue check disabled")
-        return {}
-    return json.loads(p.read_text())
+# load_nj_municipalities() and load_venue_canonical() now live in
+# extraction_core (imported at top of file). load_apify_datasets stays
+# here because it's events_from_ids-specific (Apify-aware caching).
 
 
 def load_apify_datasets(dataset_ids: list) -> dict:
@@ -937,263 +875,10 @@ TIER_HANDLERS = {
 
 
 # ─────────────────────────────────────────────────────────────────
-# Sanity checks
+# Sanity checks now live in extraction_core (imported at top of file).
+# expand_day_ranges, count_distinct_dates, and the eleven check_* functions
+# are all canonical there; see docs/decisions/0012-extraction-core-foundation.md.
 # ─────────────────────────────────────────────────────────────────
-
-def _expand_day_ranges(text: str) -> set:
-    """Detect day ranges in text and return the set of weekday numbers
-    they cover. Without this, 'Mon-Fri' would be parsed as just {Mon, Fri}
-    instead of {Mon, Tue, Wed, Thu, Fri}, which produces false positives
-    on DATE_DAY_MISMATCH for recurring deals across a range."""
-    days = set()
-    src = text.lower()
-
-    # Hyphen patterns: "mon-fri", "wednesday - saturday", "mon — sat"
-    for m in re.finditer(r'\b([a-z]+)\s*[-–—]\s*([a-z]+)\b', src):
-        s = DAY_NAMES.get(m.group(1))
-        e = DAY_NAMES.get(m.group(2))
-        if s is not None and e is not None:
-            i = s
-            for _ in range(7):
-                days.add(i)
-                if i == e:
-                    break
-                i = (i + 1) % 7
-
-    # "X to Y" / "X through Y" / "X thru Y"
-    for m in re.finditer(r'\b([a-z]+)\s+(?:to|through|thru)\s+([a-z]+)\b', src):
-        s = DAY_NAMES.get(m.group(1))
-        e = DAY_NAMES.get(m.group(2))
-        if s is not None and e is not None:
-            i = s
-            for _ in range(7):
-                days.add(i)
-                if i == e:
-                    break
-                i = (i + 1) % 7
-
-    # Shortcut tokens
-    if re.search(r'\bweekend\b', src):
-        days.update({5, 6})
-    if re.search(r'\bweek(?:day|night)s?\b', src):
-        days.update({0, 1, 2, 3, 4})
-    if re.search(r'\bdaily\b', src):
-        days.update({0, 1, 2, 3, 4, 5, 6})
-
-    return days
-
-
-def check_date_day_match(event: dict, source_text: str) -> Optional[str]:
-    """Flag if extracted date doesn't fall on a day that the source text
-    indicates. Handles day ranges (mon-fri, weekend, daily) so it doesn't
-    fire false positives on multi-day recurring deals."""
-    date_str = event.get('date', '')
-    if not date_str or not source_text:
-        return None
-    try:
-        d = datetime.strptime(date_str[:10], '%Y-%m-%d')
-    except ValueError:
-        return None
-    actual_day = d.weekday()  # 0=Mon
-
-    src_lower = source_text.lower()
-
-    # Direct day-name mentions
-    mentioned_days = set()
-    for name, num in DAY_NAMES.items():
-        if re.search(rf'\b{name}\b', src_lower):
-            mentioned_days.add(num)
-
-    # Expand to include day ranges (mon-fri, weekend, daily, etc.)
-    mentioned_days.update(_expand_day_ranges(src_lower))
-
-    if not mentioned_days:
-        return None
-    if actual_day not in mentioned_days:
-        return "DATE_DAY_MISMATCH"
-    return None
-
-
-def check_venue_city(event: dict, venue_lookup: dict) -> Optional[str]:
-    venue = (event.get('venue_name') or '').strip().upper()
-    city = (event.get('city') or '').strip().upper()
-    if not venue or not city:
-        return None
-    canonical = venue_lookup.get(venue)
-    if not canonical:
-        return None
-    if canonical in ("MULTI_LOCATION", "NOT_A_VENUE"):
-        return None
-    if canonical.upper() != city:
-        return "VENUE_CITY_MISMATCH"
-    return None
-
-
-def check_region_against_lookup(event: dict, region_lookup: dict, stats: dict = None) -> Optional[str]:
-    """Auto-fix region using canonical lookup. Mutates event in-place.
-    Updates stats['region_lookup'] counters when stats is provided so we can
-    see whether Gemini's getting it right on its own vs being corrected."""
-    rl = stats['region_lookup'] if stats else None
-    city = (event.get('city') or '').strip().upper()
-    if not city:
-        return None
-    canonical = region_lookup.get(city)
-    if canonical is None:
-        if rl is not None:
-            rl['unknown_city'] += 1
-        return "CITY_NOT_IN_NJ_LOOKUP"
-    if canonical == "NON_NJ":
-        if event.get('section_of_nj'):
-            event['section_of_nj'] = ""
-        if rl is not None:
-            rl['non_nj_cleared'] += 1
-        return "CITY_NOT_IN_NJ_LOOKUP"
-    # City IS in NJ lookup — register the hit
-    if rl is not None:
-        rl['hits'] += 1
-    current = (event.get('section_of_nj') or '').strip().upper()
-    if current != canonical:
-        event['section_of_nj'] = canonical
-        if rl is not None:
-            rl['autofixed'] += 1
-        return "REGION_AUTOFIXED"
-    if rl is not None:
-        rl['already_correct'] += 1
-    return None
-
-
-def check_low_confidence(event: dict) -> Optional[str]:
-    try:
-        conf = float(event.get('confidence', 1.0))
-    except (TypeError, ValueError):
-        return None
-    return "LOW_CONFIDENCE" if conf < LOW_CONFIDENCE_THRESHOLD else None
-
-
-def check_missing_date(event: dict) -> Optional[str]:
-    """Fire when an event was extracted without a date. Date is essential
-    for an event row to be actionable — flagging surfaces these for human
-    review without preventing the row from being saved (the venue + name
-    info may still be useful as a recovery breadcrumb)."""
-    date = event.get('date')
-    if date is None:
-        return "MISSING_DATE"
-    s = str(date).strip().lower()
-    if s == '' or s in ('none', 'null', 'tbd', 'tba'):
-        return "MISSING_DATE"
-    return None
-
-
-def check_date_sanity(event: dict, post_date: datetime) -> Optional[str]:
-    """Fire when extracted date is implausibly far from POST DATE.
-
-    PAST_DATE: extracted date is more than 7 days BEFORE post date.
-      Event posts shouldn't be advertising past events. Could be a date
-      typo (e.g., "5/7" misparsed as last year), a recap post, or a
-      genuine "Save the date" post about something that happened.
-
-    FAR_FUTURE_DATE: extracted date is more than 365 days AFTER post date.
-      Most NJ event promo posts are within a year. Beyond suggests a typo
-      (e.g., "2026" → "2027" mistake) or a multi-year planned event."""
-    date_str = event.get('date')
-    if not date_str:
-        return None
-    try:
-        d = datetime.strptime(str(date_str)[:10], '%Y-%m-%d')
-    except (ValueError, TypeError):
-        return None
-    delta = (d - post_date).days
-    if delta < -7:
-        return "PAST_DATE"
-    if delta > 365:
-        return "FAR_FUTURE_DATE"
-    return None
-
-
-def _count_distinct_dates(text: str) -> int:
-    """Count distinct date-shaped tokens in text. Used to distinguish
-    real calendar posts (multiple dates) from single-event posts that
-    happen to mention 'schedule'/'every'/etc."""
-    if not text:
-        return 0
-    found = set()
-    # M/D, MM/DD, M/D/YY, MM/DD/YYYY
-    for m in re.finditer(r'\b(\d{1,2})/(\d{1,2})(?:/\d{2,4})?\b', text):
-        found.add((m.group(1).zfill(2), m.group(2).zfill(2)))
-    # M.D with strict bounds (avoid catching "$5.99" decimals)
-    for m in re.finditer(r'\b(0?[1-9]|1[0-2])\.(0?[1-9]|[12]\d|3[01])\b', text):
-        found.add((m.group(1).zfill(2), m.group(2).zfill(2)))
-    # Month name + day: "May 8", "MAY 8TH", "Jun 12"
-    months = r'(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)'
-    for m in re.finditer(rf'\b{months}\w*\s+(\d{{1,2}})(?:st|nd|rd|th)?\b', text, re.IGNORECASE):
-        found.add(("month", m.group(1)))
-    return len(found)
-
-
-def check_calendar_low_events(caption: str, ocr_text: str, num_events: int) -> Optional[str]:
-    """Fire only when (caption keyword OR OCR keyword) AND ≥2 distinct
-    date tokens appear across caption+OCR. Single-event posts that mention
-    'schedule' once shouldn't trip this — they need multi-date evidence."""
-    if num_events > 1:
-        return None
-    combined = ((caption or '') + ' ' + (ocr_text or '')).lower()
-    if not any(kw in combined for kw in CALENDAR_KEYWORDS):
-        return None
-    # Require ≥2 distinct dates in source — that's what makes it a calendar
-    if _count_distinct_dates(combined) < 2:
-        return None
-    return "CALENDAR_LOW_EVENTS"
-
-
-def check_carousel_low_events(slide_count: int, slides_with_text: int, num_events: int) -> Optional[str]:
-    """Fire only when 3+ slides actually have text content AND ≤1 event extracted.
-    Counting raw slide_count was too noisy — promotional carousels often have
-    1 flyer + many decoration photos, where 1 event is the right answer.
-    Requiring 3+ slides with text means there's actually multiple text regions
-    that each could plausibly contain an event."""
-    if slide_count >= 3 and slides_with_text >= 3 and num_events <= 1:
-        return "CAROUSEL_LOW_EVENTS"
-    return None
-
-
-def check_ocr_rich_low_events(ocr_text: str, num_events: int) -> Optional[str]:
-    """Fire only when OCR text is long AND contains ≥2 distinct dates AND
-    ≤1 event extracted. The keyword/length-only version fired on long
-    descriptive captions (e.g., 'thanks to our community...') with no
-    actual missed events. Multiple distinct dates is the structural
-    signal that real multi-event content was likely missed."""
-    if num_events > 1:
-        return None
-    if not ocr_text or len(ocr_text) < 1500:
-        return None
-    if _count_distinct_dates(ocr_text) < 2:
-        return None
-    return "OCR_RICH_LOW_EVENTS"
-
-
-def check_account_pattern(account: str, num_events: int, account_avg: dict) -> Optional[str]:
-    avg = account_avg.get(account)
-    if avg is not None and avg >= 3 and num_events <= 1:
-        return "ACCOUNT_PATTERN_DROP"
-    return None
-
-
-def check_no_grounding(caption: str, ocr_text: str, num_events: int) -> Optional[str]:
-    """Fire when events were extracted but neither caption nor OCR text
-    contained meaningful content. This catches Gemini hallucinating from
-    metadata-only context (account name + Instagram location tag) when
-    the post itself has no event content. Surfaced via tier4_capped_test:
-    blutheartist_ Reels with empty caption + empty OCR produced 3 named
-    events at a specific Bayonne venue — almost certainly hallucinated
-    from the location tag rather than extracted from real source content."""
-    if num_events == 0:
-        return None
-    if (caption or '').strip():
-        return None
-    if (ocr_text or '').strip():
-        return None
-    return "NO_GROUNDING"
-
 
 def should_escalate(flags: list) -> bool:
     return any(f in ESCALATION_FLAGS for f in flags)
