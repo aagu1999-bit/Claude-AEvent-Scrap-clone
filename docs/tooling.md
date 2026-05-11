@@ -76,6 +76,26 @@ python dedup_all_events.py --after-date 2026-05-09 --apply
 Audit CSV at `outputs/dedup_all_events_<ts>.csv`. Deletes in reverse row
 order so row numbers stay valid mid-batch.
 
+### `reset_quality_formatting.py`
+Re-apply per-cell yellow highlighting on All_Events based on each row's
+CURRENT QUALITY_FLAGS content and the CURRENT FLAG_TO_COLUMNS mapping in
+`extraction_core`. Use after editing FLAG_TO_COLUMNS, after manual edits
+to QUALITY_FLAGS cells, or any time the formatting drifts from the
+canonical rules.
+
+```
+python reset_quality_formatting.py                       # preview
+python reset_quality_formatting.py --apply                # commit
+python reset_quality_formatting.py --after-row 18400 --apply
+```
+
+Treats QUALITY_FLAGS cell content as the source of truth — does NOT
+re-run sanity checks. For sanity-check re-runs, use `audit_regions.py`
+(region only) or re-extract via `events_from_ids.py`.
+
+Two-phase per batch: (1) clears row backgrounds to white, (2) applies
+yellow to specific cells per current mapping. Batched ~100 rows/call.
+
 ### `merge_extract_runs.py`
 Combines multiple `outputs/extract_runs/<run_id>.json` summaries into one.
 
