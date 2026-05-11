@@ -26,6 +26,26 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import recurring_accounts
 import audit
+# B5: shared extraction logic — sanity checks, region/venue lookups,
+# flag→column mapping. Imported under ec_ prefix to avoid collision with
+# any same-named locals (e.g., the existing check_* names in legacy code).
+# See docs/decisions/0012-extraction-core-foundation.md.
+from extraction_core import (
+    load_nj_municipalities    as ec_load_nj_municipalities,
+    load_venue_canonical      as ec_load_venue_canonical,
+    check_date_day_match      as ec_check_date_day_match,
+    check_venue_city          as ec_check_venue_city,
+    check_region_against_lookup as ec_check_region_against_lookup,
+    check_low_confidence      as ec_check_low_confidence,
+    check_missing_date        as ec_check_missing_date,
+    check_date_sanity         as ec_check_date_sanity,
+    check_calendar_low_events as ec_check_calendar_low_events,
+    check_carousel_low_events as ec_check_carousel_low_events,
+    check_ocr_rich_low_events as ec_check_ocr_rich_low_events,
+    check_no_grounding        as ec_check_no_grounding,
+    FLAG_TO_COLUMNS           as ec_FLAG_TO_COLUMNS,
+    FLAG_BG_COLOR             as ec_FLAG_BG_COLOR,
+)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%I:%M:%S %p')
 logger = logging.getLogger(__name__)
@@ -931,6 +951,58 @@ class InstagramEventPipeline:
                 e['from_calendar'] = is_calendar
                 processed_events.append(e)
 
+            # B5: apply the same safety net events_from_ids.py uses, so the
+            # production cron also gets region auto-fix, sanity flags, and
+            # per-cell visual indicators on All_Events. See
+            # docs/decisions/0012-extraction-core-foundation.md.
+            #
+            # Lookups are loaded once per pipeline run + cached on the bot
+            # instance to avoid re-reading disk on every post.
+            if not hasattr(self, '_safety_net_region_lookup'):
+                self._safety_net_region_lookup = ec_load_nj_municipalities()
+                self._safety_net_venue_lookup = ec_load_venue_canonical()
+            region_lookup = self._safety_net_region_lookup
+            venue_lookup = self._safety_net_venue_lookup
+
+            # Count text-bearing slides for the carousel-low-events check
+            slides_with_text = ocr_text.count('[SLIDE ') if '[SLIDE ' in ocr_text else (1 if ocr_text else 0)
+            slide_count = len(self.collect_carousel_urls(post)) if hasattr(self, 'collect_carousel_urls') else slides_with_text
+            source_text = (caption or '') + ' ' + (ocr_text or '')
+
+            # Per-event sanity checks + region auto-fix
+            for ev in processed_events:
+                row_flags = []
+                f = ec_check_region_against_lookup(ev, region_lookup)
+                if f: row_flags.append(f)
+                f = ec_check_date_day_match(ev, source_text)
+                if f: row_flags.append(f)
+                f = ec_check_venue_city(ev, venue_lookup)
+                if f: row_flags.append(f)
+                f = ec_check_low_confidence(ev)
+                if f: row_flags.append(f)
+                f = ec_check_missing_date(ev)
+                if f: row_flags.append(f)
+                f = ec_check_date_sanity(ev, post_date)
+                if f: row_flags.append(f)
+                ev['_row_flags'] = row_flags  # per-event flags, merged with post-level below
+
+            # Post-level flags apply to every event from this post
+            post_flags = []
+            for f in [
+                ec_check_calendar_low_events(caption or '', ocr_text or '', len(processed_events)),
+                ec_check_carousel_low_events(slide_count, slides_with_text, len(processed_events)),
+                ec_check_ocr_rich_low_events(ocr_text or '', len(processed_events)),
+                ec_check_no_grounding(caption or '', ocr_text or '', len(processed_events)),
+            ]:
+                if f: post_flags.append(f)
+
+            for ev in processed_events:
+                all_flags = (ev.get('_row_flags') or []) + post_flags
+                ev['quality_flags'] = ",".join(sorted(set(all_flags)))
+                ev.pop('_row_flags', None)
+                # recurrence_pattern field for the new column; default empty
+                ev.setdefault('recurrence_pattern', '')
+
             _result_tag = 'events_found' if processed_events else 'no_events_found'
             if processed_events:
                 self._record_post_outcome(pid, _result_tag, user, post_date_str)
@@ -1136,6 +1208,72 @@ class InstagramEventPipeline:
             if len(shell_accounts) > 20:
                 print(f"     ... and {len(shell_accounts) - 20} more (full list in anomaly summary)")
 
+    def _apply_quality_flag_formatting(self, evt_sheet, df, start_row):
+        """B5: apply per-cell light-yellow highlighting based on each event's
+        quality_flags. Uses the canonical FLAG_TO_COLUMNS mapping from
+        extraction_core so main.py and events_from_ids.py produce identical
+        visual signals on All_Events.
+
+        Each flag in an event's quality_flags maps to specific sheet columns
+        (DATE for date flags, CITY+SECTION OF NJ for region flags, DESCRIPTION
+        for NO_GROUNDING, etc.). Only the cells corresponding to the flags
+        get highlighted — not the entire row — so operators can identify
+        WHICH field is uncertain at a glance."""
+        if 'QUALITY FLAGS' not in df.columns:
+            return
+        try:
+            flag_col_idx = list(df.columns).index('QUALITY FLAGS')
+        except ValueError:
+            return
+
+        # Build column-letter map from canonical header → A1 letter.
+        # df.columns are already uppercase + space-separated (line 1181
+        # in save_data uppercases them); convert to the same form
+        # FLAG_TO_COLUMNS uses.
+        col_letter_by_name = {}
+        for i, c in enumerate(df.columns):
+            if i < 26:
+                col_letter_by_name[c] = chr(ord('A') + i)
+            else:
+                col_letter_by_name[c] = chr(ord('A') + (i // 26) - 1) + chr(ord('A') + (i % 26))
+
+        format_requests = []
+        rows_list = df.values.tolist()
+        for offset, row in enumerate(rows_list):
+            flags_str = row[flag_col_idx] if flag_col_idx < len(row) else ''
+            if not flags_str:
+                continue
+            row_num = start_row + offset
+            cells_to_color = set()
+            for f in str(flags_str).split(','):
+                f = f.strip()
+                cols = ec_FLAG_TO_COLUMNS.get(f, [])
+                cells_to_color.update(cols)
+            for col_label in cells_to_color:
+                letter = col_letter_by_name.get(col_label)
+                if not letter:
+                    continue
+                format_requests.append({
+                    'range': f'{letter}{row_num}',
+                    'format': {'backgroundColor': ec_FLAG_BG_COLOR},
+                })
+
+        if not format_requests:
+            return
+        try:
+            evt_sheet.batch_format(format_requests)
+            print(f"✓ Applied {len(format_requests)} per-cell quality-flag highlights")
+        except AttributeError:
+            # Older gspread without batch_format — fall back to per-cell
+            for fr in format_requests:
+                try:
+                    evt_sheet.format(fr['range'], fr['format'])
+                    time.sleep(0.3)
+                except Exception as e2:
+                    print(f"    ⚠ Format failed for {fr['range']}: {str(e2)[:80]}")
+        except Exception as e:
+            print(f"  ⚠ batch_format failed: {str(e)[:120]}")
+
     def save_data(self, events, post_log):
         # Final Processed_Log flush. Most entries are already there from
         # incremental flushes during the run (see ADR 0010); this picks up
@@ -1157,13 +1295,20 @@ class InstagramEventPipeline:
 
         df = pd.DataFrame(events)
 
+        # B5: schema now matches events_from_ids.py — adds QUALITY_FLAGS and
+        # RECURRENCE_PATTERN columns. Existing All_Events headers are
+        # forward-compatible (the two columns get appended at the right edge
+        # without shifting any existing data). New extractions populate them;
+        # legacy rows have empty values.
         cols = [
             'instagram_handle', 'event_name', 'date', 'start_time',
             'venue_name', 'city', 'section_of_nj', 'newsletter_description',
             'instagram_post_url', 'display_url', 'post_url', 'instagram_profile_url',
             'event_type', 'account_name', 'description', 'performer', 'price',
             'confidence', 'post_id', 'had_ocr', 'from_calendar', 'is_recurring',
-            'processed_timestamp'
+            'processed_timestamp',
+            'quality_flags',         # NEW: per-row sanity-check fingerprint
+            'recurrence_pattern',    # NEW: pattern string for recurring events
         ]
 
         df['processed_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -1209,7 +1354,7 @@ class InstagramEventPipeline:
                 try:
                     evt_sheet = self.main_sheet.worksheet("All_Events")
                 except gspread.WorksheetNotFound:
-                    evt_sheet = self.main_sheet.add_worksheet("All_Events", 5000, 25)
+                    evt_sheet = self.main_sheet.add_worksheet("All_Events", 5000, 27)
                     evt_sheet.append_row(df.columns.tolist())
 
                 def sanitize(val):
@@ -1227,9 +1372,19 @@ class InstagramEventPipeline:
                         return str(val)
                     return val
 
+                # Track where we're about to write so we can apply per-cell
+                # highlighting after the append succeeds.
+                start_row = len(evt_sheet.col_values(1)) + 1
+
                 rows = [[sanitize(v) for v in row] for row in df.values.tolist()]
                 evt_sheet.append_rows(rows)
                 print(f"✓ Uploaded {len(events)} events to Google Sheets")
+
+                # B5: apply per-cell light-yellow highlighting based on each
+                # event's quality_flags. Uses the canonical FLAG_TO_COLUMNS
+                # mapping from extraction_core so main.py and events_from_ids.py
+                # produce identical visual signals.
+                self._apply_quality_flag_formatting(evt_sheet, df, start_row)
             except Exception as e:
                 print(f"⚠ Sheets Upload Error: {e}")
 
