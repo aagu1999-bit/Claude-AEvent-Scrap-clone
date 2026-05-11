@@ -1544,15 +1544,74 @@ def reset_run_now():
         print(f"⚠ Could not reset run_now in config.json: {e}")
 
 
+def _extract_dataset_id_from_url(url: str) -> str:
+    """Pull the dataset_id out of an Apify dataset URL for archival logging.
+    Returns empty string if URL doesn't match the expected pattern."""
+    import re as _re
+    m = _re.search(r'/datasets/([A-Za-z0-9_-]+)/items', url or '')
+    return m.group(1) if m else ''
+
+
+def _append_dataset_run_log(ts: str, source: str, url: str, dataset_id: str, post_count: int):
+    """Append one entry to outputs/dataset_run_log.json — a permanent map of
+    run_timestamp → dataset_id so future "what URL did the X run use?"
+    questions become a 2-second grep.
+
+    Surfaced today when an Apify dataset wipe forced us to manually pull
+    historical dataset IDs from the user's Apify console. Going forward,
+    every main.py run leaves a breadcrumb."""
+    log_path = Path("outputs") / "dataset_run_log.json"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    entries = []
+    if log_path.exists():
+        try:
+            with open(log_path) as f:
+                entries = json.load(f)
+        except Exception:
+            entries = []
+    entries.append({
+        'run_timestamp': ts,
+        'source':        source,      # 'apify_live' or 'static_url'
+        'url':           url,
+        'dataset_id':    dataset_id,
+        'post_count':    post_count,
+    })
+    try:
+        with open(log_path, 'w') as f:
+            json.dump(entries, f, indent=2)
+    except Exception as e:
+        print(f"  ⚠ Could not append to dataset_run_log: {e}")
+
+
 def do_force_run(bot):
     print("\n🚀 Force run initiated...\n")
     run_started_at = datetime.now()
+    run_ts = run_started_at.strftime('%Y%m%d_%H%M%S')
     bot.setup_sheets()
 
     # Try live Apify scrape first; fall back to static URL if disabled or failed
     data = []
+    data_source = ''
+    data_url = ''
+    data_dataset_id = ''
     if CONF.get("apify_enabled", True):
         data = fetch_posts_via_apify()
+        if data:
+            data_source = 'apify_live'
+            # apify_live path already saves apify_raw_<ts>.json + dataset_id via fetch_posts_via_apify;
+            # we record the source here for the unified run log. The most-recent
+            # apify_raw file's content has dataset_id we can mirror into the run log.
+            try:
+                from glob import glob as _glob
+                latest_raw = max(_glob('outputs/apify_raw_*.json'), default='')
+                if latest_raw:
+                    with open(latest_raw) as f:
+                        raw = json.load(f)
+                    data_dataset_id = raw.get('dataset_id', '')
+                    data_url = (f"https://api.apify.com/v2/datasets/{data_dataset_id}/items"
+                                if data_dataset_id else '')
+            except Exception as e:
+                print(f"  ⚠ Could not read latest apify_raw for run log: {e}")
 
     if not data:
         url = CONF.get("instagram_data_url", "")
@@ -1561,9 +1620,36 @@ def do_force_run(bot):
             response = requests.get(url, timeout=120)
             response.raise_for_status()
             data = response.json()
+            data_source = 'static_url'
+            data_url = url
+            data_dataset_id = _extract_dataset_id_from_url(url)
+
+            # B4: archive the static-URL response too. Previously only the
+            # live-Apify path saved a raw dump. Without this, runs against
+            # the static URL had no permanent record of the source data —
+            # and Apify can wipe datasets (we observed this today), making
+            # retroactive recovery impossible. Mirror the live-path schema.
+            try:
+                raw_path = Path("outputs") / f'apify_raw_{run_ts}.json'
+                raw_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(raw_path, 'w') as _rf:
+                    json.dump({
+                        'fetched_at':  run_ts,
+                        'source':      'static_url',
+                        'url':         url,
+                        'dataset_id':  data_dataset_id,
+                        'post_count':  len(data),
+                        'posts':       data,
+                    }, _rf, default=str)
+                print(f"  💾 Raw static-URL dump saved: {raw_path}")
+            except Exception as e:
+                print(f"  ⚠ Could not save raw static-URL dump: {e}")
         else:
             print("❌ No posts fetched — Apify returned nothing and no instagram_data_url is set.")
             return
+
+    # Append breadcrumb to the unified dataset_run_log (works for both paths)
+    _append_dataset_run_log(run_ts, data_source, data_url, data_dataset_id, len(data))
 
     offset = CONF.get("post_offset", 0)
     cap    = CONF.get("max_posts", 0)
