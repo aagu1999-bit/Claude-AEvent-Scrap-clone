@@ -219,6 +219,31 @@ class InstagramEventPipeline:
 
         self.setup_vision()
 
+        # ─────────────────────────────────────────────────────────────
+        # PR C — eager safety-net lookup load.
+        # Previously these were lazy-loaded on the FIRST post processed.
+        # If a data file was missing or malformed, the first post would
+        # raise — and the outer 'Gemini error' handler would silently
+        # mark it as gemini_error. Then every subsequent post would try
+        # to load again (hasattr check would still be False), hit the
+        # same error, and silently fail. Whole run would produce zero
+        # events with no obvious indication why.
+        #
+        # Loading here at startup means a missing/broken data file
+        # crashes the process IMMEDIATELY with a clear message.
+        # ─────────────────────────────────────────────────────────────
+        try:
+            self._safety_net_region_lookup = ec_load_nj_municipalities()
+            self._safety_net_venue_lookup = ec_load_venue_canonical()
+            print(f"  • Safety net lookups: "
+                  f"{len(self._safety_net_region_lookup)} NJ cities, "
+                  f"{len(self._safety_net_venue_lookup)} canonical venues")
+        except Exception as e:
+            print(f"❌ FATAL: could not load safety net lookups: {e}")
+            print(f"   Check that data/nj_municipalities.json and "
+                  f"data/venue_city_canonical.json exist and are valid JSON.")
+            sys.exit(1)
+
         atexit.register(self.emergency_save)
         atexit.register(self._write_anomaly_summary)
         signal.signal(signal.SIGINT, self.handle_interrupt)
@@ -275,6 +300,25 @@ class InstagramEventPipeline:
                 entry['error'] = str(error)[:300]
             entry['post_url'] = f"https://www.instagram.com/p/{pid}/"
         self.post_results[pid] = entry
+
+    def _safe_check(self, name, fn, *args):
+        """PR C — guard each sanity check against unexpected exceptions.
+        Previously, if any ec_check_* raised on a malformed event dict,
+        the exception bubbled up past the entire sanity-check block and
+        was swallowed by the outer 'Gemini error' handler — which marked
+        the post as gemini_error and DISCARDED the events Gemini had
+        already extracted. That's a silent data-loss bug.
+
+        Now: log the exception with check name + pid context, return
+        None for THAT check, and let the remaining checks run normally.
+        Worst case becomes 'this single flag not applied' rather than
+        'whole post lost'."""
+        try:
+            return fn(*args)
+        except Exception as e:
+            print(f"    ⚠ Sanity check {name!r} raised: "
+                  f"{type(e).__name__}: {str(e)[:120]}")
+            return None
 
     def _flush_processed_log(self, force=False):
         """Append any post_results entries that haven't been written to
@@ -1059,11 +1103,8 @@ class InstagramEventPipeline:
             # per-cell visual indicators on All_Events. See
             # docs/decisions/0012-extraction-core-foundation.md.
             #
-            # Lookups are loaded once per pipeline run + cached on the bot
-            # instance to avoid re-reading disk on every post.
-            if not hasattr(self, '_safety_net_region_lookup'):
-                self._safety_net_region_lookup = ec_load_nj_municipalities()
-                self._safety_net_venue_lookup = ec_load_venue_canonical()
+            # Lookups loaded eagerly in __init__ (PR C — fail-fast on
+            # missing/broken data files rather than silently degrading).
             region_lookup = self._safety_net_region_lookup
             venue_lookup = self._safety_net_venue_lookup
 
@@ -1072,32 +1113,35 @@ class InstagramEventPipeline:
             slide_count = len(self.collect_carousel_urls(post)) if hasattr(self, 'collect_carousel_urls') else slides_with_text
             source_text = (caption or '') + ' ' + (ocr_text or '')
 
-            # Per-event sanity checks + region auto-fix
+            # PR C — Per-event sanity checks wrapped in _safe_check so one
+            # exception doesn't crash the whole post + discard its events.
             for ev in processed_events:
                 row_flags = []
-                f = ec_check_region_against_lookup(ev, region_lookup)
-                if f: row_flags.append(f)
-                f = ec_check_date_day_match(ev, source_text)
-                if f: row_flags.append(f)
-                f = ec_check_venue_city(ev, venue_lookup)
-                if f: row_flags.append(f)
-                f = ec_check_low_confidence(ev)
-                if f: row_flags.append(f)
-                f = ec_check_missing_date(ev)
-                if f: row_flags.append(f)
-                f = ec_check_date_sanity(ev, post_date)
-                if f: row_flags.append(f)
+                for name, fn, args in [
+                    ('region_against_lookup', ec_check_region_against_lookup, (ev, region_lookup)),
+                    ('date_day_match',        ec_check_date_day_match,        (ev, source_text)),
+                    ('venue_city',            ec_check_venue_city,            (ev, venue_lookup)),
+                    ('low_confidence',        ec_check_low_confidence,        (ev,)),
+                    ('missing_date',          ec_check_missing_date,          (ev,)),
+                    ('date_sanity',           ec_check_date_sanity,           (ev, post_date)),
+                ]:
+                    f = self._safe_check(name, fn, *args)
+                    if f:
+                        row_flags.append(f)
                 ev['_row_flags'] = row_flags  # per-event flags, merged with post-level below
 
-            # Post-level flags apply to every event from this post
+            # PR C — Post-level flags also wrapped in _safe_check.
+            n_events = len(processed_events)
             post_flags = []
-            for f in [
-                ec_check_calendar_low_events(caption or '', ocr_text or '', len(processed_events)),
-                ec_check_carousel_low_events(slide_count, slides_with_text, len(processed_events)),
-                ec_check_ocr_rich_low_events(ocr_text or '', len(processed_events)),
-                ec_check_no_grounding(caption or '', ocr_text or '', len(processed_events)),
+            for name, fn, args in [
+                ('calendar_low_events',  ec_check_calendar_low_events,  (caption or '', ocr_text or '', n_events)),
+                ('carousel_low_events',  ec_check_carousel_low_events,  (slide_count, slides_with_text, n_events)),
+                ('ocr_rich_low_events',  ec_check_ocr_rich_low_events,  (ocr_text or '', n_events)),
+                ('no_grounding',         ec_check_no_grounding,         (caption or '', ocr_text or '', n_events)),
             ]:
-                if f: post_flags.append(f)
+                f = self._safe_check(name, fn, *args)
+                if f:
+                    post_flags.append(f)
 
             for ev in processed_events:
                 all_flags = (ev.get('_row_flags') or []) + post_flags
