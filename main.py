@@ -237,25 +237,40 @@ class InstagramEventPipeline:
         """Single source of truth for marking a post processed and recording
         what happened to it. For anomalous outcomes (anything except
         events_found), captures preview text + reason so the post-run
-        anomaly file lets you audit silent misses without re-scraping."""
+        anomaly file lets you audit silent misses without re-scraping.
+
+        Acquires self.lock then delegates to _record_post_outcome_locked.
+        Callers that already hold self.lock should call _locked directly
+        — see process_post's atomic outcome+extend block (PR A)."""
         with self.lock:
-            self.processed_posts.add(pid)
-            entry = {
-                'result': result,
-                'account': user,
-                'post_date': post_date_str,
-            }
-            if result != 'events_found':
-                if caption:
-                    entry['caption_preview'] = str(caption)[:400]
-                if ocr_text:
-                    entry['ocr_preview'] = str(ocr_text)[:400]
-                if gemini_raw:
-                    entry['gemini_raw'] = str(gemini_raw)[:600]
-                if error:
-                    entry['error'] = str(error)[:300]
-                entry['post_url'] = f"https://www.instagram.com/p/{pid}/"
-            self.post_results[pid] = entry
+            self._record_post_outcome_locked(pid, result, user, post_date_str,
+                                              caption, ocr_text, gemini_raw, error)
+
+    def _record_post_outcome_locked(self, pid, result, user, post_date_str,
+                                    caption='', ocr_text='', gemini_raw='', error=''):
+        """Lock-free variant. ASSUMES caller holds self.lock. Used by
+        process_post to combine outcome recording with results.extend
+        in a single atomic lock block — without this pairing, a
+        periodic flush firing between record_outcome and results.extend
+        could snapshot post_results WITHOUT the matching events,
+        creating orphans (PR A: orphan hardening)."""
+        self.processed_posts.add(pid)
+        entry = {
+            'result': result,
+            'account': user,
+            'post_date': post_date_str,
+        }
+        if result != 'events_found':
+            if caption:
+                entry['caption_preview'] = str(caption)[:400]
+            if ocr_text:
+                entry['ocr_preview'] = str(ocr_text)[:400]
+            if gemini_raw:
+                entry['gemini_raw'] = str(gemini_raw)[:600]
+            if error:
+                entry['error'] = str(error)[:300]
+            entry['post_url'] = f"https://www.instagram.com/p/{pid}/"
+        self.post_results[pid] = entry
 
     def _flush_processed_log(self, force=False):
         """Append any post_results entries that haven't been written to
@@ -274,6 +289,22 @@ class InstagramEventPipeline:
           call; they're picked up in the next flush.
         """
         if not self.sheets_client or not self.log_worksheet:
+            return
+
+        # ─────────────────────────────────────────────────────────────
+        # PR A — ORDER MATTERS: events to All_Events FIRST, then
+        # Processed_Log. The old order (PL first, events second) meant
+        # a kill between them left orphans (PL marked done, AE empty).
+        # By writing events first, the worst-case failure is "events
+        # in AE but no PL entry" — recoverable on next cron because
+        # the post isn't yet in PL's dedup set; that's preferable to
+        # orphans, which silently lose data.
+        # ─────────────────────────────────────────────────────────────
+        events_ok = self._flush_events_to_sheet(force=force)
+        if not events_ok:
+            # Events flush failed — abort PL flush so we retry both
+            # together on the next call. Logging is handled inside
+            # _flush_events_to_sheet.
             return
 
         with self._flush_lock:
@@ -308,13 +339,6 @@ class InstagramEventPipeline:
                 # (or save_data's force=True final call) will retry these.
                 print(f"  ⚠ Processed_Log flush error ({len(pending)} pending): {e}")
 
-        # CRITICAL: also flush new events to All_Events. Keeping the two
-        # writes paired prevents orphan creation — a kill between
-        # Processed_Log flush and event flush is what caused today's
-        # 1,843 orphans. Now: every Processed_Log flush is followed by
-        # a sheet flush of the events that produced those dedup tags.
-        self._flush_events_to_sheet(force=force)
-
     def _flush_events_to_sheet(self, force=False):
         """Append any new entries in self.results to All_Events.
 
@@ -325,9 +349,14 @@ class InstagramEventPipeline:
 
         Same row-build + sanitize logic as save_data() so columns match.
         Per-cell quality-flag highlighting is applied after each batch
-        via _apply_quality_flag_formatting (same as save_data path)."""
+        via _apply_quality_flag_formatting (same as save_data path).
+
+        Returns:
+          True  — succeeded, OR no-op (nothing to flush / threshold not met)
+          False — Sheet write failed; caller should NOT proceed to mark
+                  PL entries flushed (PR A — events go first, then PL)."""
         if not self.sheets_client or not self.main_sheet:
-            return
+            return True  # no-op = no failure
 
         with self._flush_lock:
             # Snapshot pending events under main lock
@@ -336,9 +365,9 @@ class InstagramEventPipeline:
                 pending_events = self.results[start_idx:]
 
             if not pending_events:
-                return
+                return True  # nothing to flush, success
             if not force and len(pending_events) < self.EVENTS_FLUSH_THRESHOLD:
-                return
+                return True  # threshold not met, treat as success no-op
 
             # Build DataFrame for just the pending events. Reuse the same
             # column list + uppercase + sanitize logic as save_data().
@@ -346,7 +375,7 @@ class InstagramEventPipeline:
                 df = pd.DataFrame(pending_events)
             except Exception as e:
                 print(f"  ⚠ Could not build DataFrame for incremental flush: {e}")
-                return
+                return False
 
             cols = [
                 'instagram_handle', 'event_name', 'date', 'start_time',
@@ -405,9 +434,11 @@ class InstagramEventPipeline:
                     self._apply_quality_flag_formatting(evt_sheet, df, start_row)
                 except Exception as fmt_e:
                     print(f"  ⚠ Quality-flag formatting failed (non-fatal): {fmt_e}")
+                return True
             except Exception as e:
                 # Don't crash; next flush retries (start_idx unchanged)
                 print(f"  ⚠ All_Events flush error ({len(pending_events)} pending): {e}")
+                return False
 
     def _note_apify_shell_record(self, post, post_num):
         """Track an Apify shell record (no id/shortCode = account returned no
@@ -507,6 +538,16 @@ class InstagramEventPipeline:
     def handle_interrupt(self, signum, frame):
         print("\n\n⚠ INTERRUPT DETECTED - Saving all data...")
         self.emergency_save()
+        # PR A — force-flush in-memory data to Sheets before exit.
+        # Without this, Ctrl-C between periodic flushes leaves whatever's
+        # in self.results since the last flush as local CSV only. Next
+        # cron run wouldn't see those events on the sheet, and any
+        # already-flushed Processed_Log entries WITHOUT matching events
+        # would become orphans.
+        try:
+            self._flush_processed_log(force=True)
+        except Exception as e:
+            print(f"  ⚠ Final flush during interrupt failed: {e}")
         self.create_final_report()
         sys.exit(0)
 
@@ -1113,14 +1154,24 @@ class InstagramEventPipeline:
                 ev.setdefault('recurrence_pattern', '')
 
             _result_tag = 'events_found' if processed_events else 'no_events_found'
-            if processed_events:
-                self._record_post_outcome(pid, _result_tag, user, post_date_str)
-            else:
-                self._record_post_outcome(pid, _result_tag, user, post_date_str,
-                                          caption=caption, ocr_text=ocr_text,
-                                          gemini_raw=clean_json,
-                                          error='gemini_returned_events_but_all_filtered')
+            # ─────────────────────────────────────────────────────────────
+            # PR A — atomic outcome record + results.extend.
+            # Previously these were in two separate lock acquisitions, and
+            # a periodic flush firing between them could snapshot
+            # post_results WITHOUT the matching events in self.results,
+            # creating an orphan (post marked done in Processed_Log but
+            # no events in All_Events). Combined here under one lock so
+            # flushes always see either both-present or both-absent for
+            # a given pid.
+            # ─────────────────────────────────────────────────────────────
             with self.lock:
+                if processed_events:
+                    self._record_post_outcome_locked(pid, _result_tag, user, post_date_str)
+                else:
+                    self._record_post_outcome_locked(pid, _result_tag, user, post_date_str,
+                                                      caption=caption, ocr_text=ocr_text,
+                                                      gemini_raw=clean_json,
+                                                      error='gemini_returned_events_but_all_filtered')
                 self.stats['processed'] += 1
                 if processed_events:
                     self.stats['posts_with_events'] += 1
