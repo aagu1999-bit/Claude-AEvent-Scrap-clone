@@ -104,6 +104,23 @@ via fresh Apify scrape, then runs the full pipeline.
 
 ## Analytics (called by main.py + standalone)
 
+### `extraction_core.py` (module — not a runnable tool)
+Shared library of extraction logic that both `main.py` and `events_from_ids.py`
+should eventually import from. Currently a FOUNDATION — created so future PRs
+can migrate each consumer to use it.
+
+Contains:
+- Constants (model IDs, tier ladder, cost-per-call, calendar keywords, day names)
+- Lookup loaders (`load_nj_municipalities`, `load_venue_canonical`)
+- Helpers (`expand_day_ranges`, `count_distinct_dates`)
+- All sanity checks (region, date-day, venue-city, low-confidence,
+  missing-date, date-sanity, calendar/carousel/OCR-rich low-events,
+  account-pattern, no-grounding)
+- Per-flag column mapping (`FLAG_TO_COLUMNS`), light-yellow color constant
+
+Both tools currently have these inlined. Migration to imports is staged
+across follow-up PRs to keep each change focused.
+
 ### `recurring_accounts.py`
 Mines historical event CSVs to identify accounts whose posts contain
 recurring-event language ("Fridays", "Weekly", "Every Saturday", etc.).
