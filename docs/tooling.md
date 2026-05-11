@@ -47,6 +47,22 @@ Use when:
 - You need a fresh Apify scrape (use `main.py`)
 - You need weekend-specific re-scraping (use `reprocess_weekends.py`)
 
+### `merge_extract_runs.py`
+Combines multiple `outputs/extract_runs/<run_id>.json` summaries into one.
+
+**Use when:** An events_from_ids.py run was interrupted (Ctrl+C, network blip)
+and resumed later, producing two or more partial summaries. Also useful
+for aggregating multiple smoke-test runs.
+
+```
+python merge_extract_runs.py outputs/extract_runs/full_recovery_*.json -o combined.json
+```
+
+Element-wise sums all counter fields (counts, tiers_used, flag_distribution,
+skip_reasons, per_account_events, api_call_counts, region_lookup, phase
+timings, cost). Flags `completion_status: interrupted` if ANY source was
+interrupted. Lists source run IDs under `merged_from` for traceability.
+
 ### `reprocess_weekends.py`
 Re-scrapes weekend posts (Fri/Sat/Sun) for the next 3 calendar weeks
 via fresh Apify scrape, then runs the full pipeline.
