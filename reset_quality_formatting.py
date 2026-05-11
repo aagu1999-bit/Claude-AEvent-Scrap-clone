@@ -24,8 +24,6 @@ WHAT IT DOES NOT DO
   taken as-is. If you want to re-RUN sanity checks (e.g., recompute
   REGION_AUTOFIXED after lookup edits), use `audit_regions.py` or
   re-extract via events_from_ids.py.
-- Does NOT touch rows where QUALITY_FLAGS is empty (no flags = no
-  highlighting needed = nothing to do).
 
 USAGE
 ─────
@@ -40,10 +38,16 @@ USAGE
 
 SAFETY
 ──────
-- Dry-run by default. Counts flagged rows and lists what colors would change.
-- Two-phase per batch: (1) clear background on all 25 columns of each
-  affected row, (2) apply yellow to specific cells per flags. Done as
-  batch_format requests, ~100 rows per API call.
+- Dry-run by default. Reports row range that Phase 1 will wipe + cell
+  count Phase 2 will yellow.
+- Two-phase:
+  - PHASE 1: universal background wipe of ALL data rows in the
+    considered range. ONE bulk batch_format request. This clears drift
+    from rows with blank QUALITY_FLAGS that have stray yellow cells
+    (the failure mode of the pre-PR-D version).
+  - PHASE 2: re-apply yellow ONLY to cells dictated by each row's
+    current QUALITY_FLAGS + current FLAG_TO_COLUMNS mapping. Batched
+    ~100 cells per API call.
 """
 
 import argparse
@@ -142,34 +146,49 @@ def main():
     for flag, n in flag_counter.most_common():
         print(f"    {flag:<28} {n:>5}")
 
-    if not targets:
-        print("\n✓ No flagged rows. Nothing to reformat.")
+    # ─────────────────────────────────────────────────────────────
+    # PR D — UNIVERSAL Phase 1 wipe.
+    # The OLD Phase 1 cleared background only on rows with flag content.
+    # That left "blank QUALITY_FLAGS but stray yellow cells" rows
+    # completely untouched — the exact drift visible in the 2026-05
+    # screenshots (NEWSLETTER, CITY, SECTION OF NJ rows yellowed under
+    # an older FLAG_TO_COLUMNS, then orphaned when the mapping changed).
+    #
+    # New Phase 1 wipes ALL data rows in the considered range as a
+    # single bulk batch_format request — one API call instead of N.
+    # Phase 2 is unchanged: it paints yellow ONLY where the cell's
+    # current QUALITY_FLAGS content + current FLAG_TO_COLUMNS dictate.
+    # ─────────────────────────────────────────────────────────────
+    phase1_start = max(args.after_row or 2, 2)   # row 1 is header
+    phase1_end = len(all_data)
+    if phase1_end < phase1_start:
+        print(f"\n✓ No data rows in the considered range. Nothing to do.")
         return
 
     if not args.apply:
-        print(f"\n  [dry-run] Would clear formatting + re-apply on {len(targets)} rows.")
+        print(f"\n  [dry-run] Would:")
+        print(f"    Phase 1: clear formatting on rows {phase1_start}..{phase1_end} "
+              f"({phase1_end - phase1_start + 1} rows)")
+        n_cells = sum(len(c) for _, c, _ in targets)
+        print(f"    Phase 2: apply yellow to {n_cells} cells across "
+              f"{len(targets)} flagged rows")
         print(f"  Re-run with --apply to commit.")
         return
 
-    # PHASE 1: clear background on every row that's about to be touched
-    print(f"\n━━━ PHASE 1: clearing formatting on {len(targets)} rows ━━━")
-    clear_requests = [
-        {'range': f'A{row_num}:{last_col_letter}{row_num}',
-         'format': {'backgroundColor': WHITE_BG}}
-        for row_num, _, _ in targets
-    ]
-    total = (len(clear_requests) + BATCH_SIZE - 1) // BATCH_SIZE
-    for batch_idx in range(0, len(clear_requests), BATCH_SIZE):
-        batch = clear_requests[batch_idx:batch_idx + BATCH_SIZE]
-        try:
-            ws.batch_format(batch)
-            n = batch_idx // BATCH_SIZE + 1
-            print(f"  ✓ clear batch {n}/{total} ({len(batch)} rows)")
-        except Exception as e:
-            print(f"  ✗ clear batch failed: {str(e)[:120]}")
-            sys.exit(1)
-        if batch_idx + BATCH_SIZE < len(clear_requests):
-            time.sleep(BATCH_DELAY_SEC)
+    # PHASE 1: universal wipe of the considered row range.
+    # One bulk request — cheaper than N per-row requests AND covers
+    # rows the old code skipped (blank QUALITY_FLAGS with stray yellow).
+    print(f"\n━━━ PHASE 1: clearing formatting on rows {phase1_start}..{phase1_end} ━━━")
+    wipe_range = f'A{phase1_start}:{last_col_letter}{phase1_end}'
+    try:
+        ws.batch_format([{
+            'range': wipe_range,
+            'format': {'backgroundColor': WHITE_BG},
+        }])
+        print(f"  ✓ Cleared {phase1_end - phase1_start + 1} rows in one call ({wipe_range})")
+    except Exception as e:
+        print(f"  ✗ Bulk clear failed: {str(e)[:120]}")
+        sys.exit(1)
 
     # PHASE 2: re-apply yellow per FLAG_TO_COLUMNS
     print(f"\n━━━ PHASE 2: applying yellow to flagged cells ━━━")
