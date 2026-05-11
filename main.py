@@ -57,6 +57,17 @@ from extraction_core import (
     # process_post. Both main.py and events_from_ids.py call this so
     # extractions stay in lockstep.
     build_prompt              as ec_build_prompt,
+    # PR I — tier escalation constants. main.py mirrors the same
+    # 4-tier ladder events_from_ids.py uses so production cron and
+    # recovery tool produce comparable extractions.
+    MODEL_FLASH_LITE          as ec_MODEL_FLASH_LITE,
+    MODEL_PRO                 as ec_MODEL_PRO,
+    TIER_FLASH_CAPTION        as ec_TIER_FLASH_CAPTION,
+    TIER_FLASH_IMAGE          as ec_TIER_FLASH_IMAGE,
+    TIER_FLASH_TEXT           as ec_TIER_FLASH_TEXT,
+    TIER_PRO_IMAGE            as ec_TIER_PRO_IMAGE,
+    TIER_LADDER               as ec_TIER_LADDER,
+    ESCALATION_FLAGS          as ec_ESCALATION_FLAGS,
 )
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%I:%M:%S %p')
@@ -245,6 +256,16 @@ class InstagramEventPipeline:
             'carousel_posts': 0,
             'total_slides_ocrd': 0,
             'slides_with_text': 0,
+            # PR I — per-tier usage counters. Each post processed via
+            # the tier ladder increments the tier it FINISHED at (after
+            # any escalations). Useful for cost forecasting + tracking
+            # how often escalation actually kicks in.
+            'tiers_used': {
+                ec_TIER_FLASH_CAPTION: 0,
+                ec_TIER_FLASH_IMAGE: 0,
+                ec_TIER_FLASH_TEXT: 0,
+                ec_TIER_PRO_IMAGE: 0,
+            },
         }
 
         if not GEMINI_API_KEY:
@@ -252,14 +273,34 @@ class InstagramEventPipeline:
         else:
             genai.configure(api_key=GEMINI_API_KEY)
 
-        model_name = CONF["gemini_model"]
+        # PR I — Tier escalation in main.py.
+        # Default ON (matches events_from_ids.py behavior). Set
+        # tier_escalation_enabled: false in config.json to revert to
+        # single-model behavior using CONF["gemini_model"].
+        self.tier_escalation_enabled = bool(CONF.get("tier_escalation_enabled", True))
+
         print(f"\n{'='*60}")
         print(f" INSTAGRAM EVENT EXTRACTION PIPELINE")
         print(f"{'='*60}")
-        print(f"  • AI Model: {model_name}")
+        if self.tier_escalation_enabled:
+            # Tier ladder uses Flash-Lite for cheap tiers, Pro lazily
+            # for the last-resort tier. The user's gemini_model config
+            # is intentionally ignored here — tier escalation defines
+            # its own model assignments per tier.
+            self.gemini_flash_lite = genai.GenerativeModel(ec_MODEL_FLASH_LITE)
+            self.gemini_pro = None  # lazy init via _setup_pro_model
+            print(f"  • AI Model: Tier ladder (Flash-Lite → Pro)")
+        else:
+            # Legacy single-shot path — used when tier escalation is
+            # explicitly disabled. Honors the user's gemini_model setting.
+            model_name = CONF["gemini_model"]
+            self.gemini_flash_lite = genai.GenerativeModel(model_name)
+            self.gemini_pro = None
+            print(f"  • AI Model: {model_name} (tier escalation disabled)")
+        # Legacy alias for any older callers that referenced self.gemini_model
+        self.gemini_model = self.gemini_flash_lite
         print(f"  • Parallel Workers: {self.max_workers}")
         print(f"  • Rate Limit Delay: {self.rate_limit_delay}s")
-        self.gemini_model = genai.GenerativeModel(model_name)
 
         self.setup_vision()
 
@@ -928,6 +969,312 @@ class InstagramEventPipeline:
 
         return ""
 
+    # ─────────────────────────────────────────────────────────────
+    # PR I — Tier escalation helpers.
+    # Mirrors events_from_ids.py's 4-tier ladder so production cron
+    # and recovery tool produce comparable extractions. Tier handlers
+    # are class methods (vs. top-level functions in events_from_ids.py)
+    # so they can read self.gemini_flash_lite, self.gemini_pro, and
+    # the cached safety-net lookups without ctx-dict ceremony.
+    # ─────────────────────────────────────────────────────────────
+
+    def _setup_pro_model(self):
+        """Lazy init of the Pro model. Most cron runs never hit Tier 4
+        (Pro escalation only fires on quality flags, not zero events),
+        so we defer the genai.GenerativeModel construction until needed."""
+        if self.gemini_pro is None:
+            self.gemini_pro = genai.GenerativeModel(ec_MODEL_PRO)
+            print(f"    ↳ Pro model initialized ({ec_MODEL_PRO})")
+
+    def _download_image_for_multimodal(self, image_url):
+        """Download a single image and return ({'mime_type': str, 'data': bytes}, mime)
+        or None on failure. Uses the same retry/UA pattern as extract_ocr_text."""
+        if not image_url or image_url == 'null':
+            return None
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+            }
+            resp = requests.get(image_url, headers=headers, timeout=15)
+            if resp.status_code != 200:
+                return None
+            # Infer MIME type from Content-Type or URL extension
+            ct = (resp.headers.get('Content-Type') or '').lower()
+            if 'jpeg' in ct or 'jpg' in ct:
+                mime = 'image/jpeg'
+            elif 'png' in ct:
+                mime = 'image/png'
+            elif 'webp' in ct:
+                mime = 'image/webp'
+            else:
+                # Default to JPEG (Instagram CDN serves JPEG most often)
+                mime = 'image/jpeg'
+            return {'mime_type': mime, 'data': resp.content}
+        except Exception:
+            return None
+
+    def _collect_multimodal_images(self, post, cache_key='_cached_mm_images'):
+        """Return a list of {'mime_type', 'data'} dicts ready for
+        genai.GenerativeModel.generate_content() multimodal calls.
+
+        Caches the result on the post dict under cache_key so successive
+        tier escalations don't re-download the same images. The cache
+        cleanup happens at the end of process_post (PR I memory hygiene)."""
+        if cache_key in post:
+            return post[cache_key]
+        urls = self.collect_carousel_urls(post)
+        images = []
+        for url in urls:
+            img = self._download_image_for_multimodal(url)
+            if img:
+                images.append(img)
+        post[cache_key] = images
+        return images
+
+    def _parse_gemini_json(self, text):
+        """Strip code fences and parse a JSON response. Returns dict or None.
+        Mirrors events_from_ids.py.call_gemini's parsing logic."""
+        if not text:
+            return None
+        clean = re.sub(r'```json\s*|```', '', text).strip()
+        try:
+            return json.loads(clean)
+        except json.JSONDecodeError:
+            m = re.search(r'\{.*\}', clean, re.DOTALL)
+            if m:
+                try:
+                    return json.loads(m.group())
+                except Exception:
+                    return None
+            return None
+
+    def _call_gemini_tier(self, model, prompt_or_content, tier_name):
+        """Wrap a Gemini call with parsing + minimal error handling.
+        Returns the parsed JSON dict or None on any failure. tier_name
+        is recorded for log readability only."""
+        try:
+            resp = model.generate_content(prompt_or_content)
+            if not resp:
+                return None
+            text = resp.text.strip()
+        except Exception as e:
+            print(f"    ✗ Gemini error in {tier_name}: {str(e)[:120]}")
+            return None
+        return self._parse_gemini_json(text)
+
+    def _enrich_event_for_tier(self, e, post, has_ocr, is_calendar):
+        """Add the metadata fields the sheet expects. Used by every
+        tier so its events are ready for sanity checks.
+
+        Returns the enriched event dict (mutated in place) or None if
+        it should be dropped (no name AND no date)."""
+        if not e.get('event_name') and not e.get('date'):
+            return None
+        if e.get('event_name') and len(e['event_name']) > 40:
+            e['event_name'] = e['event_name'][:40].rsplit(' ', 1)[0]
+        user = post.get('ownerUsername', '')
+        owner_full_name = post.get('ownerFullName', '')
+        shortcode = post.get('shortCode', '') or post.get('shortcode', '')
+        display_url = post.get('displayUrl', '') or post.get('display_url', '')
+        pid = post.get('id') or post.get('shortCode')
+        e['instagram_handle'] = user
+        e['instagram_post_url'] = f"https://www.instagram.com/p/{shortcode}/" if shortcode else ''
+        e['display_url'] = display_url
+        e['post_url'] = post.get('url', '')
+        e['instagram_profile_url'] = f"https://www.instagram.com/{user}/" if user else ''
+        e['account_name'] = owner_full_name
+        e['start_time'] = self.clean_time(e.get('start_time'))
+        e['post_id'] = pid
+        e['had_ocr'] = has_ocr
+        e['from_calendar'] = is_calendar
+        e.setdefault('recurrence_pattern', '')
+        return e
+
+    def _run_tier(self, tier_name, post, post_date, ocr_text, slide_count, slides_with_text, cached_images):
+        """Run a single tier. Returns (enriched_events, is_calendar, has_ocr, all_flags).
+
+        Each tier:
+          1. Builds the appropriate prompt + (optional) image content
+          2. Calls Gemini and parses response
+          3. Enriches resulting events with metadata
+          4. Runs per-event + post-level sanity checks
+          5. Returns flags so the tier ladder can decide escalation"""
+        # ── Build call inputs per tier ──
+        caption = post.get('caption', '') or post.get('text', '')
+        if tier_name == ec_TIER_FLASH_CAPTION:
+            print(f"  [Tier 1: Flash-Lite caption-only (no Vision)]")
+            prompt = ec_build_prompt(post, "", post_date)
+            data = self._call_gemini_tier(self.gemini_flash_lite, prompt, tier_name)
+            has_ocr = False
+        elif tier_name == ec_TIER_FLASH_IMAGE:
+            print(f"  [Tier 2: Flash-Lite multimodal (image)]")
+            if not cached_images:
+                print(f"    ⚠ No images downloadable — falling back to caption-only handling")
+                prompt = ec_build_prompt(post, "", post_date)
+                data = self._call_gemini_tier(self.gemini_flash_lite, prompt, tier_name)
+            else:
+                print(f"    ✓ {len(cached_images)} image(s) prepared for multimodal")
+                prompt = ec_build_prompt(post, "", post_date)
+                content = [prompt] + cached_images
+                data = self._call_gemini_tier(self.gemini_flash_lite, content, tier_name)
+            has_ocr = False
+        elif tier_name == ec_TIER_FLASH_TEXT:
+            print(f"  [Tier 3: Flash-Lite + OCR text]")
+            if not ocr_text:
+                print(f"    ⚠ No OCR text")
+            prompt = ec_build_prompt(post, ocr_text or "", post_date)
+            data = self._call_gemini_tier(self.gemini_flash_lite, prompt, tier_name)
+            has_ocr = bool(ocr_text)
+        elif tier_name == ec_TIER_PRO_IMAGE:
+            print(f"  [Tier 4: Pro multimodal (image)]")
+            self._setup_pro_model()
+            if not cached_images:
+                print(f"    ⚠ No images — falling back to caption-only on Pro")
+                prompt = ec_build_prompt(post, ocr_text or "", post_date)
+                data = self._call_gemini_tier(self.gemini_pro, prompt, tier_name)
+            else:
+                prompt = ec_build_prompt(post, ocr_text or "", post_date)
+                content = [prompt] + cached_images
+                data = self._call_gemini_tier(self.gemini_pro, content, tier_name)
+            has_ocr = bool(ocr_text)
+        else:
+            print(f"  ⚠ Unknown tier: {tier_name}")
+            return [], False, False, []
+
+        if not data:
+            return [], False, has_ocr, []
+
+        is_calendar = data.get('is_calendar_post', False)
+        raw_events = data.get('events', [])
+
+        # ── Enrich each event ──
+        enriched = []
+        for e in raw_events:
+            ee = self._enrich_event_for_tier(e, post, has_ocr, is_calendar)
+            if ee is not None:
+                enriched.append(ee)
+
+        # ── Per-event sanity checks ──
+        source_text = (caption or '') + ' ' + (ocr_text or '')
+        all_flags = set()
+        for ev in enriched:
+            row_flags = []
+            for name, fn, args in [
+                ('region_against_lookup', ec_check_region_against_lookup, (ev, self._safety_net_region_lookup)),
+                ('date_day_match',        ec_check_date_day_match,        (ev, source_text)),
+                ('venue_city',            ec_check_venue_city,            (ev, self._safety_net_venue_lookup)),
+                ('low_confidence',        ec_check_low_confidence,        (ev,)),
+                ('missing_date',          ec_check_missing_date,          (ev,)),
+                ('date_sanity',           ec_check_date_sanity,           (ev, post_date)),
+            ]:
+                f = self._safe_check(name, fn, *args)
+                if f:
+                    row_flags.append(f)
+            ev['_row_flags'] = row_flags
+            all_flags.update(row_flags)
+
+        # ── Post-level sanity checks ──
+        n_events = len(enriched)
+        post_flags = []
+        for name, fn, args in [
+            ('calendar_low_events',  ec_check_calendar_low_events,  (caption or '', ocr_text or '', n_events)),
+            ('carousel_low_events',  ec_check_carousel_low_events,  (slide_count, slides_with_text, n_events)),
+            ('ocr_rich_low_events',  ec_check_ocr_rich_low_events,  (ocr_text or '', n_events)),
+            ('no_grounding',         ec_check_no_grounding,         (caption or '', ocr_text or '', n_events)),
+        ]:
+            f = self._safe_check(name, fn, *args)
+            if f:
+                post_flags.append(f)
+        all_flags.update(post_flags)
+
+        # Merge per-event + post-level flags onto each event
+        for ev in enriched:
+            merged = (ev.get('_row_flags') or []) + post_flags
+            ev['quality_flags'] = ",".join(sorted(set(merged)))
+            ev.pop('_row_flags', None)
+
+        return enriched, is_calendar, has_ocr, list(all_flags)
+
+    def _process_with_tier_ladder(self, post, post_date, ocr_text,
+                                   slide_count, slides_with_text,
+                                   max_tier=None):
+        """Run a post through the tier ladder. Returns
+        (final_events, tier_used, has_ocr, is_calendar).
+
+        Starts at TIER_FLASH_CAPTION (cheapest) and escalates only when
+        needed. Caption-less posts skip Tier 1 (nothing to work with)
+        and start at TIER_FLASH_IMAGE.
+
+        Escalation rules (mirrors events_from_ids.py):
+          (a) Any ESCALATION_FLAGS fired → escalate (even to Pro)
+          (b) Zero events at non-final, non-Pro tier → escalate
+          (c) NEVER escalate to Pro just because earlier tiers returned
+              zero events. Pro only fires on a quality flag — preserves
+              cost discipline (Pro is ~8× Flash-Lite per call)."""
+        max_tier = max_tier or ec_TIER_PRO_IMAGE
+
+        # Download images once, reuse across Tier 2 + Tier 4
+        cached_images = self._collect_multimodal_images(post)
+
+        has_caption = bool((post.get('caption') or '').strip())
+        if not has_caption:
+            print(f"  ↳ no caption — starting at flash_image (skipping Tier 1)")
+            current_tier = ec_TIER_FLASH_IMAGE
+        else:
+            current_tier = ec_TIER_FLASH_CAPTION
+
+        final_events = []
+        final_is_calendar = False
+        final_has_ocr = False
+
+        while current_tier is not None:
+            events, is_calendar, has_ocr, flags = self._run_tier(
+                current_tier, post, post_date, ocr_text,
+                slide_count, slides_with_text, cached_images,
+            )
+
+            # Decide whether to escalate
+            try:
+                idx = ec_TIER_LADDER.index(current_tier)
+            except ValueError:
+                idx = -1
+            nt = ec_TIER_LADDER[idx + 1] if 0 <= idx < len(ec_TIER_LADDER) - 1 else None
+
+            flag_escalate = any(f in ec_ESCALATION_FLAGS for f in flags)
+            zero_event_escalate = (len(events) == 0 and nt is not None and nt != ec_TIER_PRO_IMAGE)
+            can_escalate = nt is not None and current_tier != max_tier
+
+            if can_escalate and (flag_escalate or zero_event_escalate):
+                reason_parts = []
+                if flag_escalate:
+                    esc_flags = sorted(f for f in set(flags) if f in ec_ESCALATION_FLAGS)
+                    reason_parts.append(f"flags={esc_flags}")
+                if zero_event_escalate:
+                    reason_parts.append("zero_events")
+                print(f"  ↳ escalating to {nt}  ({', '.join(reason_parts)})")
+                current_tier = nt
+                continue
+
+            # Final tier reached. Surface informational flags so user sees auto-fixes.
+            informational = sorted(f for f in set(flags) if f not in ec_ESCALATION_FLAGS)
+            if informational:
+                print(f"  ↳ informational flags: {informational}")
+            final_events = events
+            final_is_calendar = is_calendar
+            final_has_ocr = has_ocr
+            break
+
+        # Free the image cache for this post — these can be MB of bytes
+        # per post, and parallel workers can accumulate quickly.
+        post.pop('_cached_mm_images', None)
+
+        # Track which tier ended up "winning"
+        with self.lock:
+            self.stats['tiers_used'][current_tier] = self.stats['tiers_used'].get(current_tier, 0) + 1
+
+        return final_events, current_tier, final_has_ocr, final_is_calendar
+
     def process_post(self, post, post_num, total):
         pid = post.get('id') or post.get('shortCode')
 
@@ -1041,158 +1388,48 @@ class InstagramEventPipeline:
 
         time.sleep(self.rate_limit_delay)
 
-        print(f"  ↳ Analyzing with Gemini AI (checking for multiple events)...")
+        print(f"  ↳ Analyzing with Gemini AI...")
 
-        # PR B — prompt comes from extraction_core so main.py and
-        # events_from_ids.py produce identical Gemini outputs. The
-        # old inline prompt was missing 6 categories of guidance
-        # (anti-hallucination, spatial layout, day-range handling,
-        # city specificity, time range, confidence scale documentation)
-        # which caused measurable production drift: 60 hallucinated
-        # "New Jersey" cities and 384 out-of-range confidence values
-        # captured in the 2026-05-11 quality baseline.
-        prompt = ec_build_prompt(post, ocr_text, post_date)
+        # ─────────────────────────────────────────────────────────────
+        # PR I — TIER LADDER EXTRACTION.
+        # Replaces the single-shot Gemini call with the 4-tier ladder
+        # (Flash-Lite caption → Flash-Lite image → Flash-Lite + OCR →
+        # Pro multimodal). _process_with_tier_ladder handles prompt
+        # construction, Gemini calls, enrichment, sanity checks, and
+        # escalation decisions — see method docstring for the loop
+        # invariants. Returns processed events with quality_flags
+        # already merged, plus the winning tier name + is_calendar.
+        #
+        # When self.tier_escalation_enabled is False (config opt-out),
+        # we cap the ladder at TIER_FLASH_TEXT so the user's preferred
+        # single model (still bound to self.gemini_flash_lite from
+        # __init__) gets used without spilling into Pro.
+        # ─────────────────────────────────────────────────────────────
+        slides_with_text = ocr_text.count('[SLIDE ') if '[SLIDE ' in ocr_text else (1 if ocr_text else 0)
+        slide_count = len(self.collect_carousel_urls(post))
+        max_tier = ec_TIER_PRO_IMAGE if self.tier_escalation_enabled else ec_TIER_FLASH_TEXT
+        clean_json = ''  # legacy sentinel — kept for error-recording sites that reference it
 
         try:
-            resp = self.gemini_model.generate_content(prompt)
-            if not resp:
-                print(f"  ✗ Gemini returned empty response")
-                self._record_post_outcome(pid, 'gemini_error', user, post_date_str,
-                                          caption=caption, ocr_text=ocr_text,
-                                          error='gemini_returned_none')
-                with self.lock:
-                    self.stats['gemini_errors'] += 1
-                    self.stats['processed'] += 1
-                return None
+            processed_events, tier_used, has_ocr_used, is_calendar = self._process_with_tier_ladder(
+                post, post_date, ocr_text,
+                slide_count=slide_count,
+                slides_with_text=slides_with_text,
+                max_tier=max_tier,
+            )
 
-            try:
-                text = resp.text.strip()
-            except (AttributeError, ValueError) as e:
-                print(f"  ✗ Gemini response error: {e}")
-                self._record_post_outcome(pid, 'gemini_error', user, post_date_str,
-                                          caption=caption, ocr_text=ocr_text,
-                                          error=f'response_text_access_failed: {e}')
-                with self.lock:
-                    self.stats['gemini_errors'] += 1
-                    self.stats['processed'] += 1
-                return None
-
-            clean_json = re.sub(r'```json\s*|```', '', text).strip()
-
-            try:
-                data = json.loads(clean_json)
-            except json.JSONDecodeError:
-                json_match = re.search(r'\{.*\}', clean_json, re.DOTALL)
-                if json_match:
-                    try:
-                        data = json.loads(json_match.group())
-                    except Exception as parse_e:
-                        print(f"  ✗ Could not parse Gemini JSON response")
-                        self._record_post_outcome(pid, 'gemini_error', user, post_date_str,
-                                                  caption=caption, ocr_text=ocr_text,
-                                                  gemini_raw=clean_json,
-                                                  error=f'json_parse_failed_after_regex: {parse_e}')
-                        with self.lock:
-                            self.stats['gemini_errors'] += 1
-                            self.stats['processed'] += 1
-                        return None
-                else:
-                    print(f"  ✗ No valid JSON in Gemini response")
-                    self._record_post_outcome(pid, 'gemini_error', user, post_date_str,
-                                              caption=caption, ocr_text=ocr_text,
-                                              gemini_raw=clean_json,
-                                              error='no_json_brace_in_response')
-                    with self.lock:
-                        self.stats['gemini_errors'] += 1
-                        self.stats['processed'] += 1
-                    return None
-
-            events = data.get('events', [])
-            is_calendar = data.get('is_calendar_post', False)
-
-            if not events:
-                print(f"  ↳ No events found in this post")
+            if not processed_events:
+                print(f"  ↳ No events found in this post (tier={tier_used})")
                 result_tag = 'ocr_failed' if ocr_attempted_and_failed else 'no_events_found'
-                reason = ('gemini_returned_empty_events_after_failed_ocr' if ocr_attempted_and_failed
-                          else 'gemini_returned_empty_events_array')
+                reason = ('tier_ladder_no_events_after_failed_ocr' if ocr_attempted_and_failed
+                          else 'tier_ladder_returned_no_events')
                 self._record_post_outcome(pid, result_tag, user, post_date_str,
                                           caption=caption, ocr_text=ocr_text,
-                                          gemini_raw=clean_json,
                                           error=reason)
                 with self.lock:
                     self.stats['processed'] += 1
                     self.stats['posts_no_events'] += 1
                 return None
-
-            processed_events = []
-            for e in events:
-                if not e.get('event_name') and not e.get('date'):
-                    continue
-                if e.get('event_name') and len(e['event_name']) > 40:
-                    e['event_name'] = e['event_name'][:40].rsplit(' ', 1)[0]
-                e['instagram_handle'] = user
-                e['instagram_post_url'] = f"https://www.instagram.com/p/{shortcode}/" if shortcode else ''
-                e['display_url'] = display_url
-                e['post_url'] = post.get('url', '')
-                e['instagram_profile_url'] = f"https://www.instagram.com/{user}/" if user else ''
-                e['account_name'] = owner_full_name
-                e['start_time'] = self.clean_time(e.get('start_time'))
-                e['post_id'] = pid
-                e['had_ocr'] = has_ocr
-                e['from_calendar'] = is_calendar
-                processed_events.append(e)
-
-            # B5: apply the same safety net events_from_ids.py uses, so the
-            # production cron also gets region auto-fix, sanity flags, and
-            # per-cell visual indicators on All_Events. See
-            # docs/decisions/0012-extraction-core-foundation.md.
-            #
-            # Lookups loaded eagerly in __init__ (PR C — fail-fast on
-            # missing/broken data files rather than silently degrading).
-            region_lookup = self._safety_net_region_lookup
-            venue_lookup = self._safety_net_venue_lookup
-
-            # Count text-bearing slides for the carousel-low-events check
-            slides_with_text = ocr_text.count('[SLIDE ') if '[SLIDE ' in ocr_text else (1 if ocr_text else 0)
-            slide_count = len(self.collect_carousel_urls(post)) if hasattr(self, 'collect_carousel_urls') else slides_with_text
-            source_text = (caption or '') + ' ' + (ocr_text or '')
-
-            # PR C — Per-event sanity checks wrapped in _safe_check so one
-            # exception doesn't crash the whole post + discard its events.
-            for ev in processed_events:
-                row_flags = []
-                for name, fn, args in [
-                    ('region_against_lookup', ec_check_region_against_lookup, (ev, region_lookup)),
-                    ('date_day_match',        ec_check_date_day_match,        (ev, source_text)),
-                    ('venue_city',            ec_check_venue_city,            (ev, venue_lookup)),
-                    ('low_confidence',        ec_check_low_confidence,        (ev,)),
-                    ('missing_date',          ec_check_missing_date,          (ev,)),
-                    ('date_sanity',           ec_check_date_sanity,           (ev, post_date)),
-                ]:
-                    f = self._safe_check(name, fn, *args)
-                    if f:
-                        row_flags.append(f)
-                ev['_row_flags'] = row_flags  # per-event flags, merged with post-level below
-
-            # PR C — Post-level flags also wrapped in _safe_check.
-            n_events = len(processed_events)
-            post_flags = []
-            for name, fn, args in [
-                ('calendar_low_events',  ec_check_calendar_low_events,  (caption or '', ocr_text or '', n_events)),
-                ('carousel_low_events',  ec_check_carousel_low_events,  (slide_count, slides_with_text, n_events)),
-                ('ocr_rich_low_events',  ec_check_ocr_rich_low_events,  (ocr_text or '', n_events)),
-                ('no_grounding',         ec_check_no_grounding,         (caption or '', ocr_text or '', n_events)),
-            ]:
-                f = self._safe_check(name, fn, *args)
-                if f:
-                    post_flags.append(f)
-
-            for ev in processed_events:
-                all_flags = (ev.get('_row_flags') or []) + post_flags
-                ev['quality_flags'] = ",".join(sorted(set(all_flags)))
-                ev.pop('_row_flags', None)
-                # recurrence_pattern field for the new column; default empty
-                ev.setdefault('recurrence_pattern', '')
 
             _result_tag = 'events_found' if processed_events else 'no_events_found'
             # ─────────────────────────────────────────────────────────────
@@ -1387,6 +1624,21 @@ class InstagramEventPipeline:
                 print(f"  • {error}: {count} times")
 
         print(f"\n⚠ GEMINI ERRORS: {self.stats['gemini_errors']}")
+
+        # PR I — Tier-usage report. Surfaces how often each tier ended up
+        # being the "winning" tier for a post. Useful for cost forecasting
+        # and verifying that escalation is firing as expected (most posts
+        # should land at flash_caption or flash_image; pro_image should be
+        # rare — a few percent at most).
+        tiers_used = self.stats.get('tiers_used', {})
+        if tiers_used and any(tiers_used.values()):
+            print(f"\n🎚  TIER USAGE:")
+            total = sum(tiers_used.values()) or 1
+            for tier in [ec_TIER_FLASH_CAPTION, ec_TIER_FLASH_IMAGE,
+                         ec_TIER_FLASH_TEXT, ec_TIER_PRO_IMAGE]:
+                n = tiers_used.get(tier, 0)
+                pct = 100.0 * n / total
+                print(f"  • {tier:<14} {n:>5}  ({pct:>5.1f}%)")
 
         if self.post_results:
             from collections import Counter
