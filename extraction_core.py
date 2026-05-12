@@ -328,7 +328,13 @@ def check_missing_date(event: dict) -> Optional[str]:
 def check_date_sanity(event: dict, post_date: datetime) -> Optional[str]:
     """Fire when extracted date is implausibly far from POST DATE.
     PAST_DATE: extracted date >7 days BEFORE post date.
-    FAR_FUTURE_DATE: extracted date >365 days AFTER post date."""
+    FAR_FUTURE_DATE: extracted date >365 days AFTER post date.
+
+    Bug fix (2026-05-12): main.py's PR F made datetime.now() timezone-aware,
+    so post_date may now be tz-aware while `d` (from strptime) is naive.
+    Subtracting one from the other raises TypeError. Strip tzinfo from
+    post_date if present so we always compare naive↔naive. This is safe
+    because we only use .days (not actual wall-clock arithmetic)."""
     date_str = event.get('date')
     if not date_str:
         return None
@@ -336,6 +342,10 @@ def check_date_sanity(event: dict, post_date: datetime) -> Optional[str]:
         d = datetime.strptime(str(date_str)[:10], '%Y-%m-%d')
     except (ValueError, TypeError):
         return None
+    # Normalize post_date to naive — handle both tz-aware (PR F'd main.py)
+    # and tz-naive (events_from_ids.py) callers.
+    if post_date is not None and post_date.tzinfo is not None:
+        post_date = post_date.replace(tzinfo=None)
     delta = (d - post_date).days
     if delta < -PAST_DATE_DAYS:
         return "PAST_DATE"
