@@ -145,6 +145,7 @@ RE_EVENT_FOUND  = re.compile(r'EVENT FOUND:\s+(.+?)\s*$')
 RE_MULTI_HEADER = re.compile(r'MULTIPLE EVENTS FOUND:\s+(\d+)\s+events extracted')
 RE_MULTI_ITEM   = re.compile(r'^\s+(\d+)\.\s+(.+?)\s*$')
 
+# New-format event marker:  ✦ [flash_caption] 'Bad Bunny Night' | 2026-05-22
 RE_NEW_EVENT = re.compile(
     r"\[([a-z][a-z0-9_]*)\]\s+[\'\"\u2018\u201c](.+?)[\'\"\u2019\u201d]\s+\|\s+(\S+)\s*$"
 )
@@ -181,7 +182,7 @@ def parse_log(log_path):
     log_mtime = datetime.fromtimestamp(log_path.stat().st_mtime)
 
     posts_by_id = {}
-    legacy_current_id = None
+    legacy_current_id = None  # used when a line has no prefix
 
     def ensure_post(post_id):
         if post_id not in posts_by_id:
@@ -207,7 +208,9 @@ def parse_log(log_path):
             body = line
             ctx = posts_by_id.get(legacy_current_id) if legacy_current_id else None
 
-        # Processing post: marker -- always update legacy anchor
+        # Processing post: marker -- always update legacy anchor; if line also
+        # had a prefix, the prefix already set ctx (they should agree, but
+        # prefix wins by virtue of having already been applied).
         m = RE_PROCESSING.search(body)
         if m:
             inner_id = m.group(1)
@@ -216,7 +219,7 @@ def parse_log(log_path):
             continue
 
         if ctx is None:
-            continue
+            continue  # no post in scope; skip this line
 
         # NEW format event marker (specific, check first)
         m = RE_NEW_EVENT.search(body)
@@ -283,6 +286,7 @@ def parse_log(log_path):
                     pass
                 continue
 
+    # Return list, dropping internal _cur_event
     posts = []
     for post in posts_by_id.values():
         post.pop('_cur_event', None)
@@ -360,9 +364,11 @@ def col_letter(idx_zero_based):
 
 def derive_flags(post_record, event_log, sheet_row, col_indices,
                  nj_lookup, all_event_dates_in_post, skip_day_mismatch=True):
+    # Event-level path: trust the log directly.
     if event_log.get('event_flags') is not None:
         return set(event_log['event_flags']), 'event-level'
 
+    # Post-level fallback (legacy conservative derivation)
     flags = set()
     log_post_flags = post_record['post_flags']
 

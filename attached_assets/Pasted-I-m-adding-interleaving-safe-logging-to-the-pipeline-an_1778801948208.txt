@@ -1,0 +1,31 @@
+I'm adding interleaving-safe logging to the pipeline and updating the flag repair tool to take advantage of it. I have three files to integrate.
+New files to add to the repo root:
+
+worker_log.py — helper module for per-worker log prefixing (NEW, paste contents below)
+retrofit_log_prefixes.py — standalone script that adds [post_id] prefixes to existing logs (NEW, paste contents below)
+
+File to replace:
+3. repair_flags_from_log.py — updated parser that recognizes [post_id] prefixes (REPLACE existing file with contents below)
+Then make these edits to main.py:
+A. Add to the imports near the top:
+pythonfrom worker_log import wprint, log_post_context, get_logger
+B. Find the line logger = logging.getLogger(__name__) and replace with:
+pythonlogger = get_logger(__name__)
+C. In the process_post method of InstagramEventPipeline, wrap the entire method body in a with log_post_context(post_id): block. The post_id variable is already computed near the top of the method. So the structure becomes:
+pythondef process_post(self, post, post_num, total):
+    post_id = post.get('id', '') or post.get('shortCode', '') or post.get('shortcode', '') or f'post_{post_num}'
+    with log_post_context(post_id):
+        # ... ALL existing body of process_post goes here, unchanged ...
+Indent the existing body one level to fit inside the with block. Do not change any of the existing logic — just wrap it.
+D. Inside process_post (and any helper methods it calls), find-and-replace print( with wprint(. The signature is identical, so this is purely mechanical. Don't touch print( calls in setup, teardown, or anywhere outside the worker code path — only the per-post processing path.
+Do not change anything else. No changes to extraction_core.py, quality_metrics.py, the sheet schema, or any other files.
+After integrating, please:
+
+Run python -c "import worker_log; import repair_flags_from_log; import retrofit_log_prefixes" to confirm all three import cleanly
+Run python main.py for a small batch (use max_posts=5 or similar) to verify the new logs come out with [post_id] prefixes on every line during post processing
+Commit and push with message: feat: per-worker log prefixing for interleaving-safe parsing
+
+[paste worker_log.py contents]
+[paste repair_flags_from_log.py contents]
+[paste retrofit_log_prefixes.py contents]
+
