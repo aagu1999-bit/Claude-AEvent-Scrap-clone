@@ -1,0 +1,34 @@
+1. "0 true duplicates" needs sharper criteria.
+
+The agent checked "post IDs with both May 7 AND May 8 timestamps." But the relevant duplicate question is different: did the recovery script end up writing rows that overlap with the 46 already-present rows from the original 14:17 run? Both sets have May 7 timestamps. The recovery dedup logic in recover_events.py uses a composite key (POST ID, EVENT NAME, DATE) — but the agent didn't show they verified that path. Better question:
+
+"For the 46 All_Events rows that came from the original 14:17 run, do their (POST ID, EVENT NAME, DATE) composite keys appear exactly once in All_Events, or twice (once from original, once from recovery)? Run select count(*) ... group by post_id, event_name, date having count > 1 over All_Events filtered to May 7 timestamps."
+
+If 46 duplicates exist, that's a real-but-tiny data quality issue (would need to be cleaned later, low urgency). If 0, recovery's dedup worked as designed and we're clean.
+
+2. The 2 missing post IDs from Processed_Log (3881940062649119319, 3885368551138013442) deserve a one-line answer.
+
+If save_data() writes Processed_Log first and then CSV, but those 2 IDs are in the CSV and not in Processed_Log, that means the death happened during the Processed_Log write step — not after it. Which contradicts the agent's narrative that "Processed_Log finished and during the All_Events append" the process died.
+
+Two possible explanations:
+
+Processed_Log writes are interleaved during processing (per-post or per-batch), not a single end-of-run dump. The 2 missing ones may be from a batch that was queued but never flushed.
+The order in save_data() is different than the agent stated.
+Worth resolving — small detail, but affects how we describe the failure mode.
+
+3. May 8 reprocess wiping May 7 Processed_Log entries.
+
+reprocess_weekends.py deletes post IDs from Processed_Log so they re-process. Today's May 8 reprocess targeted weekend events in the next 3 weeks. Did any of the 695 May 7 Processed_Log entries get wiped by that reprocess? If yes, your dedup history just lost coverage of those posts and they'll re-process again next Thursday — silent rework. The agent should run:
+
+
+# Currently in Processed_Log: how many May-7-source entries remain?
+# Compare against what was in Processed_Log on May 7 evening
+If we don't have a May 7 evening snapshot of Processed_Log to compare against, this is unanswerable definitively. But we can at least count how many May 7 entries are currently there and compare to the 695 we know were written. If the count is < 695, some got wiped.
+
+4. Pseudo-ID artifacts from the failed 18:26 runs.
+
+We know 34 pseudo-IDs (post_NNN) are in Processed_Log dated 2026-05-07 with Auto-Bot source. The agent's narrative says the 18:26 runs got killed mid-processing. Yet 34 pseudo-IDs got written. So Processed_Log writes ARE happening incrementally during the run, not just at end. That confirms my point in #2 above. The 34 post_NNN rows are real artifacts of the killed 18:26 attempts — they processed up to ~395 posts and wrote pseudo-IDs as they went.
+
+5. The Plan-mode-can't-write-to-disk constraint is fine, write the doc later.
+
+Their offer to create docs/decisions/0004-run-postmortem-may7.md is exactly the right pattern. Same format as existing ADRs. Encourage them to do this in Build mode, including the verified/inferred discipline they just demonstrated.

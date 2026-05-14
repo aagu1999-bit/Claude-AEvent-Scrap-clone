@@ -1,0 +1,35 @@
+Before writing 0004-run-postmortem-may7.md, two more verifications:
+
+1. Confirm the pre-PR#2 code has no pickle.load() anywhere. I just did:
+   `grep -n "pickle.load\|checkpoint_file" main.py` on commit 4e4fdf6
+   shows ONLY the write path. The checkpoint hypothesis isn't just
+   "contradicted by skipped_history: 0" — it's structurally impossible
+   because the code never reads the pickle. State this directly.
+
+2. The 14:17 run was reprocess_weekends.py running. Evidence:
+   - reprocess_weekends.py line 423 explicitly does
+     `pipeline.processed_posts = set()` BEFORE run_pipeline
+   - That's the only path that produces skipped_history: 0 cleanly
+   - Combined with the "Project" workflow firing all three tasks in
+     parallel, this is mechanistically how 14:17 happened
+   The Event Pipeline (main.py) presumably also fired in parallel and
+   was killed/restarted at 18:24-26 — those were the larger 4441-post
+   runs. Two parallel processes, two different fates.
+
+3. For the 2 orphan IDs root cause: trace the `as_completed` +
+   `future.result(timeout=120)` behavior in run_pipeline (commit 4e4fdf6).
+   Specifically:
+   - Is `executor.shutdown(wait=True)` ever called after the loop?
+   - Could a thread that timed out (TimeoutError caught and ignored)
+     still complete its lock block AFTER run_pipeline returns?
+   - run_pipeline returns `self.results, dict(self.post_results)` —
+     one is a reference, one is a copy. If a thread completes between
+     the snapshot copy and the CSV write, you get exactly this symptom.
+   Check Replit's console output for the timeframe for any
+   "Worker error: TimeoutError" lines — if present, this is the
+   mechanism.
+
+The doc should explicitly distinguish:
+- VERIFIED: no pickle.load() in pre-PR#2; reprocess_weekends explicitly wipes dedup
+- INFERRED-BUT-CONSISTENT: 14:17 was reprocess_weekends (signature: skipped_history=0, ~3 events/post)
+- UNRESOLVED but with a plausible mechanism: timeout-then-late-completion race for the 2 orphans

@@ -1,0 +1,56 @@
+Adding more questions. Please separate verified vs inferred for each:
+
+1. The CHANGELOG.md, docs/decisions/, and PR #2 observability code are all
+   on this Replit's main branch as of commit d9a8929. Have you read them?
+   They include the rationale for the per-run log + anomalies + apify_raw
+   files you've been reading.
+
+2. Confirm by reading .replit: the "Project" workflow runs Event Pipeline,
+   History Migration, and Reprocess Weekends in PARALLEL on a single
+   trigger. So a single workflow fire = three concurrent processes.
+
+3. config.json has "schedule_time": "20:16" with no timezone declared.
+   What timezone does Replit's scheduler interpret this in? Did the
+   scheduler actually fire at that exact time on May 7? Today's 14:17 EDT
+   and 18:24-26 EDT runs don't obviously match 20:16 UTC or any 20:16
+   conversion — were they triggered by the scheduler or manually?
+
+4. Where exactly does the "743 posts processed, 2158 events found" claim
+   come from? Run `ls -la outputs/stats_2026050*.json` and paste output.
+   If a stats file exists, paste its contents. If not, label that number
+   as inferred from CSV row counts, not stats-file confirmed.
+
+5. For Sheets upload "verified rows are there": (a) did you verify all
+   2158 rows or sample? (b) are there duplicates in All_Events from the
+   recovery script running on top of a partial original upload? (c) does
+   Processed_Log have entries for the 743 post IDs from the 14:17 CSV,
+   or only All_Events? Run:
+   
+   python3 -c "
+   import pandas as pd
+   df = pd.read_csv('outputs/Events_20260507_141723.csv')
+   ids = set(df['POST ID'].dropna().astype(str).str.strip())
+   print(f'unique post IDs in CSV: {len(ids)}')
+   print('sample:', list(ids)[:5])
+   "
+   
+   Then check whether those sample IDs appear in Processed_Log.
+
+6. For the three runs at 18:24:58, 18:25:41, 18:26:44 — what does Replit's
+   process exit log show? Killed by system (memory/timeout/restart),
+   terminated by user, or self-exited? Don't infer "probably memory" —
+   actually look it up.
+
+7. Things to label as inference, not fact, going forward:
+   - "1,621 instantly skipped" — read from incomplete log, never finalized
+   - "395 of ~2,820" — only most recent log shows that; earlier two unknown
+   - "Reprocess Weekends ran on its own schedule" — it's parallel with main
+   - "Sheets upload from 14:17 likely too slow to complete in 20s" — guess
+   - "Recovery upload resolved data gap" — partial; see #5
+
+8. Pseudo-IDs in Processed_Log: 3,187 rows total. ~2,965 from Feb 5
+   migration with empty Account/Result; ~222 from Auto-Bot runs tagged
+   no_events_found. Apify upstream is still queryable per the user, so
+   the 222 Auto-Bot ones are recoverable. Migration ones may be orphans.
+   Don't recommend deletion or skip-on-no-events; user explicitly wants
+   recovery and visibility, not pruning.

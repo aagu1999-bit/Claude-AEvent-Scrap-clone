@@ -1,0 +1,62 @@
+The 2-orphan-IDs question is an interesting engineering puzzle, but it's NOT what's actually hurting your operation. You started this thread with five real concerns:
+
+DX-D5OtjxFj missing — caused by run not finishing, not by the orphan-ID mystery
+Pseudo-ID pollution — 222 Auto-Bot ones per ~5 runs, cumulative
+Event count low — caused by Instagram CDN image-download failures, visible in logs
+Run "got messed up" — caused by 18:26 runs being killed, not by the orphan IDs
+The 14:17 run only filled All_Events from a recovery script, not the natural pipeline path
+The agent has spent three rounds and significant compute on point 5's edge case (2 events out of 2,158). That's 0.09% of the data. Meanwhile points 1-4 — which represent the real reliability gap — haven't been touched.
+
+What should actually be happening
+Tier 1 — what's hurting you weekly:
+
+Instagram CDN image-download failures. The 18:26 log was full of HTTPSConnectionPool... Max retries exceeded. Every failed download means OCR doesn't run, which means flyer-text events go unextracted. This is a systemic extraction-quality bleed, far bigger than 2 missing rows. Fix paths: retry-with-backoff in extract_ocr_text(), IP rotation, accepting caption-only fallback gracefully.
+
+The 18:26 runs got killed three times in 2 minutes. That's the actual reliability story. The agent said "unanswerable from inside the container," but Replit has process exit logs in their UI (Workflows tab → run history → see why each task ended). Did anyone check?
+
+The killed run's 4,441-post dataset was never fully processed. That's likely thousands of events still unextracted. Apify retains datasets ~14 days — you can re-feed that exact dataset back through the pipeline without re-paying the scrape cost. That's the real recovery action.
+
+Tier 2 — accumulating debt:
+
+Pseudo-ID generation each run continues to pollute. Even if root cause is unclear, the forward fix is straightforward: hash-based stable IDs or skip-and-log. Same effort as understanding the 2-orphan mystery, but addresses an actually growing problem.
+
+Processed_Log writes are end-of-run batch. If a run gets killed mid-extraction (which is happening!), zero dedup state is saved. Incremental PL writes would mean killed runs don't re-process from scratch next week.
+
+Tier 3 — the orphan rabbit hole:
+
+Worth a one-paragraph "unresolved, low-impact" entry in the postmortem ADR. Not a deep investigation. The two specific events are already in All_Events. They'll re-process next Thursday, possibly creating duplicates — that's the only consequence, and it's small.
+What I'd say to the agent
+
+The 2-orphan-IDs investigation is well-executed but it's the wrong
+priority. Park it as "unresolved, low-impact" in the ADR with a brief
+mention of the verified facts (no pickle.load, single atomic lock block,
+no mechanism identified).
+
+Then pivot to the actually-hurting problems:
+
+1. Instagram CDN image-download failures in the 18:26 log. Count how
+   many "Max retries exceeded" lines there are. That's the real
+   extraction quality issue. Propose a retry/backoff or fallback
+   strategy for extract_ocr_text().
+
+2. Why did the three 18:26 processes die? Check Replit's Workflow run
+   history UI (not just stdout in the container) — exit codes, restart
+   reasons, memory caps. This is verifiable, not "unknowable."
+
+3. Recovery: the 4,441-post Apify dataset for the 18:26 run was never
+   fully extracted. Apify retains datasets — can we re-feed dataset_id
+   into the pipeline to recover unextracted events from that scrape?
+
+4. Pseudo-ID forward fix: even without identifying the original cause
+   in pre-PR#2 code, we can change the current main.py to either skip
+   no-id posts entirely OR use a stable content-hash ID. Either stops
+   the cumulative pollution.
+
+5. Incremental Processed_Log writes: end-of-run batch means killed
+   runs lose all their dedup state. Switching to per-batch flushes
+   means partial work survives.
+
+The ADR should cover the 14:17 forensics (where you've been working)
+plus a short "open issues" section listing 1-5 with priorities.
+Otherwise we have a beautiful postmortem of an irrelevant edge case
+while the actual reliability gap continues to leak events every week.

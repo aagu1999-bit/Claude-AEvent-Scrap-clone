@@ -1,0 +1,78 @@
+1. They didn't quantify what's quantifiable RIGHT NOW.
+
+The agent says: "If 10% of carousel slides are failing, that's a known extraction gap. If it's 40%, that's a crisis." They have the log file. They could have run:
+
+
+grep -c "Max retries exceeded" outputs/run_20260507_182644.log
+grep -c "Image downloaded" outputs/run_20260507_182644.log
+Five-second action. Converts hand-waving into a real number. The fact they didn't is the same misdirection pattern: still in analysis mode instead of "let me check the actual data." Push back: "Run the grep. Don't theorize about 10% vs 40%."
+
+2. They didn't sequence the five issues by effort vs impact.
+
+Listing "five things in priority order" reads as a checklist but tells you nothing about what to do this week vs next month. A useful version would look more like:
+
+
+This Thursday's run protection (do TODAY):
+  - Run the grep to get CDN failure count
+  - Check Replit Workflow tab for what killed the 18:26 runs
+  - Add executor.shutdown() with timeout safeguard if memory is the cause
+
+Within 1 week:
+  - Apify dataset recovery for the 18:26 dataset (recovers thousands of events)
+  - Retry-with-backoff in extract_ocr_text() (fixes the systemic bleed)
+
+Within 1 month:
+  - Incremental Processed_Log writes (resilience)
+  - Pseudo-ID forward fix (stop accumulation)
+
+Open / not in scope yet:
+  - 2-orphan root cause (low-impact rabbit hole)
+That's actionable. The agent's flat list isn't.
+
+3. They never connected "CDN failures" to specific events being lost.
+
+A CDN failure isn't an abstract metric — it's a specific category of post: flyer-only posts where the venue/date/time are visible only in the image, not the caption. Those are the loss. Worth saying explicitly because it tells you what kind of events are being missed (likely many of the high-quality, branded promoter posts — which is exactly the user's pain).
+
+4. The 14:17 recovery upload status is still open.
+
+The "verified facts" section confirmed: PL has 695/697, All_Events has 46 from original + ~2,158 from recovery. The agent never definitively answered: are there duplicate events in All_Events because of the recovery upload running on top of the 46 already-present rows? They said "no, recovery did dedup" but didn't show the SQL/composite-key check. That's still open.
+
+5. No process guardrail to prevent the next misdirection.
+
+The agent says "I kept going because the puzzle was tractable, not because it mattered." That's a self-aware admission, but it's not a process change. A real guardrail would be:
+
+"Before going more than 30 minutes deep on any issue, ask: is this in the top 3 of the user's actual concerns? If not, stop and surface it."
+
+Without that explicit guardrail, the same drift happens next time. The user could ask for it.
+
+6. No measurement plan.
+
+After fixes ship, how does the user know they worked? Concrete metrics:
+
+CDN failure rate per run, week-over-week
+Pseudo-IDs created per run trending toward zero
+Killed-run frequency (count of run_*.log files per day vs. completion rate)
+Posts in PL after a run / posts in Apify response (should be ~100%)
+Without this, fixes go in and nobody knows if they helped.
+
+7. No risk assessment for the proposed fixes.
+
+Each "fix" has tradeoffs:
+
+Retry-with-backoff for CDN: increases run time, could hit Apify timeouts on long runs
+Incremental PL writes: more API calls to Sheets (rate-limit risk), tiny per-write overhead
+Content-hash pseudo-IDs: changes dedup semantics, may cause one-time confusion when handling old post_NNN entries that still exist
+Apify dataset re-feed: could create duplicate events in All_Events if the original 18:26 partial output isn't excluded
+The agent didn't surface any of these. They should.
+
+8. The framing of the ADR is still postmortem-centric.
+
+The agent proposes "ADR with forensics section + open issues section." That's still a postmortem with appendix. The actually-needed doc is closer to "Pipeline Reliability Audit & Action Plan" — issues first, with the May 7 forensics as evidence/appendix. The framing matters because what gets named "the doc" is what gets revisited later. A reliability-plan doc gets revisited; a postmortem doesn't.
+
+9. They didn't address the existing 3,187 pseudo-IDs in PL.
+
+The forward fix prevents new ones. What about the 3,187 already there? Backfill from upstream Apify (recoverable for the recent ~222 Auto-Bot ones)? Leave the 2,965 migration ones alone? Delete? The agent's plan would let those continue to silently block future posts via position collisions. Should be addressed.
+
+10. No explicit ownership / who-does-what.
+
+The user is doing this with you (the agent) plus me. Who runs the grep on Replit? Who writes the retry logic? Who tests it? Who reviews the ADR? Without explicit ownership, things drift.

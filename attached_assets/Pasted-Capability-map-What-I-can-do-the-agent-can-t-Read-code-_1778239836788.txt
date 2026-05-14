@@ -1,0 +1,95 @@
+Capability map
+What I can do, the agent can't:
+
+Read code rigorously across multiple commits and call out structural issues
+Critique the agent's reasoning without buying their narrative
+Maintain CHANGELOG / ADR / verified-vs-inferred discipline across long workstreams
+Cross-system thinking (GitHub + Replit + Sheet + Apify all at once)
+Resist tractable rabbit holes
+Read your Google Sheet read-only via Drive MCP (limited)
+Open PRs / merge / branch hygiene from your local clone
+What the agent can do, I can't:
+
+Run shell commands on Replit (grep, ls, ps, run scripts)
+See Replit's Workflow tab process exit history
+Call Apify API with your credentials
+Write to your Google Sheet (composite-key dedup check, row removals, etc.)
+Tail running processes / see live state
+Test code changes by actually running them in your environment
+Trigger workflow runs / restart things
+Pull historical Apify datasets via API
+Read live config.json, secrets, environment variables
+What both of us are bad at, and need you for:
+
+Knowing what's actually painful in your business
+Authorizing destructive operations
+Setting priority when the data is ambiguous
+Ideal collaboration model
+Three loops, run in parallel:
+
+1. Investigation loop (the data-gathering one)
+You ask a question → I propose the exact commands/queries with rationale → agent executes on Replit → agent returns raw output (not interpretation) → I analyze and synthesize with verified/inferred labels → we report.
+
+Example for the open CDN-failure question right now:
+
+
+You: "Quantify the CDN failure rate."
+Me: "Run these on Replit:
+  grep -c 'Max retries exceeded' outputs/run_20260507_182644.log
+  grep -c 'Image downloaded' outputs/run_20260507_182644.log
+  grep -c 'OCR SUCCESS' outputs/run_20260507_182644.log
+  Save raw outputs to outputs/diag_cdn_<ts>.txt and paste."
+Agent: runs, pastes raw numbers + saves the file
+Me: computes the rate, contextualizes against full-run estimates
+That pattern keeps the agent honest (raw data, not interpretation) and keeps my analysis rooted in real numbers.
+
+2. Execution loop (the building one)
+You decide what to build → I write the code locally, push to a feature branch, open a PR → agent pulls on Replit, runs tests, reports → I review their test output → iterate or merge.
+
+The pattern we used for PR #1, #2, and #3 — that worked. Keep using it. The agent didn't write any of those PRs and didn't need to. Their job was to pull, run, observe.
+
+3. Verification loop (the keeping-things-honest one)
+After the agent finishes any investigation → they give me their compiled answer → I run it through verified-vs-inferred lens → push back where appropriate → only then does it get committed to an ADR.
+
+That's what we just did with the May 7 postmortem rounds. The agent improved noticeably each round when pushed. Keep doing that.
+
+Specific things to hand off to the agent right now
+Based on the open issues we just identified:
+
+Task	Why agent	What I want back
+grep -c "Max retries exceeded" on the 18:26 log	Lives on Replit	Raw count + total post count for ratio
+Check Replit Workflow tab for what killed the 18:26 runs	Only they have access to that UI	Exit codes + restart events for May 7 18:24-26
+Pull Apify dataset metadata for the 18:26 run	They have the Apify API key	Dataset ID + post count + retention status
+All_Events composite-key duplicate check (POST ID, EVENT NAME, DATE) for May 7 timestamps	They write to the Sheet	Count of duplicates if any, sample of 5
+List outputs/ files chronologically with mtime + size	Live filesystem on Replit	Just the listing
+Inspect pipeline_checkpoint.pkl contents (processed_posts size, results count)	Lives on Replit	Three numbers + sample of 5 from each
+Check what config.json actually contains right now (especially run_now, apify_enabled, schedule_time)	Live config on Replit	The contents (redact secrets)
+That's a half-dozen ~5-minute tasks that would close most of our open questions. None of them require code changes — pure observation.
+
+Specific things to keep in my lane
+Reading your Sheet read-only via Drive MCP for ad-hoc queries (I already have viewer access). Faster than you exporting CSVs.
+Code reviews of any PRs the agent or I propose — verifying logic, regression risk, doc updates.
+ADR / CHANGELOG curation — when the agent writes one in Plan/Build mode, I review for verified/inferred discipline before merge.
+Architecture decisions — incremental PL writes, retry-with-backoff design, content-hash IDs. The "what's the right shape" calls.
+Strategic prioritization — pushing back when the agent goes deep on something that doesn't matter. Today's example: the orphan-IDs rabbit hole.
+Cross-system narrative — keeping a coherent story when GitHub + Replit + Sheet + Apify all have partial truths.
+Handoff protocol I'd want
+When the agent reports back to me (via you), I'd want:
+
+Raw data first, interpretation second. "I ran X, here's the output verbatim. My read of it is Y."
+File:line citations for any code claims.
+A persisted copy of large outputs to outputs/diag_*.txt so I can re-verify, not just trust the paste.
+Verified vs Inferred labels on every claim.
+Open questions called out explicitly rather than hidden behind confident framing.
+When I send work to the agent (via you), I'd give:
+
+Exact commands to run, not English instructions.
+What to save where so the output is recoverable.
+Expected output shape so they know if something's weird.
+Stop conditions — "if you see X, stop and report; don't keep going."
+Process guardrails
+Two specific ones I'd put in place:
+
+The "is this top-3" check. Before any deep investigation (>30 min on a single thread), agent surfaces: "I'm about to spend significant time on X — is this in your top 3 priorities?" That's the explicit fix for today's rabbit hole.
+
+The verified/inferred discipline becomes default formatting. Every compiled answer the agent gives ends with a "Verified:" / "Inferred:" / "Open:" block. Not optional. We saw it disappear and reappear over the past hour — make it permanent.

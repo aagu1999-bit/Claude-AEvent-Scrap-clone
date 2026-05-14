@@ -1,0 +1,22 @@
+The 2 missing IDs explanation is still inference, not verified.
+
+The agent's hypothesis: "_record_post_outcome() was never called for them" — i.e., they were processed (events made it into self.results) but no post_log entry was created, due to "an edge-case bug."
+
+Reading the relevant code, in main.py:821-829 the _record_post_outcome() call and the self.results.extend(processed_events) are inside the same with self.lock: block. They should either both happen or neither. For events to reach self.results without a corresponding entry in post_results, one of these would need to be true:
+
+Race condition under concurrency (max_workers=10). Possible but unusual for code inside a single lock block.
+The events came from a prior checkpoint reload (line 838-840 saves self.results every 500 events). If the 14:17 run resumed from a checkpoint that already had those events in self.results but the posts hadn't been freshly re-processed, you could get this mismatch.
+An older code path entirely — the 14:17 run was on pre-PR-#2 code, so we'd want to verify the lock-block structure was identical there too.
+The agent labeled it "an edge-case bug" without identifying the bug. That's reasonable for a postmortem (we don't always find the exact cause), but worth flagging as unresolved root cause rather than declaring it understood. If you want a definitive answer, ask the agent to:
+
+Confirm what version of process_post was on the clone at 14:17 (commit hash matters)
+Read that version's code path for the events-found case
+Identify any path where self.results.extend() could happen without self.post_results[pid] = ... happening immediately after
+That's a 5-minute code-reading task. Worth doing if those 2 missing IDs feel like a recurring-bug risk.
+
+The 46 "no-event-producing" posts: where are they?
+
+CSV has 697 unique post IDs. Stats says 743 processed. The gap of 46 (= 34 skipped_no_data + 12 no_events_found per agent's earlier accounting) — are those in Processed_Log? They should be, all paths in process_post write to post_results even when there are no events. So PL should have at minimum 743 - 2 = 741 entries from the 14:17 run alone, not 695.
+
+If PL only has ~695 + 34 pseudo-IDs (~729) from the 14:17 run, we're missing ~12 more entries unaccounted for. Worth a one-line check from the agent: count of all PL rows with Date Processed = 2026-05-07 (across both real and pseudo IDs, before the May 8 reprocess wiped some) — does that match 743? If not, more is missing than just the 2 orphans.
+

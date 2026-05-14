@@ -1,0 +1,53 @@
+Three fetches I'd like you to run, raw output back to me. Paste verbatim.
+
+1. Static dataset contents — hit instagram_data_url from config.json
+   directly via requests.get(url). Report:
+   - Total post count
+   - Date range: oldest post (timestamp), newest post (timestamp)
+   - Distinct ownerUsername count
+   - Top 5 accounts by post count
+   
+   This tells us the blast radius — how many posts will keep
+   re-processing weekly under current Mode-2 behavior before PR #1
+   lands.
+
+2. All_Events processed_timestamp distribution by week:
+   
+   import gspread, collections
+   from oauth2client.service_account import ServiceAccountCredentials
+   scope = ['https://spreadsheets.google.com/feeds',
+            'https://www.googleapis.com/auth/drive']
+   creds = ServiceAccountCredentials.from_json_keyfile_name(
+       "apt-mark-468506-u9-ec44cabc7335 copy.json", scope)
+   sh = gspread.authorize(creds).open("Instagram_Events_Master").worksheet("All_Events")
+   rows = sh.get_all_values()
+   header = rows[0]
+   ts_idx = header.index("PROCESSED TIMESTAMP")
+   from datetime import datetime
+   weeks = collections.Counter()
+   for r in rows[1:]:
+       if len(r) <= ts_idx: continue
+       ts = r[ts_idx].strip()[:10]
+       if ts:
+           try:
+               d = datetime.fromisoformat(ts).date()
+               # Get Monday of the week
+               monday = d - timedelta(days=d.weekday())
+               weeks[monday] += 1
+           except: pass
+   for w, n in sorted(weeks.items()):
+       print(f"  week of {w}: {n} rows")
+   
+   This shows the weekly accumulation pattern. If duplicates are
+   adding up via Path B, we'll see steady increases.
+
+3. May 8 actual elapsed time:
+   
+   ls -la outputs/run_20260508_011504.log
+   head -1 outputs/run_20260508_011504.log
+   tail -3 outputs/run_20260508_011504.log
+   
+   First-line timestamp vs last-line timestamp = real elapsed time.
+   Also confirms the run completed cleanly (or shows where it ended).
+
+Don't interpret yet — just give me the raw output for all three.

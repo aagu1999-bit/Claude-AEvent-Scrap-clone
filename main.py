@@ -1193,6 +1193,16 @@ class InstagramEventPipeline:
             merged = (ev.get('_row_flags') or []) + post_flags
             ev['quality_flags'] = ",".join(sorted(set(merged)))
             ev.pop('_row_flags', None)
+            # Event-level log: name, date, venue, confidence, flags — visible
+            # in run_*.log for every event from every tier.
+            ev_name  = ev.get('event_name', '?')
+            ev_date  = ev.get('date', '?')
+            ev_venue = ev.get('venue', '')
+            ev_conf  = ev.get('confidence', '')
+            ev_flags = ev['quality_flags'] if ev['quality_flags'] else 'none'
+            venue_str = f"\n      • Venue: {ev_venue}" if ev_venue else ''
+            conf_str  = f"\n      • Confidence: {ev_conf}" if ev_conf != '' else ''
+            print(f"    ✦ [{tier_name}] {ev_name!r} | {ev_date}{venue_str}{conf_str}\n      • Flags: {ev_flags}")
 
         return enriched, is_calendar, has_ocr, list(all_flags)
 
