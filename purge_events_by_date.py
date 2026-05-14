@@ -270,6 +270,10 @@ def main():
                    help="Date window YYYY-MM-DD:YYYY-MM-DD (inclusive). Repeatable.")
     p.add_argument("--next-weekends", type=int, default=None,
                    help="Use the next N upcoming Fri-Sun weekends from today.")
+    p.add_argument("--max-posts", type=int, default=None,
+                   help="Cap the number of unique post IDs targeted "
+                        "(takes the first N by sheet row order). Useful for "
+                        "small-batch test runs.")
     p.add_argument("--apply", action="store_true",
                    help="Commit deletions (default: dry-run).")
     args = p.parse_args()
@@ -323,6 +327,24 @@ def main():
     if not rows_in_window:
         print("\n✓ No in-window rows found. Nothing to delete.")
         return
+
+    # ── Optional cap: limit to first N unique post IDs by sheet row order ──
+    if args.max_posts is not None and args.max_posts > 0:
+        kept_pids = []
+        seen = set()
+        for r in rows_in_window:
+            pid = r["post_id"]
+            if not pid or pid in seen:
+                continue
+            seen.add(pid)
+            kept_pids.append(pid)
+            if len(kept_pids) >= args.max_posts:
+                break
+        kept_pids_set = set(kept_pids)
+        original_count = len(rows_in_window)
+        rows_in_window = [r for r in rows_in_window if r["post_id"] in kept_pids_set]
+        print(f"\n  --max-posts {args.max_posts}: kept first {len(kept_pids)} unique post ID(s), "
+              f"trimmed {original_count} → {len(rows_in_window)} rows.")
 
     # Collect post IDs touched by in-window rows
     touched_post_ids = sorted({r["post_id"] for r in rows_in_window if r["post_id"]})
