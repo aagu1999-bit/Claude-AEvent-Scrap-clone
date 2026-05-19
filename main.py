@@ -70,7 +70,11 @@ from extraction_core import (
     ESCALATION_FLAGS          as ec_ESCALATION_FLAGS,
 )
 
-from worker_log import wprint, log_post_context, get_logger
+from worker_log import (
+    wprint, log_post_context, get_logger,
+    get_worker_id, set_buffered_mode, is_buffered_mode,
+    post_buffer, print_unbuffered,
+)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%I:%M:%S %p')
 logger = get_logger(__name__)
@@ -1288,8 +1292,32 @@ class InstagramEventPipeline:
         return final_events, current_tier, final_has_ocr, final_is_calendar
 
     def process_post(self, post, post_num, total):
+        """Outer wrapper: prints unprefixed entry/exit boundary lines with
+        worker ID and timing, and (when buffered mode is on) buffers all
+        per-post output so each post appears as one contiguous block."""
         post_id = (post.get('id', '') or post.get('shortCode', '') or
                    post.get('shortcode', '') or f'post_{post_num}')
+        worker_id = get_worker_id()
+        t0 = time.time()
+
+        # Entry boundary — unprefixed, atomic, always live (not buffered).
+        print_unbuffered(f"\n[{worker_id}] [{post_num}/{total}] Processing post: {post_id}")
+
+        result = None
+        try:
+            with post_buffer():
+                result = self._process_post_impl(post, post_num, total, post_id)
+            return result
+        finally:
+            elapsed = time.time() - t0
+            n_events = len(result) if isinstance(result, list) else 0
+            plural = '' if n_events == 1 else 's'
+            print_unbuffered(
+                f"[{worker_id}] [{post_num}/{total}] "
+                f"Done in {elapsed:.1f}s ({n_events} event{plural})"
+            )
+
+    def _process_post_impl(self, post, post_num, total, post_id):
         with log_post_context(post_id):
             pid = post.get('id') or post.get('shortCode')
 
@@ -1339,7 +1367,8 @@ class InstagramEventPipeline:
                 post_date = datetime.now(EAST_TZ)
             post_date_str = post_date.strftime('%Y-%m-%d')
 
-            wprint(f"\n[{post_num}/{total}] Processing post: {pid}")
+            # NOTE: the "Processing post" header line is now emitted by the
+            # outer process_post() wrapper as an unprefixed boundary marker.
             wprint(f"  ↳ Account: @{user} ({owner_full_name})")
 
             if not caption and not display_url:
@@ -2280,6 +2309,14 @@ def do_force_run(bot):
 
 
 if __name__ == "__main__":
+    # --buffered: each worker buffers its post's lines and flushes the whole
+    # block atomically when the post finishes. Trades real-time visibility
+    # for clean per-post blocks in the run log — good for retrospective
+    # analysis, less good for live debugging. Off by default.
+    if "--buffered" in sys.argv:
+        set_buffered_mode(True)
+        print("📦 Buffered-output mode: each post flushes as one atomic block on completion")
+
     bot = InstagramEventPipeline()
     config_forced = CONF.get("run_now", False)
     if "--now" in sys.argv or config_forced:
