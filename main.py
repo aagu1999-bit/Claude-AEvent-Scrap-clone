@@ -1300,8 +1300,16 @@ class InstagramEventPipeline:
         worker_id = get_worker_id()
         t0 = time.time()
 
-        # Entry boundary — unprefixed, atomic, always live (not buffered).
-        print_unbuffered(f"\n[{worker_id}] [{post_num}/{total}] Processing post: {post_id}")
+        # Include the Instagram URL on the entry line so the post is one
+        # click away when scanning the log retrospectively. Omitted when
+        # there's no shortcode (Apify shell records, etc.).
+        shortcode = post.get('shortCode', '') or post.get('shortcode', '')
+        url_suffix = f" — https://www.instagram.com/p/{shortcode}/" if shortcode else ""
+
+        # Entry boundary — atomic, always live (not buffered), tagged with [Wn].
+        print_unbuffered(
+            f"\n[{worker_id}] [{post_num}/{total}] Processing post: {post_id}{url_suffix}"
+        )
 
         result = None
         try:

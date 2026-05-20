@@ -82,18 +82,33 @@ def log_post_context(post_id):
 
 def wprint(*args, **kwargs):
     """
-    Drop-in replacement for builtins.print() that prepends [post_id] when a
-    worker context is active. Outside a worker context, behaves like print().
+    Drop-in replacement for builtins.print() that prepends [Wn] [post_id]
+    when called from inside a worker context.
 
-    Uses _print_lock to make each line write atomic. When the current thread
-    is inside a post_buffer() context AND buffered mode is on, appends to
-    the per-thread buffer instead of writing immediately — the buffer is
-    flushed atomically when post_buffer() exits.
+    Tag layout per line:
+      [W<n>] [<post_id>] <message>    — worker thread, inside log_post_context
+      [W<n>] <message>                — worker thread, no post_id set
+      <message>                       — main thread (no tag)
+
+    The worker tag is added even in non-buffered mode so when lines inevitably
+    interleave, every line carries enough info to reconstruct who emitted it
+    and which post it belongs to.
+
+    Uses _print_lock for atomic line writes. When buffered mode is on AND
+    we're inside post_buffer(), appends to the per-thread buffer instead
+    of writing immediately; buffer flushes atomically on context exit.
     """
     pid = _current_post_id()
+    wid = get_worker_id()
     sep = kwargs.get('sep', ' ')
     msg = sep.join(str(a) for a in args)
-    line = f"[{pid}] {msg}" if pid else msg
+
+    prefix_parts = []
+    if wid and wid != 'main':
+        prefix_parts.append(f"[{wid}]")
+    if pid:
+        prefix_parts.append(f"[{pid}]")
+    line = f"{' '.join(prefix_parts)} {msg}" if prefix_parts else msg
 
     buf = getattr(_ctx, 'buffer', None)
     if _buffered_mode and buf is not None:
@@ -121,9 +136,12 @@ def get_worker_id():
     """Return a short worker ID for the current thread, stable per actual
     thread without caching gotchas. Examples:
       MainThread                 -> 'main'
-      ThreadPoolExecutor-0_2     -> 'T-2'
-      ThreadPoolExecutor-1_0     -> 'T-0'
+      ThreadPoolExecutor-0_2     -> 'W2'
+      ThreadPoolExecutor-1_0     -> 'W0'
       anything else              -> the thread name as-is
+
+    Used by wprint() to prefix every line with [W<n>] and by main.py
+    boundary markers to identify which worker is handling each post.
     """
     name = threading.current_thread().name
     if name == 'MainThread':
@@ -131,7 +149,7 @@ def get_worker_id():
     if '_' in name:
         suffix = name.rsplit('_', 1)[1]
         if suffix.isdigit():
-            return f'T-{suffix}'
+            return f'W{suffix}'
     return name
 
 
@@ -201,12 +219,18 @@ def print_unbuffered(*args, **kwargs):
 
 
 class _PostIdAdapter(logging.LoggerAdapter):
-    """LoggerAdapter that prepends [post_id] to every record."""
+    """LoggerAdapter that prepends [Wn] [post_id] to every record."""
 
     def process(self, msg, kwargs):
         pid = _current_post_id()
+        wid = get_worker_id()
+        prefix_parts = []
+        if wid and wid != 'main':
+            prefix_parts.append(f"[{wid}]")
         if pid:
-            return f"[{pid}] {msg}", kwargs
+            prefix_parts.append(f"[{pid}]")
+        if prefix_parts:
+            return f"{' '.join(prefix_parts)} {msg}", kwargs
         return msg, kwargs
 
 
