@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-repair_flags_from_log.py — re-derive QUALITY_FLAGS column + cell highlighting
+repair_flags_from_log.py -- re-derive QUALITY_FLAGS column + cell highlighting
 in All_Events from one or more main.py run logs.
 
 USE CASE
-────────
+--------
 The QUALITY_FLAGS column should reflect what the extraction sanity checks
 said at extract time. Over time it drifts because:
   - Cell highlighting is applied at write time and never re-applied
@@ -17,73 +17,79 @@ flags, matches to All_Events rows by (POST ID, EVENT NAME, DATE), and:
   - Updates QUALITY_FLAGS cell text where it differs
   - Re-applies cell highlighting per current FLAG_TO_COLUMNS
 
-LOG FORMAT SUPPORT
-──────────────────
-Auto-detects two log formats per file:
+LOG FORMATS (mixed support)
+---------------------------
+Three log formats are recognized; the same logs directory may contain a mix.
 
-  NEW (post-cutover, with worker_log.py [W<n>] prefixes):
-    Every event has a ✦ line with authoritative per-event Flags. The
-    pipeline wrote these exact flags to the sheet at extract time, so
-    no derivation is needed — the rules below are bypassed entirely.
-    Tier-escalation gotcha: ✦ lines fire per tier. We dedup by event
-    name and keep the last occurrence (matches the final tier's output).
+(0) [post_id] PREFIX  (newest; safest under parallel workers)
+    Every line in main.py output is prefixed by worker_log.wprint() with
+    "[<post_id>] " when emitted inside a worker context. The parser uses
+    the prefix to route each line independently, so interleaved output
+    from multiple workers can no longer cause misattribution.
 
-  OLD (pre-cutover, no per-line tags):
-    Only post-level informational flags are emitted. Per-event attribution
-    is inferred via the rules below. ~85-95% accurate due to thread
-    interleaving on carousel-heavy multi-event posts. For high-confidence
-    repair, re-extract with events_from_ids.py to generate a NEW-format
-    log, then re-run this tool against that log.
+        [3894171512534099386]   ✦ [flash_caption] 'Bad Bunny Night' | 2026-05-22
+        [3894171512534099386]       • Flags: none
 
-DERIVATION RULES (old-format only)
-──────────────────────────────────
-For each event extracted in an old-format log, determine its flag set:
+    Lines without a prefix fall back to the legacy "most recent
+    Processing post:" rule below.
 
-  (A) Always-apply post-level flags (apply to ALL events from that post):
-        CALENDAR_LOW_EVENTS, CAROUSEL_LOW_EVENTS, OCR_RICH_LOW_EVENTS,
-        ACCOUNT_PATTERN_DROP, NO_GROUNDING
+(1) EVENT-LEVEL  (new -- unprefixed)
+    Per-event marker + bullet fields:
 
-  (B) Per-event derivation from log fields:
-        MISSING_DATE     ← event Date == None
-        LOW_CONFIDENCE   ← event Confidence < 0.5
+        ✦ [flash_caption] 'Bad Bunny Night' | 2026-05-22
+            • Venue: Birch Hoboken
+            • Confidence: 1.0
+            • Flags: none
 
-  (C) Per-event conditional via sheet field check (only if log fired):
-        CITY_NOT_IN_NJ_LOOKUP   ← log fired AND sheet CITY non-empty
-        REGION_AUTOFIXED        ← log fired AND sheet SECTION OF NJ non-empty
-        VENUE_CITY_MISMATCH     ← log fired AND sheet VENUE NAME + CITY both set
-        PAST_DATE               ← log fired AND event has earliest date in post
-        FAR_FUTURE_DATE         ← log fired AND event has latest date in post
+    "Flags:" is authoritative for that event. "Flags: none" means
+    "evaluated cleanly at event level" -- the repair tool trusts it
+    directly and does NOT fall back to conservative post-level spreading
+    for this post.
 
-  (D) Skipped by default:
-        DATE_DAY_MISMATCH — needs original caption text to verify; cannot
-        be cleanly derived from log + sheet alone.
+(2) POST-LEVEL  (legacy)
+    Older logs use:
+
+        ✓ EVENT FOUND: Watermelon & Feta Salad
+          • Date: 2026-05-01
+
+    or for multi-event posts:
+
+        🎉 MULTIPLE EVENTS FOUND: 5 events extracted!
+          1. The Dirty German 50K
+             Date: 2026-05-09
+
+    plus a separate post-level flags line:
+
+        ↳ informational flags: ['CITY_NOT_IN_NJ_LOOKUP']
+
+    For these the tool falls back to the conservative derivation below.
+
+CONSERVATIVE DERIVATION (post-level fallback only)
+--------------------------------------------------
+(A) Always-apply post-level flags (apply to ALL events from that post):
+    CALENDAR_LOW_EVENTS, CAROUSEL_LOW_EVENTS, OCR_RICH_LOW_EVENTS,
+    ACCOUNT_PATTERN_DROP, NO_GROUNDING
+
+(B) Per-event derivation from log fields:
+    MISSING_DATE     <- event Date == None
+    LOW_CONFIDENCE   <- event Confidence < 0.5
+
+(C) Per-event conditional via sheet field check (only if log fired):
+    CITY_NOT_IN_NJ_LOOKUP  <- log fired AND sheet CITY non-empty
+    REGION_AUTOFIXED       <- log fired AND sheet SECTION OF NJ non-empty
+    VENUE_CITY_MISMATCH    <- log fired AND sheet VENUE NAME + CITY both set
+    PAST_DATE              <- log fired AND event has earliest date in post
+    FAR_FUTURE_DATE        <- log fired AND event has latest date in post
+
+(D) Skipped by default:
+    DATE_DAY_MISMATCH -- needs original caption text to verify.
 
 USAGE
-─────
-  # Dry-run against one log
+-----
   python repair_flags_from_log.py --log outputs/run_20260514_160556.log
-
-  # All logs in outputs/, dry-run
   python repair_flags_from_log.py --logs-dir outputs/
-
-  # Apply
-  python repair_flags_from_log.py --log outputs/run_20260514_160556.log --apply
-
-  # Limit scope to recent rows
-  python repair_flags_from_log.py --log outputs/run_*.log --after-row 18000
-
-OUTPUT
-──────
-- Console: per-status counts (matched/conflict/log-only/sheet-only)
-- CSV audit: outputs/repair_flags_<ts>.csv with every row + before/after
-- (with --apply) Sheet writes: QUALITY_FLAGS text + cell formatting
-
-SAFETY
-──────
-- Dry-run by default; --apply required to write
-- Only TOUCHES rows present in the log being parsed (won't blank out rows
-  from other runs unless --strip-extra is set)
-- Preserves manual additions in QUALITY_FLAGS unless --strip-extra
+  python repair_flags_from_log.py --log <path> --apply
+  python repair_flags_from_log.py --log <path> --after-row 18000
 """
 
 import argparse
@@ -112,7 +118,6 @@ BATCH_DELAY_SEC = 1.0
 
 DATE_FMTS = ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%B %d, %Y")
 
-# Flag categories
 ALWAYS_APPLY_POST_FLAGS = {
     'CALENDAR_LOW_EVENTS', 'CAROUSEL_LOW_EVENTS', 'OCR_RICH_LOW_EVENTS',
     'ACCOUNT_PATTERN_DROP', 'NO_GROUNDING',
@@ -124,314 +129,170 @@ SHEET_CONDITIONAL_FLAGS = {
 SKIP_BY_DEFAULT = {'DATE_DAY_MISMATCH'}
 
 
-# ─────────────────────────────────────────────────────────────────
-# Log parser
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
+# Log parser -- handles [post_id] prefix + new event-level + legacy post-level
+# -----------------------------------------------------------------
 
-# Regexes for the patterns we care about. Tolerates emoji prefixes (or absence)
-# since terminal mojibake can vary.
-RE_PROCESSING = re.compile(r'\[\d+/\d+\]\s+Processing post:\s+(\S+)')
-RE_INFO_FLAGS = re.compile(r"informational flags:\s*\[([^\]]*)\]")
-RE_EVENT_FOUND = re.compile(r'EVENT FOUND:\s+(.+?)\s*$')
+# Optional [post_id] prefix at start of line. Requires 6+ chars of
+# [A-Za-z0-9_-] inside the brackets so it doesn't collide with [N/M] (slash),
+# [Tier X: ...] (space/colon), or [flash_caption] (mid-line, not at start).
+RE_PREFIX = re.compile(r'^\s*\[([A-Za-z0-9_-]{6,})\]\s+')
+
+RE_PROCESSING  = re.compile(r'\[\d+/\d+\]\s+Processing post:\s+(\S+)')
+RE_INFO_FLAGS  = re.compile(r"informational flags:\s*\[([^\]]*)\]")
+
+RE_EVENT_FOUND  = re.compile(r'EVENT FOUND:\s+(.+?)\s*$')
 RE_MULTI_HEADER = re.compile(r'MULTIPLE EVENTS FOUND:\s+(\d+)\s+events extracted')
 RE_MULTI_ITEM   = re.compile(r'^\s+(\d+)\.\s+(.+?)\s*$')
-RE_DATE_LINE    = re.compile(r'Date:\s+(\S+)')
-RE_VENUE_LINE   = re.compile(r'Venue:\s+(.+?)\s*$')
-RE_CONF_LINE    = re.compile(r'Confidence:\s+([\d.]+)')
 
-# ─── New format markers (feat/worker-log-prefixing branch + later) ───
-# Every line emitted inside a worker context is prefixed with [W<n>]
-# (worker tag) and [<post_id>] (post tag). The new ✦ line emits the
-# authoritative per-event flag set directly, so derivation rules can be
-# skipped when present.
-
-# Format detector: any [W<digits>] prefix anywhere → new format
-RE_FORMAT_NEW_MARKER = re.compile(r'\[W\d+\]')
-
-# Single ✦ event line — emitted per tier inside _run_tier. The tier may
-# escalate after this, in which case more ✦ lines will follow for the same
-# post. We dedup by event name and keep the last seen entry per post (which
-# corresponds to the final tier and matches what's written to the sheet).
-# Format: "    ✦ [<tier_name>] '<event_name>' | <date>"
-RE_EVENT_DOT = re.compile(
-    r"✦\s+\[(\w+)\]\s+['\"](.+?)['\"]\s+\|\s+(\S+)"
+RE_NEW_EVENT = re.compile(
+    r"\[([a-z][a-z0-9_]*)\]\s+[\'\"\u2018\u201c](.+?)[\'\"\u2019\u201d]\s+\|\s+(\S+)\s*$"
 )
 
-# Sub-field lines that follow a ✦ event. They're not [post_id]-prefixed
-# (they're continuation lines from a single multi-line print) so we
-# attribute them to the most recently seen ✦ event in the same post.
-RE_NEW_VENUE = re.compile(r'•\s+Venue:\s+(.+?)\s*$')
-RE_NEW_CONF  = re.compile(r'•\s+Confidence:\s+([\d.]+)')
-RE_NEW_FLAGS = re.compile(r'•\s+Flags:\s+(.+?)\s*$')
-
-# New Done boundary — marks end of post processing. Useful as a "close
-# this post record" signal even though Processing post: of the NEXT post
-# would also flush.
-RE_NEW_DONE = re.compile(r'\[\d+/\d+\]\s+Done in\s+[\d.]+s')
+RE_DATE_LINE  = re.compile(r'(?:•\s*)?Date:\s+(\S+)')
+RE_VENUE_LINE = re.compile(r'(?:•\s*)?Venue:\s+(.+?)\s*$')
+RE_CONF_LINE  = re.compile(r'(?:•\s*)?Confidence:\s+([\d.]+)')
+RE_NEW_FLAGS  = re.compile(r'(?:•\s*)?Flags:\s*(.+?)\s*$')
 
 
-def detect_log_format(log_path: Path) -> str:
-    """Sniff a log file to determine whether it's the old format (no per-line
-    worker tag) or the new format (every worker line prefixed with [W<n>]).
-    Reads until first match — early-exit cheap for new-format files."""
-    try:
-        with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
-            for line in f:
-                if RE_FORMAT_NEW_MARKER.search(line):
-                    return 'new'
-    except OSError:
-        pass
-    return 'old'
+def _parse_new_flags_value(raw):
+    raw = (raw or '').strip()
+    if not raw or raw.lower() == 'none':
+        return set()
+    return {tok.strip() for tok in raw.split(',') if tok.strip()}
 
 
-def parse_log(log_path: Path) -> list:
+def parse_log(log_path):
     """
-    Parse a single run log into a list of post records. Auto-detects format.
+    Parse a single run log into a list of post records.
 
-    Returns:
-        [
-          {
-            'post_id': str,
-            'log_mtime': datetime,
-            'format': 'old' | 'new',
-            'post_flags': set[str],           # post-level only (informational flags)
-            'events': [
-              {
-                'name': str,
-                'date': str|None,
-                'venue': str|None,
-                'confidence': float|None,
-                'authoritative_flags': set[str] | None,  # set in new format from ✦ Flags:
-                'tier': str | None,                       # set in new format from ✦ [tier]
-              }
-            ]
-          },
-          ...
-        ]
+    Per post record:
+      {
+        'post_id', 'log_mtime',
+        'post_flags': set[str],         # legacy 'informational flags:' line
+        'has_event_level': bool,        # any '• Flags:' line seen?
+        'events': [{'name','date','venue','confidence','event_flags','tier'}],
+      }
 
-    For old-format records, authoritative_flags is None and derive_flags()
-    falls back to the heuristic rules in its (A)/(B)/(C)/(D) sections.
-    For new-format records, authoritative_flags is the canonical per-event
-    flag set the pipeline assigned at write time — derive_flags() returns
-    it as-is, no derivation needed.
+    Lines with [post_id] prefix are routed directly to that post's record.
+    Lines without prefix fall back to the most-recent Processing post: ID.
     """
-    fmt = detect_log_format(log_path)
-    if fmt == 'new':
-        return _parse_new_format(log_path)
-    return _parse_old_format(log_path)
-
-
-def _parse_old_format(log_path: Path) -> list:
-    """Original parser — pre-worker_log.py logs without [W<n>] prefix.
-    Uses informational flags + EVENT FOUND / MULTIPLE EVENTS FOUND lines.
-    derive_flags() will apply heuristic rules to fill in per-event flags."""
     text = log_path.read_text(encoding='utf-8', errors='replace')
     log_mtime = datetime.fromtimestamp(log_path.stat().st_mtime)
 
-    posts = []
-    current = None  # in-progress post dict
-    multi_event = None  # in-progress event dict (for MULTIPLE EVENTS FOUND items)
+    posts_by_id = {}
+    legacy_current_id = None
 
-    def flush_current():
-        if current and (current['events'] or current['post_flags']):
-            posts.append(current)
-
-    for raw_line in text.splitlines():
-        line = raw_line.rstrip()
-
-        # New post boundary
-        m = RE_PROCESSING.search(line)
-        if m:
-            flush_current()
-            current = {
-                'post_id': m.group(1),
+    def ensure_post(post_id):
+        if post_id not in posts_by_id:
+            posts_by_id[post_id] = {
+                'post_id': post_id,
                 'log_mtime': log_mtime,
-                'format': 'old',
                 'post_flags': set(),
+                'has_event_level': False,
                 'events': [],
+                '_cur_event': None,
             }
-            multi_event = None
-            continue
-
-        if current is None:
-            continue
-
-        # Post-level informational flags
-        m = RE_INFO_FLAGS.search(line)
-        if m:
-            raw = m.group(1).strip()
-            for tok in re.findall(r"'([^']+)'", raw):
-                current['post_flags'].add(tok)
-            continue
-
-        # Single-event marker
-        m = RE_EVENT_FOUND.search(line)
-        if m:
-            multi_event = {'name': m.group(1).strip(), 'date': None,
-                           'venue': None, 'confidence': None,
-                           'authoritative_flags': None, 'tier': None}
-            current['events'].append(multi_event)
-            continue
-
-        # Multiple-events list item: "  N. <name>"
-        m = RE_MULTI_ITEM.match(line)
-        if m and RE_MULTI_HEADER.search(line) is None:
-            # Plausibly a multi-event list item; verify we're inside one
-            # (lookback approach: any recent MULTIPLE EVENTS marker for this post)
-            multi_event = {'name': m.group(2).strip(), 'date': None,
-                           'venue': None, 'confidence': None,
-                           'authoritative_flags': None, 'tier': None}
-            current['events'].append(multi_event)
-            continue
-
-        # Multi-event header just informs that the next N items are events;
-        # we don't need to act on it specifically — the items are caught above.
-
-        # Field lines (apply to most-recent event in this post)
-        if multi_event is not None:
-            m = RE_DATE_LINE.search(line)
-            if m:
-                val = m.group(1).strip()
-                multi_event['date'] = None if val == 'None' else val
-                continue
-            m = RE_VENUE_LINE.search(line)
-            if m:
-                val = m.group(1).strip()
-                multi_event['venue'] = None if val == 'None' else val
-                continue
-            m = RE_CONF_LINE.search(line)
-            if m:
-                try:
-                    multi_event['confidence'] = float(m.group(1))
-                except ValueError:
-                    pass
-                continue
-
-    flush_current()
-    return posts
-
-
-def _parse_new_format(log_path: Path) -> list:
-    """Parser for the new log format (feat/worker-log-prefixing branch and
-    later). Authoritative per-event flags come from the ✦ line's
-    `• Flags: <comma flags>` sub-field. derive_flags() returns them as-is.
-
-    Tier-escalation gotcha: ✦ lines emit once per tier execution. A post
-    that escalates Tier1 → Tier2 → Tier3 produces 3 sets of ✦ lines. Only
-    the FINAL tier's events are written to the sheet. We handle this by
-    keeping ✦ events in a dict keyed by event name — later occurrences
-    overwrite earlier ones, so the surviving set matches the final tier.
-    """
-    text = log_path.read_text(encoding='utf-8', errors='replace')
-    log_mtime = datetime.fromtimestamp(log_path.stat().st_mtime)
-
-    posts = []
-    current = None       # in-progress post dict (events as dict keyed by name)
-    current_event = None # ref to event dict that the next sub-field lines describe
-
-    def flush_current():
-        if current is None:
-            return
-        # Convert events dict back to list (insertion order preserved in py3.7+)
-        rec = {
-            'post_id': current['post_id'],
-            'log_mtime': current['log_mtime'],
-            'format': 'new',
-            'post_flags': current['post_flags'],
-            'events': list(current['events'].values()),
-        }
-        if rec['events'] or rec['post_flags']:
-            posts.append(rec)
+        return posts_by_id[post_id]
 
     for raw_line in text.splitlines():
         line = raw_line.rstrip()
 
-        # New post boundary (search, so it works whether prefixed or not)
-        m = RE_PROCESSING.search(line)
+        # Peel optional [post_id] prefix
+        m_pre = RE_PREFIX.match(line)
+        if m_pre:
+            ctx = ensure_post(m_pre.group(1))
+            body = line[m_pre.end():]
+        else:
+            body = line
+            ctx = posts_by_id.get(legacy_current_id) if legacy_current_id else None
+
+        # Processing post: marker -- always update legacy anchor
+        m = RE_PROCESSING.search(body)
         if m:
-            flush_current()
-            current = {
-                'post_id': m.group(1),
-                'log_mtime': log_mtime,
-                'post_flags': set(),
-                'events': {},  # keyed by event name; later writes overwrite earlier
+            inner_id = m.group(1)
+            ensure_post(inner_id)
+            legacy_current_id = inner_id
+            continue
+
+        if ctx is None:
+            continue
+
+        # NEW format event marker (specific, check first)
+        m = RE_NEW_EVENT.search(body)
+        if m:
+            ev = {
+                'name': m.group(2).strip(),
+                'date': None if m.group(3).strip() == 'None' else m.group(3).strip(),
+                'venue': None, 'confidence': None,
+                'event_flags': None, 'tier': m.group(1),
             }
-            current_event = None
+            ctx['events'].append(ev)
+            ctx['_cur_event'] = ev
             continue
 
-        if current is None:
+        # NEW format Flags bullet (must come before generic field lines)
+        m = RE_NEW_FLAGS.search(body)
+        if m and ctx['_cur_event'] is not None:
+            ctx['_cur_event']['event_flags'] = _parse_new_flags_value(m.group(1))
+            ctx['has_event_level'] = True
             continue
 
-        # Done boundary — close the post (next Processing also would, but
-        # being explicit avoids a stale current_event lingering for the
-        # space between posts).
-        if RE_NEW_DONE.search(line):
-            flush_current()
-            current = None
-            current_event = None
-            continue
-
-        # ✦ event line — starts (or replaces) an event in the current post
-        m = RE_EVENT_DOT.search(line)
+        # OLD format post-level flags
+        m = RE_INFO_FLAGS.search(body)
         if m:
-            tier_name, ev_name, ev_date = m.group(1), m.group(2).strip(), m.group(3).strip()
-            current_event = {
-                'name': ev_name,
-                'date': None if ev_date in ('None', '?', '') else ev_date,
-                'venue': None,
-                'confidence': None,
-                'authoritative_flags': set(),
-                'tier': tier_name,
-            }
-            # Dedup by name — later occurrence (later tier) wins.
-            current['events'][ev_name] = current_event
+            for tok in re.findall(r"'([^']+)'", m.group(1).strip()):
+                ctx['post_flags'].add(tok)
             continue
 
-        # Post-level informational flags — recorded for diagnostics / fallback,
-        # but the per-event ✦ Flags lines are the canonical source.
-        m = RE_INFO_FLAGS.search(line)
+        # OLD format single-event marker
+        m = RE_EVENT_FOUND.search(body)
         if m:
-            raw = m.group(1).strip()
-            for tok in re.findall(r"'([^']+)'", raw):
-                current['post_flags'].add(tok)
+            ev = {'name': m.group(1).strip(), 'date': None, 'venue': None,
+                  'confidence': None, 'event_flags': None, 'tier': None}
+            ctx['events'].append(ev)
+            ctx['_cur_event'] = ev
             continue
 
-        # Sub-field lines attach to the most recent ✦ event in this post.
-        # These continuation lines are NOT prefixed because they share a
-        # single print() with the ✦ line, but they ARE physically contiguous
-        # in the log (atomic write), so attaching to current_event is safe.
-        if current_event is not None:
-            m = RE_NEW_VENUE.search(line)
+        # OLD format multi-event list item: "  N. <name>"
+        m = RE_MULTI_ITEM.match(body)
+        if m and RE_MULTI_HEADER.search(body) is None:
+            ev = {'name': m.group(2).strip(), 'date': None, 'venue': None,
+                  'confidence': None, 'event_flags': None, 'tier': None}
+            ctx['events'].append(ev)
+            ctx['_cur_event'] = ev
+            continue
+
+        # Field lines apply to ctx's current event
+        if ctx['_cur_event'] is not None:
+            m = RE_DATE_LINE.search(body)
             if m:
                 val = m.group(1).strip()
-                current_event['venue'] = None if val in ('None', '') else val
+                ctx['_cur_event']['date'] = None if val == 'None' else val
                 continue
-            m = RE_NEW_CONF.search(line)
+            m = RE_VENUE_LINE.search(body)
+            if m:
+                val = m.group(1).strip()
+                ctx['_cur_event']['venue'] = None if val == 'None' else val
+                continue
+            m = RE_CONF_LINE.search(body)
             if m:
                 try:
-                    current_event['confidence'] = float(m.group(1))
+                    ctx['_cur_event']['confidence'] = float(m.group(1))
                 except ValueError:
                     pass
                 continue
-            m = RE_NEW_FLAGS.search(line)
-            if m:
-                raw = m.group(1).strip()
-                if raw and raw.lower() != 'none':
-                    for tok in raw.split(','):
-                        tok = tok.strip()
-                        if tok:
-                            current_event['authoritative_flags'].add(tok)
-                continue
 
-    flush_current()
+    posts = []
+    for post in posts_by_id.values():
+        post.pop('_cur_event', None)
+        if post['events'] or post['post_flags']:
+            posts.append(post)
     return posts
 
 
-def parse_logs(log_paths: list) -> dict:
-    """
-    Parse multiple logs. Returns dict keyed by post_id; for posts that appear
-    in multiple logs, the LATEST log (by mtime) wins.
-    """
+def parse_logs(log_paths):
+    """Latest log by mtime wins per post_id."""
     by_post = {}
     for p in log_paths:
         for rec in parse_log(p):
@@ -441,9 +302,9 @@ def parse_logs(log_paths: list) -> dict:
     return by_post
 
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 # Date helpers
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 
 def parse_date(s):
     if not s or s == 'None':
@@ -458,18 +319,17 @@ def parse_date(s):
 
 
 def normalize_date_for_key(s):
-    """Normalize a date string for matching. Returns canonical string or original."""
     d = parse_date(s)
     return d.isoformat() if d else (s.strip() if s else '')
 
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 # Sheet helpers
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 
 def setup_sheet():
     if not Path(SERVICE_ACCOUNT_FILE).exists():
-        print(f"❌ Service account not found at {SERVICE_ACCOUNT_FILE}", file=sys.stderr)
+        print(f"ERROR: Service account not found at {SERVICE_ACCOUNT_FILE}", file=sys.stderr)
         sys.exit(1)
     scope = ["https://spreadsheets.google.com/feeds",
              "https://www.googleapis.com/auth/drive"]
@@ -486,7 +346,6 @@ def col_index(header, *names):
 
 
 def col_letter(idx_zero_based):
-    """Convert 0-based column index to A1 letter (A, B, ..., Z, AA, ...)."""
     n = idx_zero_based + 1
     s = ''
     while n > 0:
@@ -495,102 +354,67 @@ def col_letter(idx_zero_based):
     return s
 
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 # Flag derivation
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 
 def derive_flags(post_record, event_log, sheet_row, col_indices,
                  nj_lookup, all_event_dates_in_post, skip_day_mismatch=True):
-    """
-    Compute the canonical set of flags for one event.
-
-    New-format short-circuit: if event_log['authoritative_flags'] is set
-    (not None), it's the actual flag set the pipeline wrote at extract
-    time. Return it directly — no derivation needed.
-
-    Old-format fallback: apply the heuristic derivation rules (A)/(B)/(C)/(D)
-    against post-level informational flags + event fields + sheet fields.
-
-    post_record: dict from log parser (has post_flags)
-    event_log: dict for this specific event from log
-    sheet_row: list of cell values for this row in the sheet
-    col_indices: dict of column-name -> index
-    nj_lookup: dict of city -> region (from data/nj_municipalities.json)
-    all_event_dates_in_post: list of parsed date objects for all events in this post
-    skip_day_mismatch: if True, never apply DATE_DAY_MISMATCH (old format only)
-    """
-    # New format: per-event Flags from ✦ line is authoritative. Use as-is.
-    auth = event_log.get('authoritative_flags')
-    if auth is not None:
-        return set(auth)
+    if event_log.get('event_flags') is not None:
+        return set(event_log['event_flags']), 'event-level'
 
     flags = set()
     log_post_flags = post_record['post_flags']
 
-    # (A) Always-apply post-level flags
     for f in ALWAYS_APPLY_POST_FLAGS:
         if f in log_post_flags:
             flags.add(f)
 
-    # (B) Per-event derivation from log fields
     if event_log.get('date') is None:
         flags.add('MISSING_DATE')
     conf = event_log.get('confidence')
     if conf is not None and conf < 0.5:
         flags.add('LOW_CONFIDENCE')
 
-    # (C) Per-event conditional via sheet field check
     def sheet_val(col_name):
         idx = col_indices.get(col_name)
         if idx is None or idx >= len(sheet_row):
             return ''
         return (sheet_row[idx] or '').strip()
 
-    sheet_city = sheet_val('CITY')
-    sheet_venue = sheet_val('VENUE NAME')
+    sheet_city    = sheet_val('CITY')
+    sheet_venue   = sheet_val('VENUE NAME')
     sheet_section = sheet_val('SECTION OF NJ')
 
-    if 'CITY_NOT_IN_NJ_LOOKUP' in log_post_flags:
-        # Apply to events whose sheet CITY is non-empty (not just "")
-        if sheet_city:
-            # Stricter: only flag if city actually isn't in NJ lookup
-            if not nj_lookup or sheet_city.lower() not in {k.lower() for k in nj_lookup.keys()}:
-                flags.add('CITY_NOT_IN_NJ_LOOKUP')
+    if 'CITY_NOT_IN_NJ_LOOKUP' in log_post_flags and sheet_city:
+        if not nj_lookup or sheet_city.lower() not in {k.lower() for k in nj_lookup.keys()}:
+            flags.add('CITY_NOT_IN_NJ_LOOKUP')
 
-    if 'REGION_AUTOFIXED' in log_post_flags:
-        if sheet_section:
-            flags.add('REGION_AUTOFIXED')
+    if 'REGION_AUTOFIXED' in log_post_flags and sheet_section:
+        flags.add('REGION_AUTOFIXED')
 
-    if 'VENUE_CITY_MISMATCH' in log_post_flags:
-        if sheet_venue and sheet_city:
-            flags.add('VENUE_CITY_MISMATCH')
+    if 'VENUE_CITY_MISMATCH' in log_post_flags and sheet_venue and sheet_city:
+        flags.add('VENUE_CITY_MISMATCH')
 
-    # PAST_DATE / FAR_FUTURE_DATE: apply to event(s) with earliest/latest date
     event_date = parse_date(event_log.get('date'))
     if 'PAST_DATE' in log_post_flags and event_date and all_event_dates_in_post:
-        earliest = min(d for d in all_event_dates_in_post if d)
-        if event_date == earliest:
+        if event_date == min(d for d in all_event_dates_in_post if d):
             flags.add('PAST_DATE')
     if 'FAR_FUTURE_DATE' in log_post_flags and event_date and all_event_dates_in_post:
-        latest = max(d for d in all_event_dates_in_post if d)
-        if event_date == latest:
+        if event_date == max(d for d in all_event_dates_in_post if d):
             flags.add('FAR_FUTURE_DATE')
 
-    # (D) DATE_DAY_MISMATCH — skip by default
     if not skip_day_mismatch and 'DATE_DAY_MISMATCH' in log_post_flags:
         flags.add('DATE_DAY_MISMATCH')
 
-    return flags
+    return flags, 'post-level'
 
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 # Sheet update batchers
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 
 def batch_update_text_cells(spreadsheet, ws, sheet_id, updates):
-    """
-    updates: list of (sheet_row, col_idx, new_value)
-    """
     if not updates:
         return
     requests = []
@@ -599,14 +423,10 @@ def batch_update_text_cells(spreadsheet, ws, sheet_id, updates):
             "updateCells": {
                 "range": {
                     "sheetId": sheet_id,
-                    "startRowIndex": row - 1,
-                    "endRowIndex": row,
-                    "startColumnIndex": col,
-                    "endColumnIndex": col + 1,
+                    "startRowIndex": row - 1, "endRowIndex": row,
+                    "startColumnIndex": col, "endColumnIndex": col + 1,
                 },
-                "rows": [{"values": [{
-                    "userEnteredValue": {"stringValue": val}
-                }]}],
+                "rows": [{"values": [{"userEnteredValue": {"stringValue": val}}]}],
                 "fields": "userEnteredValue",
             }
         })
@@ -617,20 +437,14 @@ def batch_update_text_cells(spreadsheet, ws, sheet_id, updates):
 
 
 def batch_update_format_cells(spreadsheet, ws, sheet_id, paint_ops, wipe_ops):
-    """
-    paint_ops: list of (sheet_row, col_idx, color_dict)
-    wipe_ops:  list of (sheet_row, col_idx) — set to white
-    """
     requests = []
     for row, col in wipe_ops:
         requests.append({
             "repeatCell": {
                 "range": {
                     "sheetId": sheet_id,
-                    "startRowIndex": row - 1,
-                    "endRowIndex": row,
-                    "startColumnIndex": col,
-                    "endColumnIndex": col + 1,
+                    "startRowIndex": row - 1, "endRowIndex": row,
+                    "startColumnIndex": col, "endColumnIndex": col + 1,
                 },
                 "cell": {"userEnteredFormat": {"backgroundColor": WHITE_BG}},
                 "fields": "userEnteredFormat.backgroundColor",
@@ -641,10 +455,8 @@ def batch_update_format_cells(spreadsheet, ws, sheet_id, paint_ops, wipe_ops):
             "repeatCell": {
                 "range": {
                     "sheetId": sheet_id,
-                    "startRowIndex": row - 1,
-                    "endRowIndex": row,
-                    "startColumnIndex": col,
-                    "endColumnIndex": col + 1,
+                    "startRowIndex": row - 1, "endRowIndex": row,
+                    "startColumnIndex": col, "endColumnIndex": col + 1,
                 },
                 "cell": {"userEnteredFormat": {"backgroundColor": color}},
                 "fields": "userEnteredFormat.backgroundColor",
@@ -656,9 +468,9 @@ def batch_update_format_cells(spreadsheet, ws, sheet_id, paint_ops, wipe_ops):
             time.sleep(BATCH_DELAY_SEC)
 
 
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 # Main
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 
 def main():
     p = argparse.ArgumentParser(
@@ -680,84 +492,65 @@ def main():
                    help="Apply DATE_DAY_MISMATCH to all events from posts that had it.")
     args = p.parse_args()
 
-    # Resolve log paths
     log_paths = [Path(x) for x in args.log]
     if args.logs_dir:
         log_paths.extend(sorted(Path(args.logs_dir).glob("run_*.log")))
     log_paths = [p for p in log_paths if p.exists()]
     if not log_paths:
-        print("❌ No log files found. Use --log <path> or --logs-dir <dir>.", file=sys.stderr)
+        print("ERROR: No log files found.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"━━━ repair_flags_from_log.py ━━━")
-    print(f"  Apply mode:           {args.apply}")
-    print(f"  Strip extras:         {args.strip_extra}")
-    print(f"  Aggressive day-flag:  {args.aggressive_day_mismatch}")
+    print(f"=== repair_flags_from_log.py ===")
+    print(f"  Apply mode:          {args.apply}")
+    print(f"  Strip extras:        {args.strip_extra}")
+    print(f"  Aggressive day-flag: {args.aggressive_day_mismatch}")
     print(f"  Logs ({len(log_paths)}):")
     for lp in log_paths:
-        fmt = detect_log_format(lp)
-        marker = '✓' if fmt == 'new' else '⚠'
-        print(f"    {marker} [{fmt:3s}] {lp}")
-    print()
-    print("  Format notes:")
-    print("    'new' = post-cutover logs with [W<n>] [<post_id>] line tags")
-    print("            and per-event ✦ Flags — flags are AUTHORITATIVE,")
-    print("            no derivation needed.")
-    print("    'old' = pre-cutover logs without per-line tags. Heuristic")
-    print("            derivation applied; ~85-95% accurate due to thread")
-    print("            interleaving in carousel-heavy multi-event posts.")
-    print()
+        print(f"    - {lp}")
 
-    # Parse logs
-    print("  Parsing logs...")
+    print("\n  Parsing logs...")
     log_by_post = parse_logs(log_paths)
-    n_events = sum(len(p['events']) for p in log_by_post.values())
-    n_flagged_posts = sum(1 for p in log_by_post.values() if p['post_flags'])
-    n_new_format = sum(1 for p in log_by_post.values() if p.get('format') == 'new')
-    n_authoritative = sum(
-        1 for p in log_by_post.values() for e in p['events']
-        if e.get('authoritative_flags') is not None
-    )
+    n_events          = sum(len(p['events']) for p in log_by_post.values())
+    n_event_level     = sum(1 for p in log_by_post.values() if p['has_event_level'])
+    n_post_level_only = sum(1 for p in log_by_post.values()
+                            if not p['has_event_level'] and p['post_flags'])
+    n_flagged_posts   = sum(1 for p in log_by_post.values() if p['post_flags'])
     print(f"  Parsed {len(log_by_post)} posts with {n_events} events")
-    print(f"    • {n_new_format} posts from new-format logs (authoritative per-event flags)")
-    print(f"    • {n_authoritative}/{n_events} events have authoritative flags (vs derived)")
-    print(f"    • {n_flagged_posts} posts had any post-level flags recorded")
+    print(f"    - event-level posts:        {n_event_level}")
+    print(f"    - post-level-only w/ flags: {n_post_level_only}")
+    print(f"    - total posts with flags:   {n_flagged_posts}")
 
-    # Connect + read sheet
     print("\n  Connecting to sheet...")
     sh = setup_sheet()
     ws = sh.worksheet(ALL_EVENTS_TAB)
     sheet_id = ws.id
-
     print("  Reading All_Events...")
     all_values = ws.get_all_values()
     if not all_values:
-        print("⚠ Sheet is empty.")
+        print("WARNING: Sheet is empty.")
         return
     header = all_values[0]
     data_rows = all_values[1:]
-    print(f"  {len(data_rows)} data rows")
+    print(f"    {len(data_rows)} data rows")
 
-    # Resolve column indices
     cols = {
-        'POST ID':         col_index(header, 'POST ID'),
-        'EVENT NAME':      col_index(header, 'EVENT NAME'),
-        'DATE':            col_index(header, 'DATE'),
-        'VENUE NAME':      col_index(header, 'VENUE NAME'),
-        'CITY':            col_index(header, 'CITY'),
-        'SECTION OF NJ':   col_index(header, 'SECTION OF NJ'),
-        'CONFIDENCE':      col_index(header, 'CONFIDENCE'),
-        'DESCRIPTION':     col_index(header, 'DESCRIPTION'),
-        'QUALITY_FLAGS':   col_index(header, 'QUALITY_FLAGS', 'QUALITY FLAGS'),
+        'POST ID':       col_index(header, 'POST ID'),
+        'EVENT NAME':    col_index(header, 'EVENT NAME'),
+        'DATE':          col_index(header, 'DATE'),
+        'VENUE NAME':    col_index(header, 'VENUE NAME'),
+        'CITY':          col_index(header, 'CITY'),
+        'SECTION OF NJ': col_index(header, 'SECTION OF NJ'),
+        'CONFIDENCE':    col_index(header, 'CONFIDENCE'),
+        'DESCRIPTION':   col_index(header, 'DESCRIPTION'),
+        'QUALITY_FLAGS': col_index(header, 'QUALITY_FLAGS', 'QUALITY FLAGS'),
     }
     missing = [k for k, v in cols.items() if v is None]
     if missing:
-        print(f"❌ Missing required columns in sheet header: {missing}", file=sys.stderr)
+        print(f"ERROR: Missing required columns: {missing}", file=sys.stderr)
         sys.exit(1)
 
-    # Build sheet index by composite key
     print("  Indexing sheet rows...")
-    sheet_index = defaultdict(list)  # (post_id, name_upper, date_iso) -> [(row_num, row_data)]
+    sheet_index = defaultdict(list)
     for i, row in enumerate(data_rows, start=2):
         if args.after_row and i < args.after_row:
             continue
@@ -769,17 +562,12 @@ def main():
         if pid and name:
             sheet_index[(pid, name, date_iso)].append((i, row))
 
-    # Derive + diff
     print("\n  Deriving flags + diffing...")
     nj_lookup = load_nj_municipalities()
-    text_updates = []     # (row, col, new_value)
-    paint_ops = []        # (row, col, color)
-    wipe_ops = []         # (row, col)
-    audit_rows = []       # for CSV
-
+    text_updates, paint_ops, wipe_ops, audit_rows = [], [], [], []
     counts = {'matched': 0, 'updated': 0, 'log_only_no_match': 0,
               'sheet_only_not_in_log': 0, 'multi_match_skipped': 0}
-
+    source_counts = {'event-level': 0, 'post-level': 0}
     matched_keys = set()
 
     for post_id, post_rec in log_by_post.items():
@@ -788,77 +576,63 @@ def main():
 
         for event_log in post_rec['events']:
             ev_name_upper = event_log['name'].strip().upper()
-            ev_date_iso = normalize_date_for_key(event_log.get('date'))
+            ev_date_iso   = normalize_date_for_key(event_log.get('date'))
             key = (post_id, ev_name_upper, ev_date_iso)
-
             sheet_matches = sheet_index.get(key, [])
+            ev_src_hint = 'event-level' if event_log.get('event_flags') is not None else 'post-level'
+
             if not sheet_matches:
                 counts['log_only_no_match'] += 1
-                audit_rows.append({
-                    'status': 'log_only_no_match',
-                    'post_id': post_id,
-                    'event_name': event_log['name'],
-                    'date': event_log.get('date') or '',
-                    'sheet_row': '',
-                    'old_flags': '',
-                    'new_flags': '',
-                })
+                audit_rows.append({'status': 'log_only_no_match', 'source': ev_src_hint,
+                                   'post_id': post_id, 'event_name': event_log['name'],
+                                   'date': event_log.get('date') or '', 'sheet_row': '',
+                                   'old_flags': '', 'new_flags': ''})
                 continue
+
             if len(sheet_matches) > 1:
                 counts['multi_match_skipped'] += 1
-                audit_rows.append({
-                    'status': 'multi_match_skipped',
-                    'post_id': post_id,
-                    'event_name': event_log['name'],
-                    'date': event_log.get('date') or '',
-                    'sheet_row': ';'.join(str(r) for r, _ in sheet_matches),
-                    'old_flags': '',
-                    'new_flags': '',
-                })
+                audit_rows.append({'status': 'multi_match_skipped', 'source': ev_src_hint,
+                                   'post_id': post_id, 'event_name': event_log['name'],
+                                   'date': event_log.get('date') or '',
+                                   'sheet_row': ';'.join(str(r) for r, _ in sheet_matches),
+                                   'old_flags': '', 'new_flags': ''})
                 continue
 
             sheet_row_num, sheet_row = sheet_matches[0]
             matched_keys.add(key)
 
-            # Compute derived flags
-            derived = derive_flags(
+            derived, source = derive_flags(
                 post_rec, event_log, sheet_row, cols, nj_lookup, all_dates,
                 skip_day_mismatch=not args.aggressive_day_mismatch,
             )
+            source_counts[source] = source_counts.get(source, 0) + 1
 
-            # Read current flags from sheet
             current_text = (sheet_row[cols['QUALITY_FLAGS']]
                             if cols['QUALITY_FLAGS'] < len(sheet_row) else '') or ''
             current = {f.strip() for f in current_text.split(',') if f.strip()}
 
-            # Build new flag set
             if args.strip_extra:
                 new_flags = derived
+            elif source == 'event-level':
+                known = set(FLAG_TO_COLUMNS.keys())
+                manual_extras = current - known
+                new_flags = derived | manual_extras
             else:
-                # Preserve sheet extras, but always include all derived
                 new_flags = current | derived
-                # Remove DATE_DAY_MISMATCH only if not in derived AND not in sheet originally
-                # (we leave existing ones alone since we can't verify them)
 
             if new_flags == current:
                 counts['matched'] += 1
-                audit_rows.append({
-                    'status': 'matched',
-                    'post_id': post_id,
-                    'event_name': event_log['name'],
-                    'date': event_log.get('date') or '',
-                    'sheet_row': str(sheet_row_num),
-                    'old_flags': ','.join(sorted(current)),
-                    'new_flags': ','.join(sorted(new_flags)),
-                })
+                audit_rows.append({'status': 'matched', 'source': source,
+                                   'post_id': post_id, 'event_name': event_log['name'],
+                                   'date': event_log.get('date') or '',
+                                   'sheet_row': str(sheet_row_num),
+                                   'old_flags': ','.join(sorted(current)),
+                                   'new_flags': ','.join(sorted(new_flags))})
                 continue
 
-            # Diff: queue text update + repaint
             counts['updated'] += 1
-            new_text = ','.join(sorted(new_flags))
-            text_updates.append((sheet_row_num, cols['QUALITY_FLAGS'], new_text))
+            text_updates.append((sheet_row_num, cols['QUALITY_FLAGS'], ','.join(sorted(new_flags))))
 
-            # Determine all columns that need painting/wiping for this row
             cols_to_paint = set()
             for f in new_flags:
                 for col_name in FLAG_TO_COLUMNS.get(f, []):
@@ -871,57 +645,47 @@ def main():
                     ci = cols.get(col_name)
                     if ci is not None and ci not in cols_to_paint:
                         cols_should_be_white.add(ci)
-
             for ci in cols_to_paint:
                 paint_ops.append((sheet_row_num, ci, FLAG_BG_COLOR))
             for ci in cols_should_be_white:
                 wipe_ops.append((sheet_row_num, ci))
 
-            audit_rows.append({
-                'status': 'updated',
-                'post_id': post_id,
-                'event_name': event_log['name'],
-                'date': event_log.get('date') or '',
-                'sheet_row': str(sheet_row_num),
-                'old_flags': ','.join(sorted(current)),
-                'new_flags': ','.join(sorted(new_flags)),
-            })
+            audit_rows.append({'status': 'updated', 'source': source,
+                               'post_id': post_id, 'event_name': event_log['name'],
+                               'date': event_log.get('date') or '',
+                               'sheet_row': str(sheet_row_num),
+                               'old_flags': ','.join(sorted(current)),
+                               'new_flags': ','.join(sorted(new_flags))})
 
-    # Sheet-only rows (in sheet, not in any parsed log)
     for key, matches in sheet_index.items():
         if key in matched_keys:
             continue
         for (row_num, row_data) in matches:
             counts['sheet_only_not_in_log'] += 1
             cur = (row_data[cols['QUALITY_FLAGS']] if cols['QUALITY_FLAGS'] < len(row_data) else '') or ''
-            audit_rows.append({
-                'status': 'sheet_only_not_in_log',
-                'post_id': key[0],
-                'event_name': key[1],
-                'date': key[2],
-                'sheet_row': str(row_num),
-                'old_flags': cur,
-                'new_flags': cur,
-            })
+            audit_rows.append({'status': 'sheet_only_not_in_log', 'source': '',
+                               'post_id': key[0], 'event_name': key[1],
+                               'date': key[2], 'sheet_row': str(row_num),
+                               'old_flags': cur, 'new_flags': cur})
 
-    # ── REPORT ─────────────────────────────────────────────────────────
-    print(f"\n━━━ FINDINGS ━━━")
+    print(f"\n=== FINDINGS ===")
     print(f"  Matched (no change needed):  {counts['matched']}")
     print(f"  Updates queued:              {counts['updated']}")
     print(f"  In log, not in sheet:        {counts['log_only_no_match']}")
     print(f"  In sheet, not in log:        {counts['sheet_only_not_in_log']}")
     print(f"  Ambiguous (multi-match):     {counts['multi_match_skipped']}")
-    print(f"  Format ops queued:           {len(paint_ops)} paint, {len(wipe_ops)} wipe")
+    print(f"  Format ops queued: {len(paint_ops)} paint, {len(wipe_ops)} wipe")
+    print(f"\n  Derivation source breakdown:")
+    print(f"    - event-level (trusted from log):       {source_counts.get('event-level', 0)}")
+    print(f"    - post-level (conservative fallback):   {source_counts.get('post-level', 0)}")
 
-    # CSV audit
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = Path("outputs") / f"repair_flags_{ts}.csv"
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     with open(csv_path, 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=[
-            'status', 'post_id', 'event_name', 'date',
-            'sheet_row', 'old_flags', 'new_flags'
-        ])
+            'status', 'source', 'post_id', 'event_name', 'date',
+            'sheet_row', 'old_flags', 'new_flags'])
         w.writeheader()
         for r in audit_rows:
             w.writerow(r)
@@ -932,18 +696,15 @@ def main():
         return
 
     if not text_updates and not paint_ops and not wipe_ops:
-        print(f"\n  ✓ Nothing to apply. Sheet already in sync.")
+        print(f"\n  OK: Nothing to apply. Sheet already in sync.")
         return
 
-    # ── APPLY ─────────────────────────────────────────────────────────
-    print(f"\n━━━ APPLYING ━━━")
+    print(f"\n=== APPLYING ===")
     print(f"  Updating {len(text_updates)} QUALITY_FLAGS cells...")
     batch_update_text_cells(sh, ws, sheet_id, text_updates)
-
     print(f"  Updating {len(paint_ops) + len(wipe_ops)} cell formats...")
     batch_update_format_cells(sh, ws, sheet_id, paint_ops, wipe_ops)
-
-    print(f"\n✓ Done. Audit trail: {csv_path}")
+    print(f"\nOK: Done. Audit trail: {csv_path}")
 
 
 if __name__ == "__main__":

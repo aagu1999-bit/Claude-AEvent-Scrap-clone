@@ -70,8 +70,10 @@ from extraction_core import (
     ESCALATION_FLAGS          as ec_ESCALATION_FLAGS,
 )
 
+from worker_log import wprint, log_post_context, get_logger
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%I:%M:%S %p')
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 try:
     import google.generativeai as genai
@@ -890,7 +892,7 @@ class InstagramEventPipeline:
         if not self.vision_client or not image_url or image_url == 'null':
             return ""
 
-        print(f"    ↳ Downloading image from CDN...")
+        wprint(f"    ↳ Downloading image from CDN...")
 
         try:
             headers = {
@@ -902,14 +904,14 @@ class InstagramEventPipeline:
             response = requests.get(image_url, headers=headers, timeout=15)
 
             if response.status_code != 200:
-                print(f"    ✗ Image download failed: Status {response.status_code}")
+                wprint(f"    ✗ Image download failed: Status {response.status_code}")
                 with self.lock:
                     self.stats['download_errors'] += 1
                     self.stats['ocr_failed'] += 1
                 return ""
 
-            print(f"    ✓ Image downloaded ({len(response.content)} bytes)")
-            print(f"    ↳ Calling Vision API for OCR...")
+            wprint(f"    ✓ Image downloaded ({len(response.content)} bytes)")
+            wprint(f"    ↳ Calling Vision API for OCR...")
 
             time.sleep(self.rate_limit_delay)
 
@@ -918,7 +920,7 @@ class InstagramEventPipeline:
 
             if response_ocr.error.message:
                 error_msg = response_ocr.error.message
-                print(f"    ✗ Vision API error: {error_msg}")
+                wprint(f"    ✗ Vision API error: {error_msg}")
                 with self.lock:
                     self.stats['ocr_failed'] += 1
                     if error_msg not in self.stats['vision_errors']:
@@ -927,45 +929,45 @@ class InstagramEventPipeline:
                 if 'quota' in error_msg.lower() or '429' in error_msg:
                     with self.lock:
                         self.rate_limit_delay = min(self.rate_limit_delay * 1.5, 5.0)
-                    print(f"    ⚠ Rate limited - increasing delay to {self.rate_limit_delay:.1f}s")
+                    wprint(f"    ⚠ Rate limited - increasing delay to {self.rate_limit_delay:.1f}s")
                 return ""
 
             if response_ocr.text_annotations:
                 ocr_text = response_ocr.text_annotations[0].description
                 sample = ocr_text[:100].replace('\n', ' ')
-                print(f"    ✓ OCR SUCCESS! Extracted {len(ocr_text)} characters")
-                print(f"    📝 Sample: {sample}...")
+                wprint(f"    ✓ OCR SUCCESS! Extracted {len(ocr_text)} characters")
+                wprint(f"    📝 Sample: {sample}...")
                 with self.lock:
                     self.stats['ocr_success'] += 1
                     self.successful_ocr.append(post_id)
                 return ocr_text
             else:
-                print(f"    ⚠ No text found in image")
+                wprint(f"    ⚠ No text found in image")
                 with self.lock:
                     self.stats['ocr_failed'] += 1
 
         except requests.exceptions.Timeout:
-            print(f"    ✗ Image download timeout")
+            wprint(f"    ✗ Image download timeout")
             with self.lock:
                 self.stats['download_errors'] += 1
                 self.stats['ocr_failed'] += 1
 
         except requests.exceptions.RequestException as e:
-            print(f"    ✗ Image download error: {str(e)[:100]}")
+            wprint(f"    ✗ Image download error: {str(e)[:100]}")
             with self.lock:
                 self.stats['download_errors'] += 1
                 self.stats['ocr_failed'] += 1
 
         except Exception as e:
             error_str = str(e)[:150]
-            print(f"    ✗ OCR exception: {error_str}")
+            wprint(f"    ✗ OCR exception: {error_str}")
             with self.lock:
                 self.stats['ocr_failed'] += 1
                 self.failed_ocr.append(post_id)
             if '429' in error_str or 'quota' in error_str.lower():
                 with self.lock:
                     self.rate_limit_delay = min(self.rate_limit_delay * 1.5, 5.0)
-                print(f"    ⚠ Increasing delay to {self.rate_limit_delay:.1f}s")
+                wprint(f"    ⚠ Increasing delay to {self.rate_limit_delay:.1f}s")
 
         return ""
 
@@ -984,7 +986,7 @@ class InstagramEventPipeline:
         so we defer the genai.GenerativeModel construction until needed."""
         if self.gemini_pro is None:
             self.gemini_pro = genai.GenerativeModel(ec_MODEL_PRO)
-            print(f"    ↳ Pro model initialized ({ec_MODEL_PRO})")
+            wprint(f"    ↳ Pro model initialized ({ec_MODEL_PRO})")
 
     def _download_image_for_multimodal(self, image_url):
         """Download a single image and return ({'mime_type': str, 'data': bytes}, mime)
@@ -1059,7 +1061,7 @@ class InstagramEventPipeline:
                 return None
             text = resp.text.strip()
         except Exception as e:
-            print(f"    ✗ Gemini error in {tier_name}: {str(e)[:120]}")
+            wprint(f"    ✗ Gemini error in {tier_name}: {str(e)[:120]}")
             return None
         return self._parse_gemini_json(text)
 
@@ -1103,34 +1105,34 @@ class InstagramEventPipeline:
         # ── Build call inputs per tier ──
         caption = post.get('caption', '') or post.get('text', '')
         if tier_name == ec_TIER_FLASH_CAPTION:
-            print(f"  [Tier 1: Flash-Lite caption-only (no Vision)]")
+            wprint(f"  [Tier 1: Flash-Lite caption-only (no Vision)]")
             prompt = ec_build_prompt(post, "", post_date)
             data = self._call_gemini_tier(self.gemini_flash_lite, prompt, tier_name)
             has_ocr = False
         elif tier_name == ec_TIER_FLASH_IMAGE:
-            print(f"  [Tier 2: Flash-Lite multimodal (image)]")
+            wprint(f"  [Tier 2: Flash-Lite multimodal (image)]")
             if not cached_images:
-                print(f"    ⚠ No images downloadable — falling back to caption-only handling")
+                wprint(f"    ⚠ No images downloadable — falling back to caption-only handling")
                 prompt = ec_build_prompt(post, "", post_date)
                 data = self._call_gemini_tier(self.gemini_flash_lite, prompt, tier_name)
             else:
-                print(f"    ✓ {len(cached_images)} image(s) prepared for multimodal")
+                wprint(f"    ✓ {len(cached_images)} image(s) prepared for multimodal")
                 prompt = ec_build_prompt(post, "", post_date)
                 content = [prompt] + cached_images
                 data = self._call_gemini_tier(self.gemini_flash_lite, content, tier_name)
             has_ocr = False
         elif tier_name == ec_TIER_FLASH_TEXT:
-            print(f"  [Tier 3: Flash-Lite + OCR text]")
+            wprint(f"  [Tier 3: Flash-Lite + OCR text]")
             if not ocr_text:
-                print(f"    ⚠ No OCR text")
+                wprint(f"    ⚠ No OCR text")
             prompt = ec_build_prompt(post, ocr_text or "", post_date)
             data = self._call_gemini_tier(self.gemini_flash_lite, prompt, tier_name)
             has_ocr = bool(ocr_text)
         elif tier_name == ec_TIER_PRO_IMAGE:
-            print(f"  [Tier 4: Pro multimodal (image)]")
+            wprint(f"  [Tier 4: Pro multimodal (image)]")
             self._setup_pro_model()
             if not cached_images:
-                print(f"    ⚠ No images — falling back to caption-only on Pro")
+                wprint(f"    ⚠ No images — falling back to caption-only on Pro")
                 prompt = ec_build_prompt(post, ocr_text or "", post_date)
                 data = self._call_gemini_tier(self.gemini_pro, prompt, tier_name)
             else:
@@ -1139,7 +1141,7 @@ class InstagramEventPipeline:
                 data = self._call_gemini_tier(self.gemini_pro, content, tier_name)
             has_ocr = bool(ocr_text)
         else:
-            print(f"  ⚠ Unknown tier: {tier_name}")
+            wprint(f"  ⚠ Unknown tier: {tier_name}")
             return [], False, False, []
 
         if not data:
@@ -1193,6 +1195,16 @@ class InstagramEventPipeline:
             merged = (ev.get('_row_flags') or []) + post_flags
             ev['quality_flags'] = ",".join(sorted(set(merged)))
             ev.pop('_row_flags', None)
+            # Event-level log: name, date, venue, confidence, flags — visible
+            # in run_*.log for every event from every tier.
+            ev_name  = ev.get('event_name', '?')
+            ev_date  = ev.get('date', '?')
+            ev_venue = ev.get('venue', '')
+            ev_conf  = ev.get('confidence', '')
+            ev_flags = ev['quality_flags'] if ev['quality_flags'] else 'none'
+            venue_str = f"\n      • Venue: {ev_venue}" if ev_venue else ''
+            conf_str  = f"\n      • Confidence: {ev_conf}" if ev_conf != '' else ''
+            wprint(f"    ✦ [{tier_name}] {ev_name!r} | {ev_date}{venue_str}{conf_str}\n      • Flags: {ev_flags}")
 
         return enriched, is_calendar, has_ocr, list(all_flags)
 
@@ -1219,7 +1231,7 @@ class InstagramEventPipeline:
 
         has_caption = bool((post.get('caption') or '').strip())
         if not has_caption:
-            print(f"  ↳ no caption — starting at flash_image (skipping Tier 1)")
+            wprint(f"  ↳ no caption — starting at flash_image (skipping Tier 1)")
             current_tier = ec_TIER_FLASH_IMAGE
         else:
             current_tier = ec_TIER_FLASH_CAPTION
@@ -1252,14 +1264,14 @@ class InstagramEventPipeline:
                     reason_parts.append(f"flags={esc_flags}")
                 if zero_event_escalate:
                     reason_parts.append("zero_events")
-                print(f"  ↳ escalating to {nt}  ({', '.join(reason_parts)})")
+                wprint(f"  ↳ escalating to {nt}  ({', '.join(reason_parts)})")
                 current_tier = nt
                 continue
 
             # Final tier reached. Surface informational flags so user sees auto-fixes.
             informational = sorted(f for f in set(flags) if f not in ec_ESCALATION_FLAGS)
             if informational:
-                print(f"  ↳ informational flags: {informational}")
+                wprint(f"  ↳ informational flags: {informational}")
             final_events = events
             final_is_calendar = is_calendar
             final_has_ocr = has_ocr
@@ -1276,237 +1288,240 @@ class InstagramEventPipeline:
         return final_events, current_tier, final_has_ocr, final_is_calendar
 
     def process_post(self, post, post_num, total):
-        pid = post.get('id') or post.get('shortCode')
+        post_id = (post.get('id', '') or post.get('shortCode', '') or
+                   post.get('shortcode', '') or f'post_{post_num}')
+        with log_post_context(post_id):
+            pid = post.get('id') or post.get('shortCode')
 
-        # Apify shell-record check: when an account returns no posts (private,
-        # suspended, deleted, typo'd handle, or zero-recent-posts), Apify
-        # returns a placeholder entry with no id, no shortCode, no caption,
-        # and no owner. The 'url' field points at the profile URL itself.
-        # Previously we'd fabricate a pseudo-ID like f'post_{post_num}' and
-        # process the empty post anyway, polluting Processed_Log with
-        # post_NNN rows that can never collide with real Instagram IDs.
-        # Now we skip these at the entry and track which accounts are dead
-        # so the operator can clean up their accounts list. See ADR 0008.
-        if not pid:
-            self._note_apify_shell_record(post, post_num)
-            return None
-
-        # Atomic check-and-claim: add pid to the dedup set inside the same
-        # lock block as the existence check. Without this, two concurrent
-        # threads with the same pid (e.g. from a duplicated source list) can
-        # both pass the check before either thread reaches the
-        # results.extend / post_results write 10-30 seconds later, producing
-        # duplicate event rows in All_Events. See ADR 0006.
-        with self.lock:
-            if pid in self.processed_posts:
-                self.stats['skipped_history'] += 1
-                print(f"  [{post_num}/{total}] @{post.get('ownerUsername', '')} | {pid} - Already processed, skipping")
+            # Apify shell-record check: when an account returns no posts (private,
+            # suspended, deleted, typo'd handle, or zero-recent-posts), Apify
+            # returns a placeholder entry with no id, no shortCode, no caption,
+            # and no owner. The 'url' field points at the profile URL itself.
+            # Previously we'd fabricate a pseudo-ID like f'post_{post_num}' and
+            # process the empty post anyway, polluting Processed_Log with
+            # post_NNN rows that can never collide with real Instagram IDs.
+            # Now we skip these at the entry and track which accounts are dead
+            # so the operator can clean up their accounts list. See ADR 0008.
+            if not pid:
+                self._note_apify_shell_record(post, post_num)
                 return None
-            self.processed_posts.add(pid)
 
-        caption = post.get('caption', '') or post.get('text', '')
-        user = post.get('ownerUsername', '')
-        owner_full_name = post.get('ownerFullName', '')
-        shortcode = post.get('shortCode', '') or post.get('shortcode', '')
-        display_url = post.get('displayUrl', '') or post.get('display_url', '')
-        location_name = post.get('locationName', '') or post.get('location', '')
-
-        timestamp_val = post.get('timestamp', '')
-        try:
-            if timestamp_val:
-                if isinstance(timestamp_val, (int, float)):
-                    post_date = datetime.fromtimestamp(timestamp_val)
-                else:
-                    post_date = datetime.fromisoformat(str(timestamp_val).replace('Z', '+00:00'))
-            else:
-                post_date = datetime.now(EAST_TZ)
-        except Exception:
-            post_date = datetime.now(EAST_TZ)
-        post_date_str = post_date.strftime('%Y-%m-%d')
-
-        print(f"\n[{post_num}/{total}] Processing post: {pid}")
-        print(f"  ↳ Account: @{user} ({owner_full_name})")
-
-        if not caption and not display_url:
-            print(f"  ⚠ No caption or image URL - skipping")
-            self._record_post_outcome(pid, 'no_events_found', user, post_date_str,
-                                      error='no_caption_or_image_url')
+            # Atomic check-and-claim: add pid to the dedup set inside the same
+            # lock block as the existence check. Without this, two concurrent
+            # threads with the same pid (e.g. from a duplicated source list) can
+            # both pass the check before either thread reaches the
+            # results.extend / post_results write 10-30 seconds later, producing
+            # duplicate event rows in All_Events. See ADR 0006.
             with self.lock:
-                self.stats['processed'] += 1
-                self.stats['skipped_no_data'] += 1
-            return None
+                if pid in self.processed_posts:
+                    self.stats['skipped_history'] += 1
+                    wprint(f"  [{post_num}/{total}] @{post.get('ownerUsername', '')} | {pid} - Already processed, skipping")
+                    return None
+                self.processed_posts.add(pid)
 
-        has_caption = bool(caption)
-        has_location = bool(location_name)
-        has_image = bool(display_url)
+            caption = post.get('caption', '') or post.get('text', '')
+            user = post.get('ownerUsername', '')
+            owner_full_name = post.get('ownerFullName', '')
+            shortcode = post.get('shortCode', '') or post.get('shortcode', '')
+            display_url = post.get('displayUrl', '') or post.get('display_url', '')
+            location_name = post.get('locationName', '') or post.get('location', '')
 
-        ocr_text = ""
-        if self.vision_enabled:
-            all_urls = self.collect_carousel_urls(post)
-            if all_urls:
-                num_slides = len(all_urls)
-                if num_slides > 1:
-                    print(f"  📸 CAROUSEL: {num_slides} slides detected — OCR'ing all")
+            timestamp_val = post.get('timestamp', '')
+            try:
+                if timestamp_val:
+                    if isinstance(timestamp_val, (int, float)):
+                        post_date = datetime.fromtimestamp(timestamp_val)
+                    else:
+                        post_date = datetime.fromisoformat(str(timestamp_val).replace('Z', '+00:00'))
                 else:
-                    print(f"  ↳ Found image URL")
-                if num_slides > 1:
-                    with self.lock:
-                        self.stats['carousel_posts'] += 1
-                slide_texts = []
-                for idx, url in enumerate(all_urls, 1):
-                    if num_slides > 1:
-                        print(f"    ─── Slide {idx}/{num_slides} ───")
-                    text = self.extract_ocr_text(url, f"{pid}_s{idx}")
-                    with self.lock:
-                        self.stats['total_slides_ocrd'] += 1
-                    if text:
-                        with self.lock:
-                            self.stats['slides_with_text'] += 1
-                        if num_slides > 1:
-                            slide_texts.append(f"[SLIDE {idx} of {num_slides}]\n{text}")
-                        else:
-                            slide_texts.append(text)
-                ocr_text = "\n\n".join(slide_texts)
-                if num_slides > 1:
-                    print(f"  ✓ Carousel OCR complete: {len(slide_texts)}/{num_slides} slides had text")
-            else:
-                print(f"  ⚠ No image URL found - relying on text fields")
-        else:
-            print(f"  ⚠ Vision API disabled - relying on text fields only")
+                    post_date = datetime.now(EAST_TZ)
+            except Exception:
+                post_date = datetime.now(EAST_TZ)
+            post_date_str = post_date.strftime('%Y-%m-%d')
 
-        has_ocr = bool(ocr_text)
-        ocr_attempted_and_failed = self.vision_enabled and has_image and not has_ocr
-        print(f"  ↳ Data available: caption={has_caption}, location={has_location}, image={has_image}, OCR={has_ocr}")
+            wprint(f"\n[{post_num}/{total}] Processing post: {pid}")
+            wprint(f"  ↳ Account: @{user} ({owner_full_name})")
 
-        all_text = (caption + ' ' + ocr_text).lower()
-        calendar_keywords = ['calendar', 'schedule', 'lineup', 'weekly', 'monthly',
-                           'monday', 'tuesday', 'wednesday', 'thursday', 'friday',
-                           'saturday', 'sunday', 'every', 'recurring']
-        might_be_calendar = any(keyword in all_text for keyword in calendar_keywords)
-        if might_be_calendar:
-            print(f"  📅 Possible calendar/multi-event post detected")
-
-        time.sleep(self.rate_limit_delay)
-
-        print(f"  ↳ Analyzing with Gemini AI...")
-
-        # ─────────────────────────────────────────────────────────────
-        # PR I — TIER LADDER EXTRACTION.
-        # Replaces the single-shot Gemini call with the 4-tier ladder
-        # (Flash-Lite caption → Flash-Lite image → Flash-Lite + OCR →
-        # Pro multimodal). _process_with_tier_ladder handles prompt
-        # construction, Gemini calls, enrichment, sanity checks, and
-        # escalation decisions — see method docstring for the loop
-        # invariants. Returns processed events with quality_flags
-        # already merged, plus the winning tier name + is_calendar.
-        #
-        # When self.tier_escalation_enabled is False (config opt-out),
-        # we cap the ladder at TIER_FLASH_TEXT so the user's preferred
-        # single model (still bound to self.gemini_flash_lite from
-        # __init__) gets used without spilling into Pro.
-        # ─────────────────────────────────────────────────────────────
-        slides_with_text = ocr_text.count('[SLIDE ') if '[SLIDE ' in ocr_text else (1 if ocr_text else 0)
-        slide_count = len(self.collect_carousel_urls(post))
-        max_tier = ec_TIER_PRO_IMAGE if self.tier_escalation_enabled else ec_TIER_FLASH_TEXT
-        clean_json = ''  # legacy sentinel — kept for error-recording sites that reference it
-
-        try:
-            processed_events, tier_used, has_ocr_used, is_calendar = self._process_with_tier_ladder(
-                post, post_date, ocr_text,
-                slide_count=slide_count,
-                slides_with_text=slides_with_text,
-                max_tier=max_tier,
-            )
-
-            if not processed_events:
-                print(f"  ↳ No events found in this post (tier={tier_used})")
-                result_tag = 'ocr_failed' if ocr_attempted_and_failed else 'no_events_found'
-                reason = ('tier_ladder_no_events_after_failed_ocr' if ocr_attempted_and_failed
-                          else 'tier_ladder_returned_no_events')
-                self._record_post_outcome(pid, result_tag, user, post_date_str,
-                                          caption=caption, ocr_text=ocr_text,
-                                          error=reason)
+            if not caption and not display_url:
+                wprint(f"  ⚠ No caption or image URL - skipping")
+                self._record_post_outcome(pid, 'no_events_found', user, post_date_str,
+                                          error='no_caption_or_image_url')
                 with self.lock:
                     self.stats['processed'] += 1
-                    self.stats['posts_no_events'] += 1
+                    self.stats['skipped_no_data'] += 1
                 return None
 
-            _result_tag = 'events_found' if processed_events else 'no_events_found'
-            # ─────────────────────────────────────────────────────────────
-            # PR A — atomic outcome record + results.extend.
-            # Previously these were in two separate lock acquisitions, and
-            # a periodic flush firing between them could snapshot
-            # post_results WITHOUT the matching events in self.results,
-            # creating an orphan (post marked done in Processed_Log but
-            # no events in All_Events). Combined here under one lock so
-            # flushes always see either both-present or both-absent for
-            # a given pid.
-            # ─────────────────────────────────────────────────────────────
-            with self.lock:
-                if processed_events:
-                    self._record_post_outcome_locked(pid, _result_tag, user, post_date_str)
-                else:
-                    self._record_post_outcome_locked(pid, _result_tag, user, post_date_str,
-                                                      caption=caption, ocr_text=ocr_text,
-                                                      gemini_raw=clean_json,
-                                                      error='gemini_returned_events_but_all_filtered')
-                self.stats['processed'] += 1
-                if processed_events:
-                    self.stats['posts_with_events'] += 1
-                    self.stats['events_found'] += len(processed_events)
-                    self.results.extend(processed_events)
-                    if len(processed_events) > 1:
-                        self.stats['multi_event_posts'] += 1
-                    self.stats['max_events_in_post'] = max(
-                        self.stats['max_events_in_post'], len(processed_events)
-                    )
-                    if is_calendar:
-                        self.stats['calendar_posts'] += 1
+            has_caption = bool(caption)
+            has_location = bool(location_name)
+            has_image = bool(display_url)
 
-                    if self.stats['events_found'] % 500 == 0:
-                        self.save_checkpoint()
-                        print(f"  ↳ Checkpoint saved ({self.stats['events_found']} total events)")
+            ocr_text = ""
+            if self.vision_enabled:
+                all_urls = self.collect_carousel_urls(post)
+                if all_urls:
+                    num_slides = len(all_urls)
+                    if num_slides > 1:
+                        wprint(f"  📸 CAROUSEL: {num_slides} slides detected — OCR'ing all")
+                    else:
+                        wprint(f"  ↳ Found image URL")
+                    if num_slides > 1:
+                        with self.lock:
+                            self.stats['carousel_posts'] += 1
+                    slide_texts = []
+                    for idx, url in enumerate(all_urls, 1):
+                        if num_slides > 1:
+                            wprint(f"    ─── Slide {idx}/{num_slides} ───")
+                        text = self.extract_ocr_text(url, f"{pid}_s{idx}")
+                        with self.lock:
+                            self.stats['total_slides_ocrd'] += 1
+                        if text:
+                            with self.lock:
+                                self.stats['slides_with_text'] += 1
+                            if num_slides > 1:
+                                slide_texts.append(f"[SLIDE {idx} of {num_slides}]\n{text}")
+                            else:
+                                slide_texts.append(text)
+                    ocr_text = "\n\n".join(slide_texts)
+                    if num_slides > 1:
+                        wprint(f"  ✓ Carousel OCR complete: {len(slide_texts)}/{num_slides} slides had text")
                 else:
-                    self.stats['posts_no_events'] += 1
-
-            if processed_events:
-                if len(processed_events) > 1:
-                    print(f"  🎉 MULTIPLE EVENTS FOUND: {len(processed_events)} events extracted!")
-                    for idx, event in enumerate(processed_events, 1):
-                        recurring_tag = " ♻ recurring" if event.get('is_recurring') else ""
-                        print(f"    {idx}. {event.get('event_name', 'Unnamed')}{recurring_tag}")
-                        if event.get('date'):
-                            print(f"       Date: {event['date']}")
-                        if event.get('venue_name'):
-                            print(f"       Venue: {event['venue_name']}")
-                        print(f"       Confidence: {event.get('confidence', 'unknown')}")
-                else:
-                    event = processed_events[0]
-                    recurring_tag = " ♻ recurring" if event.get('is_recurring') else ""
-                    print(f"  ✓ EVENT FOUND: {event.get('event_name', 'Unnamed')}{recurring_tag}")
-                    print(f"    • Date: {event.get('date', 'N/A')}")
-                    print(f"    • Venue: {event.get('venue_name', 'N/A')}")
-                    print(f"    • Confidence: {event.get('confidence', 'unknown')}")
+                    wprint(f"  ⚠ No image URL found - relying on text fields")
             else:
-                print(f"  ↳ No valid events in this post")
+                wprint(f"  ⚠ Vision API disabled - relying on text fields only")
 
-            return processed_events
+            has_ocr = bool(ocr_text)
+            ocr_attempted_and_failed = self.vision_enabled and has_image and not has_ocr
+            wprint(f"  ↳ Data available: caption={has_caption}, location={has_location}, image={has_image}, OCR={has_ocr}")
 
-        except Exception as e:
-            error_str = str(e)
-            print(f"  ✗ Gemini error: {error_str[:200]}")
-            tb = traceback.format_exc()
-            self._record_post_outcome(pid, 'gemini_error', user, post_date_str,
-                                      caption=caption, ocr_text=ocr_text,
-                                      error=f'unhandled_exception: {error_str[:200]} | {tb.splitlines()[-1] if tb else ""}')
-            with self.lock:
-                self.stats['gemini_errors'] += 1
-                self.stats['processed'] += 1
-            if '429' in error_str:
+            all_text = (caption + ' ' + ocr_text).lower()
+            calendar_keywords = ['calendar', 'schedule', 'lineup', 'weekly', 'monthly',
+                               'monday', 'tuesday', 'wednesday', 'thursday', 'friday',
+                               'saturday', 'sunday', 'every', 'recurring']
+            might_be_calendar = any(keyword in all_text for keyword in calendar_keywords)
+            if might_be_calendar:
+                wprint(f"  📅 Possible calendar/multi-event post detected")
+
+            time.sleep(self.rate_limit_delay)
+
+            wprint(f"  ↳ Analyzing with Gemini AI...")
+
+            # ─────────────────────────────────────────────────────────────
+            # PR I — TIER LADDER EXTRACTION.
+            # Replaces the single-shot Gemini call with the 4-tier ladder
+            # (Flash-Lite caption → Flash-Lite image → Flash-Lite + OCR →
+            # Pro multimodal). _process_with_tier_ladder handles prompt
+            # construction, Gemini calls, enrichment, sanity checks, and
+            # escalation decisions — see method docstring for the loop
+            # invariants. Returns processed events with quality_flags
+            # already merged, plus the winning tier name + is_calendar.
+            #
+            # When self.tier_escalation_enabled is False (config opt-out),
+            # we cap the ladder at TIER_FLASH_TEXT so the user's preferred
+            # single model (still bound to self.gemini_flash_lite from
+            # __init__) gets used without spilling into Pro.
+            # ─────────────────────────────────────────────────────────────
+            slides_with_text = ocr_text.count('[SLIDE ') if '[SLIDE ' in ocr_text else (1 if ocr_text else 0)
+            slide_count = len(self.collect_carousel_urls(post))
+            max_tier = ec_TIER_PRO_IMAGE if self.tier_escalation_enabled else ec_TIER_FLASH_TEXT
+            clean_json = ''  # legacy sentinel — kept for error-recording sites that reference it
+
+            try:
+                processed_events, tier_used, has_ocr_used, is_calendar = self._process_with_tier_ladder(
+                    post, post_date, ocr_text,
+                    slide_count=slide_count,
+                    slides_with_text=slides_with_text,
+                    max_tier=max_tier,
+                )
+
+                if not processed_events:
+                    wprint(f"  ↳ No events found in this post (tier={tier_used})")
+                    result_tag = 'ocr_failed' if ocr_attempted_and_failed else 'no_events_found'
+                    reason = ('tier_ladder_no_events_after_failed_ocr' if ocr_attempted_and_failed
+                              else 'tier_ladder_returned_no_events')
+                    self._record_post_outcome(pid, result_tag, user, post_date_str,
+                                              caption=caption, ocr_text=ocr_text,
+                                              error=reason)
+                    with self.lock:
+                        self.stats['processed'] += 1
+                        self.stats['posts_no_events'] += 1
+                    return None
+
+                _result_tag = 'events_found' if processed_events else 'no_events_found'
+                # ─────────────────────────────────────────────────────────────
+                # PR A — atomic outcome record + results.extend.
+                # Previously these were in two separate lock acquisitions, and
+                # a periodic flush firing between them could snapshot
+                # post_results WITHOUT the matching events in self.results,
+                # creating an orphan (post marked done in Processed_Log but
+                # no events in All_Events). Combined here under one lock so
+                # flushes always see either both-present or both-absent for
+                # a given pid.
+                # ─────────────────────────────────────────────────────────────
                 with self.lock:
-                    self.rate_limit_delay = min(self.rate_limit_delay * 1.5, 5.0)
-                print(f"  ⚠ Rate limited - delay increased to {self.rate_limit_delay:.1f}s")
-            return None
+                    if processed_events:
+                        self._record_post_outcome_locked(pid, _result_tag, user, post_date_str)
+                    else:
+                        self._record_post_outcome_locked(pid, _result_tag, user, post_date_str,
+                                                          caption=caption, ocr_text=ocr_text,
+                                                          gemini_raw=clean_json,
+                                                          error='gemini_returned_events_but_all_filtered')
+                    self.stats['processed'] += 1
+                    if processed_events:
+                        self.stats['posts_with_events'] += 1
+                        self.stats['events_found'] += len(processed_events)
+                        self.results.extend(processed_events)
+                        if len(processed_events) > 1:
+                            self.stats['multi_event_posts'] += 1
+                        self.stats['max_events_in_post'] = max(
+                            self.stats['max_events_in_post'], len(processed_events)
+                        )
+                        if is_calendar:
+                            self.stats['calendar_posts'] += 1
+
+                        if self.stats['events_found'] % 500 == 0:
+                            self.save_checkpoint()
+                            wprint(f"  ↳ Checkpoint saved ({self.stats['events_found']} total events)")
+                    else:
+                        self.stats['posts_no_events'] += 1
+
+                if processed_events:
+                    if len(processed_events) > 1:
+                        wprint(f"  🎉 MULTIPLE EVENTS FOUND: {len(processed_events)} events extracted!")
+                        for idx, event in enumerate(processed_events, 1):
+                            recurring_tag = " ♻ recurring" if event.get('is_recurring') else ""
+                            wprint(f"    {idx}. {event.get('event_name', 'Unnamed')}{recurring_tag}")
+                            if event.get('date'):
+                                wprint(f"       Date: {event['date']}")
+                            if event.get('venue_name'):
+                                wprint(f"       Venue: {event['venue_name']}")
+                            wprint(f"       Confidence: {event.get('confidence', 'unknown')}")
+                    else:
+                        event = processed_events[0]
+                        recurring_tag = " ♻ recurring" if event.get('is_recurring') else ""
+                        wprint(f"  ✓ EVENT FOUND: {event.get('event_name', 'Unnamed')}{recurring_tag}")
+                        wprint(f"    • Date: {event.get('date', 'N/A')}")
+                        wprint(f"    • Venue: {event.get('venue_name', 'N/A')}")
+                        wprint(f"    • Confidence: {event.get('confidence', 'unknown')}")
+                else:
+                    wprint(f"  ↳ No valid events in this post")
+
+                return processed_events
+
+            except Exception as e:
+                error_str = str(e)
+                wprint(f"  ✗ Gemini error: {error_str[:200]}")
+                tb = traceback.format_exc()
+                self._record_post_outcome(pid, 'gemini_error', user, post_date_str,
+                                          caption=caption, ocr_text=ocr_text,
+                                          error=f'unhandled_exception: {error_str[:200]} | {tb.splitlines()[-1] if tb else ""}')
+                with self.lock:
+                    self.stats['gemini_errors'] += 1
+                    self.stats['processed'] += 1
+                if '429' in error_str:
+                    with self.lock:
+                        self.rate_limit_delay = min(self.rate_limit_delay * 1.5, 5.0)
+                    wprint(f"  ⚠ Rate limited - delay increased to {self.rate_limit_delay:.1f}s")
+                return None
 
     def save_checkpoint(self):
         try:
