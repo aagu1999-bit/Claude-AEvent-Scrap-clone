@@ -52,7 +52,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 # We derive a per-file "format" label by checking whether ANY post in the
 # file had has_event_level == True.
 from repair_flags_from_log import (
-    parse_log, normalize_date_for_key,
+    parse_log, normalize_date_for_key, detect_log_format,
     SERVICE_ACCOUNT_FILE, SHEET_NAME, ALL_EVENTS_TAB,
 )
 
@@ -137,7 +137,7 @@ def main():
     # (cheaper + more accurate than a separate format-sniff pass).
     parsed_by_path = {lp: parse_log(lp) for lp in log_paths}
     for lp in log_paths:
-        fmt = detect_log_format_from_records(parsed_by_path[lp])
+        fmt = detect_log_format(lp)
         marker = '✓' if fmt == 'new' else '⚠'
         print(f"    {marker} [{fmt:3s}] {lp.name}")
     print()
