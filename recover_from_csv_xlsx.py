@@ -13,24 +13,31 @@ By default skips events that match prior purge_events_by_date.py decisions
 
 RECOVERY MODES
 ──────────────
-The tool supports two strategies for deciding what counts as "missing":
+The tool supports three strategies for deciding what counts as "missing",
+ordered from tightest to broadest:
+
+  --strict
+    Only post_ids absent from BOTH All_Events AND Processed_Log. The
+    unambiguous crashed-before-claim cases: pipeline extracted events
+    and wrote them to CSV, then died before either Processed_Log claim
+    or All_Events write. Safest possible recovery — these post_ids are
+    completely unknown to the system, so nothing they touch can conflict
+    with existing state.
 
   --conservative  (DEFAULT)
-    Recover events for post_ids that have ZERO rows in All_Events.
-    Catches the unambiguous case: pipeline marked post_id `events_found`
-    in Processed_Log (or crashed before claim) but no rows appear in
-    All_Events. Same methodology as the "339 missing posts" gap analysis.
-    Safer because if a post has even one row in the sheet, we trust the
-    write and don't add more events under that post_id — eliminating the
-    risk of duplicating events that exist under near-matching names.
+    Only post_ids with ZERO rows in All_Events. Superset of strict —
+    also catches posts that ARE in Processed_Log (claimed events_found
+    but never wrote rows). No risk of duplicating events under near-
+    matching names because we don't touch any post that already has
+    rows in the sheet.
 
   --aggressive
-    Recover any event whose canonical key (POST ID, EVENT NAME, DATE) is
-    absent from All_Events. Catches partial-write recoveries (post had
-    some events written but others lost) AND legitimate gaps. BUT can
-    also duplicate events that exist in the sheet under slightly
-    different EVENT NAMES (tier-escalation drift, venue enrichment) or
-    DATE formats. Use after spot-checking the dry-run.
+    Any event whose canonical key (POST ID, EVENT NAME, DATE) is absent
+    from All_Events. Catches partial-write recoveries (post had some
+    events written but others lost) but may also duplicate events that
+    exist in the sheet under slightly different EVENT NAMES (tier-
+    escalation drift, venue enrichment) or DATE formats. Use after
+    spot-checking the dry-run.
 
 KEY DESIGN CHOICES
 ──────────────────
@@ -51,8 +58,11 @@ USAGE
   # dry-run, conservative mode (default — safer)
   python3 recover_from_csv_xlsx.py
 
-  # dry-run, aggressive mode — see how many more events the key-based
-  # check would catch (includes false positives from key drift)
+  # dry-run, strict — tightest filter, crashed-before-claim posts only
+  python3 recover_from_csv_xlsx.py --strict
+
+  # dry-run, aggressive — broadest, includes partial-write recoveries
+  # (but may also include false positives from name/date drift)
   python3 recover_from_csv_xlsx.py --aggressive
 
   # only files since a date (e.g., skip pre-May archive)
@@ -189,11 +199,17 @@ def write_sidecar_md(csv_path, sidecar_data):
     d = sidecar_data
     rmode = d.get('recovery_mode', 'aggressive')
     mode_blurb = {
+        'strict': (
+            "Only post_ids absent from BOTH All_Events AND Processed_Log. "
+            "Tightest filter — unambiguous crashed-before-claim cases where "
+            "the pipeline never recorded the post anywhere. No risk of "
+            "conflicting with existing dedup state."
+        ),
         'conservative': (
-            "Only post_ids with ZERO rows in All_Events. Safer — no risk of "
-            "duplicating events that exist in the sheet under a slightly "
-            "different name or date format. Will miss partial-write recoveries "
-            "(post had some events written but others lost)."
+            "Only post_ids with ZERO rows in All_Events. Safer than aggressive "
+            "— no risk of duplicating events that exist in the sheet under a "
+            "slightly different name or date format. Will miss partial-write "
+            "recoveries (post had some events written but others lost)."
         ),
         'aggressive': (
             "Any event whose canonical key isn't in All_Events. Catches "
@@ -235,7 +251,9 @@ def write_sidecar_md(csv_path, sidecar_data):
         f"- Skipped (already represented in sheet): **{d['skipped_in_sheet']:,}**",
         f"- Skipped (purged): **{d['skipped_purged']:,}**",
         f"- **Recoverable ({rmode}): {d['recoverable']:,}**",
-        f"- For comparison, `--{d['other_mode']}` would catch **{d['other_n']:,}** events",
+        f"- Mode comparison: `--strict` {d['strict_n']:,} | "
+        f"`--conservative` {d['conservative_n']:,} | "
+        f"`--aggressive` {d['aggressive_n']:,}",
         f"- New post_ids for Processed_Log: **{d['new_to_pl']:,}**",
         "",
         "## What to do with this file",
@@ -266,17 +284,24 @@ def write_sidecar_md(csv_path, sidecar_data):
             f"- ⚠ **{d['recoverable']:,} aggressive candidates is high.** In aggressive "
             "mode, many of these are likely key-mismatched (event IS in the sheet under "
             "a slightly different EVENT NAME or DATE) rather than truly missing. "
-            f"Compare against the `--conservative` count ({d['other_n']:,}) — that's "
-            "the set of post_ids fully absent from the sheet and is the safer number "
-            "to act on first."
+            f"Compare against `--conservative` ({d['conservative_n']:,}) or `--strict` "
+            f"({d['strict_n']:,}) — these progressively tighter filters are safer to "
+            "act on first."
         )
-    elif rmode == 'conservative' and d['other_n'] > d['recoverable'] * 5:
+    elif rmode == 'conservative' and d['conservative_n'] - d['strict_n'] > 500:
         lines.append(
-            f"- The aggressive mode would catch **{d['other_n']:,}** events vs. this "
-            f"conservative count of **{d['recoverable']:,}**. The difference is events "
-            "whose post_id IS in the sheet but with a key mismatch — could be "
-            "partial-write recoveries OR name/date drift. If you want those, re-run "
-            "with `--aggressive` and spot-check before applying."
+            f"- This conservative run includes **{d['conservative_n'] - d['strict_n']:,}** "
+            "events from post_ids that ARE in Processed_Log (claimed but no rows in "
+            f"All_Events). Run `--strict` ({d['strict_n']:,} events) if you want only "
+            "the cleanest crashed-before-claim subset."
+        )
+    elif rmode == 'strict':
+        lines.append(
+            "- Strict mode = only post_ids the pipeline never recorded anywhere "
+            "(absent from both All_Events and Processed_Log). Safest possible "
+            "recovery — no chance of conflicting with prior writes. Conservative "
+            f"would catch {d['conservative_n']:,} additional events from posts that "
+            "ARE in Processed_Log but missing from All_Events."
         )
     if d['recoverable'] > 0 and d['recoverable'] < 50:
         lines.append(
@@ -324,11 +349,17 @@ def main():
 
     mode_group = ap.add_mutually_exclusive_group()
     mode_group.add_argument(
+        "--strict", action="store_const", dest="mode", const="strict",
+        help="Tightest filter. Only post_ids absent from BOTH All_Events AND "
+             "Processed_Log. These are the unambiguous crashed-before-claim "
+             "cases — pipeline never recorded the post anywhere, so adding "
+             "them can't conflict with existing dedup state.")
+    mode_group.add_argument(
         "--conservative", action="store_const", dest="mode", const="conservative",
         help="(Default) Only recover events for post_ids with ZERO rows in "
-             "All_Events. Safer — no risk of duplicating events under near-"
-             "matching names. May miss partial-write recoveries (post had "
-             "some events written but others lost).")
+             "All_Events. Includes posts in Processed_Log that didn't write "
+             "to All_Events. Safer than aggressive — no risk of duplicating "
+             "events under near-matching names.")
     mode_group.add_argument(
         "--aggressive", action="store_const", dest="mode", const="aggressive",
         help="Recover any event whose canonical key (POST ID, EVENT NAME, "
@@ -448,7 +479,8 @@ def main():
     candidates = []   # [(key, mtime, row_dict, source_file)]
     skipped_in_sheet = 0
     skipped_purged = 0
-    # Track both modes' counts so we can show users what the other would catch.
+    # Track all three modes' counts so we can show users what each would catch.
+    strict_n = 0
     conservative_n = 0
     aggressive_n = 0
     # Sort by mtime DESC so the newest events are processed first
@@ -457,17 +489,26 @@ def main():
         by_key.items(), key=lambda kv: kv[1][0], reverse=True
     ):
         post_id = key[0]
-        is_aggr_candidate = key not in sheet_keys and key not in purged
-        is_cons_candidate = post_id not in sheet_post_ids and key not in purged
+        not_purged = key not in purged
+        is_aggr_candidate = key not in sheet_keys and not_purged
+        is_cons_candidate = post_id not in sheet_post_ids and not_purged
+        is_strict_candidate = (post_id not in sheet_post_ids
+                               and post_id not in pl_post_ids
+                               and not_purged)
         if is_aggr_candidate:
             aggressive_n += 1
         if is_cons_candidate:
             conservative_n += 1
+        if is_strict_candidate:
+            strict_n += 1
 
         # Pick the active-mode candidate
-        if args.mode == "conservative":
+        if args.mode == "strict":
+            in_filter = (post_id in sheet_post_ids
+                         or post_id in pl_post_ids)
+        elif args.mode == "conservative":
             in_filter = post_id in sheet_post_ids
-        else:
+        else:  # aggressive
             in_filter = key in sheet_keys
 
         if in_filter:
@@ -483,17 +524,17 @@ def main():
 
     candidate_post_ids = {k[0] for k, _, _, _ in candidates}
     new_to_pl = candidate_post_ids - pl_post_ids
-    other_mode = "aggressive" if args.mode == "conservative" else "conservative"
-    other_n = aggressive_n if args.mode == "conservative" else conservative_n
 
     print(f"━━━ DELTA ━━━")
     print(f"  Archive unique events:        {len(by_key):>7,}")
-    print(f"  Skipped ({'post_id in sheet' if args.mode == 'conservative' else 'key in sheet'}): "
-          f"{skipped_in_sheet:>7,}")
+    print(f"  Skipped (filtered by mode):   {skipped_in_sheet:>7,}")
     print(f"  Skipped (purged):             {skipped_purged:>7,}")
     print(f"  → Recoverable events:         {len(candidates):>7,}  ({args.mode} mode)")
     print(f"  → New post_ids for {PROCESSED_LOG_TAB}: {len(new_to_pl):>7,}")
-    print(f"  (For comparison, --{other_mode} would catch {other_n:,} events)")
+    print(f"  Mode comparison: "
+          f"strict={strict_n:,} | "
+          f"conservative={conservative_n:,} | "
+          f"aggressive={aggressive_n:,}")
     print()
 
     # ── DRY-RUN / APPLIED CSV ─────────────────────────────────────────
@@ -514,22 +555,24 @@ def main():
     print(f"  CSV written: {out_csv}")
 
     # Sidecar .md (project convention; see OUTPUTS.md)
-    cons_or_aggr = (
-        "post_id NOT in All_Events" if args.mode == 'conservative'
-        else "canonical key (POST ID, EVENT NAME, DATE) NOT in All_Events"
-    )
+    filter_desc = {
+        'strict': "post_id NOT in All_Events AND NOT in Processed_Log",
+        'conservative': "post_id NOT in All_Events",
+        'aggressive': "canonical key (POST ID, EVENT NAME, DATE) NOT in All_Events",
+    }[args.mode]
     sidecar_data = {
         'generated_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         'mode': 'applied' if args.apply else 'dry-run',
         'recovery_mode': args.mode,
-        'other_mode': other_mode,
-        'other_n': other_n,
+        'strict_n': strict_n,
+        'conservative_n': conservative_n,
+        'aggressive_n': aggressive_n,
         'command': 'python3 ' + ' '.join(sys.argv),
         'contents_description': (
             f"{len(candidates):,} candidate rows (recovery_mode={args.mode}) "
             f"— events from outputs/Events_*.csv|xlsx "
             f"({'since ' + args.since if args.since else 'all dates'}) "
-            f"where {cons_or_aggr}, not in prior purge audit."
+            f"where {filter_desc}, not in prior purge audit."
             + (f" Capped at --max-events {args.max_events}."
                if args.max_events else "")
         ),
