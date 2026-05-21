@@ -47,11 +47,20 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 # Reuse the parser + helpers from repair_flags_from_log so log handling
-# stays identical (auto-detects new vs old format, etc.).
+# stays identical. parse_log() returns records with `has_event_level: bool`
+# per post — True if any per-event `• Flags:` line was seen for that post.
+# We derive a per-file "format" label by checking whether ANY post in the
+# file had has_event_level == True.
 from repair_flags_from_log import (
-    parse_log, detect_log_format, normalize_date_for_key,
+    parse_log, normalize_date_for_key,
     SERVICE_ACCOUNT_FILE, SHEET_NAME, ALL_EVENTS_TAB,
 )
+
+
+def detect_log_format_from_records(records):
+    """Return 'new' if any parsed record has per-event flags; else 'old'.
+    Cheap one-liner — avoids a second pass over the raw log file."""
+    return 'new' if any(r.get('has_event_level') for r in records) else 'old'
 
 PROCESSED_LOG_TAB = "Processed_Log"
 
@@ -122,24 +131,28 @@ def main():
         sys.exit(1)
 
     print(f"━━━ audit_log_vs_sheet.py ━━━")
-    print(f"  Logs ({len(log_paths)}):")
+    print(f"  Logs ({len(log_paths)}):  (format detected from parsed records)")
+
+    # Parse first so we can label each file by what's actually inside it
+    # (cheaper + more accurate than a separate format-sniff pass).
+    parsed_by_path = {lp: parse_log(lp) for lp in log_paths}
     for lp in log_paths:
-        fmt = detect_log_format(lp)
+        fmt = detect_log_format_from_records(parsed_by_path[lp])
         marker = '✓' if fmt == 'new' else '⚠'
         print(f"    {marker} [{fmt:3s}] {lp.name}")
     print()
 
     # ── COLLECT FROM LOGS ─────────────────────────────────────────────
-    print("  Parsing logs...")
+    print("  Aggregating log content...")
     log_post_ids = set()         # every post_id seen in any log (Processing lines)
     log_event_keys = set()       # (post_id, event_name_upper, date_iso) for events emitted
     sample_event_by_key = {}     # for CSV sampling
 
-    for lp in log_paths:
+    for lp, records in parsed_by_path.items():
         # All post_ids (incl. ones with no events)
         log_post_ids |= collect_post_ids_from_log(lp)
         # Events parsed by the format-aware parser
-        for rec in parse_log(lp):
+        for rec in records:
             for e in rec['events']:
                 name_upper = e['name'].strip().upper()
                 date_iso = normalize_date_for_key(e.get('date'))

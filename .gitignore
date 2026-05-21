@@ -48,6 +48,12 @@ pipeline_checkpoint.pkl
 
 # Credentials (NEVER commit these)
 *.json
+
+# Replit snapshots — auto-saved conversation/code excerpts; noise in git
+attached_assets/
+
+# Git internal file that shouldn't be in working tree
+FETCH_HEAD
 !package.json
 !promotion_blocklist.json
 !data/*.json
