@@ -11,6 +11,27 @@ Also backfills Processed_Log so dedup logic stays consistent for future runs.
 By default skips events that match prior purge_events_by_date.py decisions
 (reads outputs/purge_events_*.csv). Pass --include-purged to re-add them.
 
+RECOVERY MODES
+──────────────
+The tool supports two strategies for deciding what counts as "missing":
+
+  --conservative  (DEFAULT)
+    Recover events for post_ids that have ZERO rows in All_Events.
+    Catches the unambiguous case: pipeline marked post_id `events_found`
+    in Processed_Log (or crashed before claim) but no rows appear in
+    All_Events. Same methodology as the "339 missing posts" gap analysis.
+    Safer because if a post has even one row in the sheet, we trust the
+    write and don't add more events under that post_id — eliminating the
+    risk of duplicating events that exist under near-matching names.
+
+  --aggressive
+    Recover any event whose canonical key (POST ID, EVENT NAME, DATE) is
+    absent from All_Events. Catches partial-write recoveries (post had
+    some events written but others lost) AND legitimate gaps. BUT can
+    also duplicate events that exist in the sheet under slightly
+    different EVENT NAMES (tier-escalation drift, venue enrichment) or
+    DATE formats. Use after spot-checking the dry-run.
+
 KEY DESIGN CHOICES
 ──────────────────
 - Canonical key: (POST ID, EVENT NAME upper-cased, DATE iso-normalized).
@@ -27,8 +48,12 @@ KEY DESIGN CHOICES
 
 USAGE
 ─────
-  # dry-run, see what would be added
+  # dry-run, conservative mode (default — safer)
   python3 recover_from_csv_xlsx.py
+
+  # dry-run, aggressive mode — see how many more events the key-based
+  # check would catch (includes false positives from key drift)
+  python3 recover_from_csv_xlsx.py --aggressive
 
   # only files since a date (e.g., skip pre-May archive)
   python3 recover_from_csv_xlsx.py --since 2026-05-01
@@ -36,7 +61,7 @@ USAGE
   # cap to first 500 — smoke test before doing the full run
   python3 recover_from_csv_xlsx.py --max-events 500 --apply
 
-  # full apply
+  # full apply (conservative)
   python3 recover_from_csv_xlsx.py --apply
 
   # re-add events you previously deleted (rare; usually you don't want this)
@@ -162,11 +187,26 @@ def write_sidecar_md(csv_path, sidecar_data):
     documenting command, snapshot of state, contents, next steps, caveats."""
     md_path = csv_path.with_suffix('.md')
     d = sidecar_data
+    rmode = d.get('recovery_mode', 'aggressive')
+    mode_blurb = {
+        'conservative': (
+            "Only post_ids with ZERO rows in All_Events. Safer — no risk of "
+            "duplicating events that exist in the sheet under a slightly "
+            "different name or date format. Will miss partial-write recoveries "
+            "(post had some events written but others lost)."
+        ),
+        'aggressive': (
+            "Any event whose canonical key isn't in All_Events. Catches "
+            "partial-write recoveries but may duplicate events that exist in "
+            "the sheet under slightly different names or date formats."
+        ),
+    }[rmode]
     lines = [
         f"# {csv_path.name}",
         "",
         f"**Generated:** {d['generated_at']} by `recover_from_csv_xlsx.py`",
         f"**Mode:** {d['mode']}",
+        f"**Recovery mode:** `{rmode}` — {mode_blurb}",
         "",
         "## Command",
         "```",
@@ -187,13 +227,15 @@ def write_sidecar_md(csv_path, sidecar_data):
         "backfilling Processed_Log)",
         "",
         "## Sheet state at generation time",
-        f"- All_Events: **{d['sheet_keys']:,}** existing keys",
+        f"- All_Events: **{d['sheet_keys']:,}** unique keys, "
+        f"**{d['sheet_post_ids']:,}** distinct post_ids",
         f"- Processed_Log: **{d['pl_post_ids']:,}** existing post IDs",
         f"- Archive scanned: **{d['archive_files']}** files, "
         f"**{d['archive_rows']:,}** total rows, **{d['archive_unique']:,}** unique events",
-        f"- Already in sheet: **{d['skipped_in_sheet']:,}**",
+        f"- Skipped (already represented in sheet): **{d['skipped_in_sheet']:,}**",
         f"- Skipped (purged): **{d['skipped_purged']:,}**",
-        f"- **Recoverable: {d['recoverable']:,}**",
+        f"- **Recoverable ({rmode}): {d['recoverable']:,}**",
+        f"- For comparison, `--{d['other_mode']}` would catch **{d['other_n']:,}** events",
         f"- New post_ids for Processed_Log: **{d['new_to_pl']:,}**",
         "",
         "## What to do with this file",
@@ -218,16 +260,28 @@ def write_sidecar_md(csv_path, sidecar_data):
         "",
         "## Caveats",
     ]
-    if d['recoverable'] > 5000:
+    # Mode-specific warnings
+    if rmode == 'aggressive' and d['recoverable'] > 5000:
         lines.append(
-            f"- ⚠ **{d['recoverable']:,} candidates is high.** Some are likely "
-            "key-mismatched (in the sheet under a slightly different EVENT NAME or DATE) "
-            "rather than actually missing. Spot-check before applying."
+            f"- ⚠ **{d['recoverable']:,} aggressive candidates is high.** In aggressive "
+            "mode, many of these are likely key-mismatched (event IS in the sheet under "
+            "a slightly different EVENT NAME or DATE) rather than truly missing. "
+            f"Compare against the `--conservative` count ({d['other_n']:,}) — that's "
+            "the set of post_ids fully absent from the sheet and is the safer number "
+            "to act on first."
         )
-    elif d['recoverable'] < 50 and d['recoverable'] > 0:
+    elif rmode == 'conservative' and d['other_n'] > d['recoverable'] * 5:
         lines.append(
-            f"- {d['recoverable']} candidates is small enough that you can safely review "
-            "every row by hand before applying."
+            f"- The aggressive mode would catch **{d['other_n']:,}** events vs. this "
+            f"conservative count of **{d['recoverable']:,}**. The difference is events "
+            "whose post_id IS in the sheet but with a key mismatch — could be "
+            "partial-write recoveries OR name/date drift. If you want those, re-run "
+            "with `--aggressive` and spot-check before applying."
+        )
+    if d['recoverable'] > 0 and d['recoverable'] < 50:
+        lines.append(
+            f"- Only {d['recoverable']} candidates — small enough to review every row "
+            "by hand before applying."
         )
     lines += [
         "- Snapshot in time. The sheet state shown above is what was true at "
@@ -267,10 +321,27 @@ def main():
                     help="Cap the recovery batch size at N events.")
     ap.add_argument("--include-purged", action="store_true",
                     help="Re-add events that match prior purge audit. Default: skip.")
+
+    mode_group = ap.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--conservative", action="store_const", dest="mode", const="conservative",
+        help="(Default) Only recover events for post_ids with ZERO rows in "
+             "All_Events. Safer — no risk of duplicating events under near-"
+             "matching names. May miss partial-write recoveries (post had "
+             "some events written but others lost).")
+    mode_group.add_argument(
+        "--aggressive", action="store_const", dest="mode", const="aggressive",
+        help="Recover any event whose canonical key (POST ID, EVENT NAME, "
+             "DATE) isn't in All_Events. Catches partial-write recoveries "
+             "but may duplicate events that exist in the sheet under "
+             "slightly different names or date formats.")
+    ap.set_defaults(mode="conservative")
+
     args = ap.parse_args()
 
     print(f"━━━ recover_from_csv_xlsx.py ━━━")
     print(f"  Apply mode:       {args.apply}")
+    print(f"  Recovery mode:    {args.mode}")
     print(f"  Since:            {args.since or '(all files)'}")
     print(f"  Max events:       {args.max_events or '(no cap)'}")
     print(f"  Include purged:   {args.include_purged}")
@@ -337,11 +408,16 @@ def main():
         sys.exit(1)
 
     sheet_keys = set()
+    sheet_post_ids = set()
     for row in data_rows:
         if len(row) <= max(pid_col, name_col, date_col):
             continue
+        pid = (row[pid_col] or '').strip()
+        if pid:
+            sheet_post_ids.add(pid)
         sheet_keys.add(make_key(row[pid_col], row[name_col], row[date_col]))
-    print(f"    {len(sheet_keys):,} existing keys in sheet")
+    print(f"    {len(sheet_keys):,} existing keys, "
+          f"{len(sheet_post_ids):,} distinct post_ids in sheet")
     print()
 
     # Processed_Log
@@ -372,12 +448,29 @@ def main():
     candidates = []   # [(key, mtime, row_dict, source_file)]
     skipped_in_sheet = 0
     skipped_purged = 0
+    # Track both modes' counts so we can show users what the other would catch.
+    conservative_n = 0
+    aggressive_n = 0
     # Sort by mtime DESC so the newest events are processed first
-    # (matters when --max-events is set)
+    # (matters when --max-events is set).
     for key, (mtime, row_dict, source_file) in sorted(
         by_key.items(), key=lambda kv: kv[1][0], reverse=True
     ):
-        if key in sheet_keys:
+        post_id = key[0]
+        is_aggr_candidate = key not in sheet_keys and key not in purged
+        is_cons_candidate = post_id not in sheet_post_ids and key not in purged
+        if is_aggr_candidate:
+            aggressive_n += 1
+        if is_cons_candidate:
+            conservative_n += 1
+
+        # Pick the active-mode candidate
+        if args.mode == "conservative":
+            in_filter = post_id in sheet_post_ids
+        else:
+            in_filter = key in sheet_keys
+
+        if in_filter:
             skipped_in_sheet += 1
             continue
         if key in purged:
@@ -390,13 +483,17 @@ def main():
 
     candidate_post_ids = {k[0] for k, _, _, _ in candidates}
     new_to_pl = candidate_post_ids - pl_post_ids
+    other_mode = "aggressive" if args.mode == "conservative" else "conservative"
+    other_n = aggressive_n if args.mode == "conservative" else conservative_n
 
     print(f"━━━ DELTA ━━━")
     print(f"  Archive unique events:        {len(by_key):>7,}")
-    print(f"  Already in sheet:             {skipped_in_sheet:>7,}")
+    print(f"  Skipped ({'post_id in sheet' if args.mode == 'conservative' else 'key in sheet'}): "
+          f"{skipped_in_sheet:>7,}")
     print(f"  Skipped (purged):             {skipped_purged:>7,}")
-    print(f"  → Recoverable events:         {len(candidates):>7,}")
+    print(f"  → Recoverable events:         {len(candidates):>7,}  ({args.mode} mode)")
     print(f"  → New post_ids for {PROCESSED_LOG_TAB}: {len(new_to_pl):>7,}")
+    print(f"  (For comparison, --{other_mode} would catch {other_n:,} events)")
     print()
 
     # ── DRY-RUN / APPLIED CSV ─────────────────────────────────────────
@@ -417,20 +514,27 @@ def main():
     print(f"  CSV written: {out_csv}")
 
     # Sidecar .md (project convention; see OUTPUTS.md)
+    cons_or_aggr = (
+        "post_id NOT in All_Events" if args.mode == 'conservative'
+        else "canonical key (POST ID, EVENT NAME, DATE) NOT in All_Events"
+    )
     sidecar_data = {
         'generated_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         'mode': 'applied' if args.apply else 'dry-run',
+        'recovery_mode': args.mode,
+        'other_mode': other_mode,
+        'other_n': other_n,
         'command': 'python3 ' + ' '.join(sys.argv),
         'contents_description': (
-            f"{len(candidates):,} candidate rows — events from "
-            f"outputs/Events_*.csv|xlsx "
+            f"{len(candidates):,} candidate rows (recovery_mode={args.mode}) "
+            f"— events from outputs/Events_*.csv|xlsx "
             f"({'since ' + args.since if args.since else 'all dates'}) "
-            f"with no matching key in live All_Events sheet, not in prior "
-            f"purge audit."
+            f"where {cons_or_aggr}, not in prior purge audit."
             + (f" Capped at --max-events {args.max_events}."
                if args.max_events else "")
         ),
         'sheet_keys': len(sheet_keys),
+        'sheet_post_ids': len(sheet_post_ids),
         'pl_post_ids': len(pl_post_ids),
         'archive_files': files_read,
         'archive_rows': rows_total,
