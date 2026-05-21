@@ -17,9 +17,27 @@ flags, matches to All_Events rows by (POST ID, EVENT NAME, DATE), and:
   - Updates QUALITY_FLAGS cell text where it differs
   - Re-applies cell highlighting per current FLAG_TO_COLUMNS
 
-DERIVATION RULES
-────────────────
-For each event extracted in the log, determine its flag set:
+LOG FORMAT SUPPORT
+──────────────────
+Auto-detects two log formats per file:
+
+  NEW (post-cutover, with worker_log.py [W<n>] prefixes):
+    Every event has a ✦ line with authoritative per-event Flags. The
+    pipeline wrote these exact flags to the sheet at extract time, so
+    no derivation is needed — the rules below are bypassed entirely.
+    Tier-escalation gotcha: ✦ lines fire per tier. We dedup by event
+    name and keep the last occurrence (matches the final tier's output).
+
+  OLD (pre-cutover, no per-line tags):
+    Only post-level informational flags are emitted. Per-event attribution
+    is inferred via the rules below. ~85-95% accurate due to thread
+    interleaving on carousel-heavy multi-event posts. For high-confidence
+    repair, re-extract with events_from_ids.py to generate a NEW-format
+    log, then re-run this tool against that log.
+
+DERIVATION RULES (old-format only)
+──────────────────────────────────
+For each event extracted in an old-format log, determine its flag set:
 
   (A) Always-apply post-level flags (apply to ALL events from that post):
         CALENDAR_LOW_EVENTS, CAROUSEL_LOW_EVENTS, OCR_RICH_LOW_EVENTS,
@@ -121,22 +139,92 @@ RE_DATE_LINE    = re.compile(r'Date:\s+(\S+)')
 RE_VENUE_LINE   = re.compile(r'Venue:\s+(.+?)\s*$')
 RE_CONF_LINE    = re.compile(r'Confidence:\s+([\d.]+)')
 
+# ─── New format markers (feat/worker-log-prefixing branch + later) ───
+# Every line emitted inside a worker context is prefixed with [W<n>]
+# (worker tag) and [<post_id>] (post tag). The new ✦ line emits the
+# authoritative per-event flag set directly, so derivation rules can be
+# skipped when present.
+
+# Format detector: any [W<digits>] prefix anywhere → new format
+RE_FORMAT_NEW_MARKER = re.compile(r'\[W\d+\]')
+
+# Single ✦ event line — emitted per tier inside _run_tier. The tier may
+# escalate after this, in which case more ✦ lines will follow for the same
+# post. We dedup by event name and keep the last seen entry per post (which
+# corresponds to the final tier and matches what's written to the sheet).
+# Format: "    ✦ [<tier_name>] '<event_name>' | <date>"
+RE_EVENT_DOT = re.compile(
+    r"✦\s+\[(\w+)\]\s+['\"](.+?)['\"]\s+\|\s+(\S+)"
+)
+
+# Sub-field lines that follow a ✦ event. They're not [post_id]-prefixed
+# (they're continuation lines from a single multi-line print) so we
+# attribute them to the most recently seen ✦ event in the same post.
+RE_NEW_VENUE = re.compile(r'•\s+Venue:\s+(.+?)\s*$')
+RE_NEW_CONF  = re.compile(r'•\s+Confidence:\s+([\d.]+)')
+RE_NEW_FLAGS = re.compile(r'•\s+Flags:\s+(.+?)\s*$')
+
+# New Done boundary — marks end of post processing. Useful as a "close
+# this post record" signal even though Processing post: of the NEXT post
+# would also flush.
+RE_NEW_DONE = re.compile(r'\[\d+/\d+\]\s+Done in\s+[\d.]+s')
+
+
+def detect_log_format(log_path: Path) -> str:
+    """Sniff a log file to determine whether it's the old format (no per-line
+    worker tag) or the new format (every worker line prefixed with [W<n>]).
+    Reads until first match — early-exit cheap for new-format files."""
+    try:
+        with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                if RE_FORMAT_NEW_MARKER.search(line):
+                    return 'new'
+    except OSError:
+        pass
+    return 'old'
+
 
 def parse_log(log_path: Path) -> list:
     """
-    Parse a single run log into a list of post records:
-    [
-      {
-        'post_id': str,
-        'log_mtime': datetime,
-        'post_flags': set[str],
-        'events': [
-          {'name': str, 'date': str|None, 'venue': str|None, 'confidence': float|None}
+    Parse a single run log into a list of post records. Auto-detects format.
+
+    Returns:
+        [
+          {
+            'post_id': str,
+            'log_mtime': datetime,
+            'format': 'old' | 'new',
+            'post_flags': set[str],           # post-level only (informational flags)
+            'events': [
+              {
+                'name': str,
+                'date': str|None,
+                'venue': str|None,
+                'confidence': float|None,
+                'authoritative_flags': set[str] | None,  # set in new format from ✦ Flags:
+                'tier': str | None,                       # set in new format from ✦ [tier]
+              }
+            ]
+          },
+          ...
         ]
-      },
-      ...
-    ]
+
+    For old-format records, authoritative_flags is None and derive_flags()
+    falls back to the heuristic rules in its (A)/(B)/(C)/(D) sections.
+    For new-format records, authoritative_flags is the canonical per-event
+    flag set the pipeline assigned at write time — derive_flags() returns
+    it as-is, no derivation needed.
     """
+    fmt = detect_log_format(log_path)
+    if fmt == 'new':
+        return _parse_new_format(log_path)
+    return _parse_old_format(log_path)
+
+
+def _parse_old_format(log_path: Path) -> list:
+    """Original parser — pre-worker_log.py logs without [W<n>] prefix.
+    Uses informational flags + EVENT FOUND / MULTIPLE EVENTS FOUND lines.
+    derive_flags() will apply heuristic rules to fill in per-event flags."""
     text = log_path.read_text(encoding='utf-8', errors='replace')
     log_mtime = datetime.fromtimestamp(log_path.stat().st_mtime)
 
@@ -158,6 +246,7 @@ def parse_log(log_path: Path) -> list:
             current = {
                 'post_id': m.group(1),
                 'log_mtime': log_mtime,
+                'format': 'old',
                 'post_flags': set(),
                 'events': [],
             }
@@ -179,7 +268,8 @@ def parse_log(log_path: Path) -> list:
         m = RE_EVENT_FOUND.search(line)
         if m:
             multi_event = {'name': m.group(1).strip(), 'date': None,
-                           'venue': None, 'confidence': None}
+                           'venue': None, 'confidence': None,
+                           'authoritative_flags': None, 'tier': None}
             current['events'].append(multi_event)
             continue
 
@@ -189,7 +279,8 @@ def parse_log(log_path: Path) -> list:
             # Plausibly a multi-event list item; verify we're inside one
             # (lookback approach: any recent MULTIPLE EVENTS marker for this post)
             multi_event = {'name': m.group(2).strip(), 'date': None,
-                           'venue': None, 'confidence': None}
+                           'venue': None, 'confidence': None,
+                           'authoritative_flags': None, 'tier': None}
             current['events'].append(multi_event)
             continue
 
@@ -214,6 +305,122 @@ def parse_log(log_path: Path) -> list:
                     multi_event['confidence'] = float(m.group(1))
                 except ValueError:
                     pass
+                continue
+
+    flush_current()
+    return posts
+
+
+def _parse_new_format(log_path: Path) -> list:
+    """Parser for the new log format (feat/worker-log-prefixing branch and
+    later). Authoritative per-event flags come from the ✦ line's
+    `• Flags: <comma flags>` sub-field. derive_flags() returns them as-is.
+
+    Tier-escalation gotcha: ✦ lines emit once per tier execution. A post
+    that escalates Tier1 → Tier2 → Tier3 produces 3 sets of ✦ lines. Only
+    the FINAL tier's events are written to the sheet. We handle this by
+    keeping ✦ events in a dict keyed by event name — later occurrences
+    overwrite earlier ones, so the surviving set matches the final tier.
+    """
+    text = log_path.read_text(encoding='utf-8', errors='replace')
+    log_mtime = datetime.fromtimestamp(log_path.stat().st_mtime)
+
+    posts = []
+    current = None       # in-progress post dict (events as dict keyed by name)
+    current_event = None # ref to event dict that the next sub-field lines describe
+
+    def flush_current():
+        if current is None:
+            return
+        # Convert events dict back to list (insertion order preserved in py3.7+)
+        rec = {
+            'post_id': current['post_id'],
+            'log_mtime': current['log_mtime'],
+            'format': 'new',
+            'post_flags': current['post_flags'],
+            'events': list(current['events'].values()),
+        }
+        if rec['events'] or rec['post_flags']:
+            posts.append(rec)
+
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+
+        # New post boundary (search, so it works whether prefixed or not)
+        m = RE_PROCESSING.search(line)
+        if m:
+            flush_current()
+            current = {
+                'post_id': m.group(1),
+                'log_mtime': log_mtime,
+                'post_flags': set(),
+                'events': {},  # keyed by event name; later writes overwrite earlier
+            }
+            current_event = None
+            continue
+
+        if current is None:
+            continue
+
+        # Done boundary — close the post (next Processing also would, but
+        # being explicit avoids a stale current_event lingering for the
+        # space between posts).
+        if RE_NEW_DONE.search(line):
+            flush_current()
+            current = None
+            current_event = None
+            continue
+
+        # ✦ event line — starts (or replaces) an event in the current post
+        m = RE_EVENT_DOT.search(line)
+        if m:
+            tier_name, ev_name, ev_date = m.group(1), m.group(2).strip(), m.group(3).strip()
+            current_event = {
+                'name': ev_name,
+                'date': None if ev_date in ('None', '?', '') else ev_date,
+                'venue': None,
+                'confidence': None,
+                'authoritative_flags': set(),
+                'tier': tier_name,
+            }
+            # Dedup by name — later occurrence (later tier) wins.
+            current['events'][ev_name] = current_event
+            continue
+
+        # Post-level informational flags — recorded for diagnostics / fallback,
+        # but the per-event ✦ Flags lines are the canonical source.
+        m = RE_INFO_FLAGS.search(line)
+        if m:
+            raw = m.group(1).strip()
+            for tok in re.findall(r"'([^']+)'", raw):
+                current['post_flags'].add(tok)
+            continue
+
+        # Sub-field lines attach to the most recent ✦ event in this post.
+        # These continuation lines are NOT prefixed because they share a
+        # single print() with the ✦ line, but they ARE physically contiguous
+        # in the log (atomic write), so attaching to current_event is safe.
+        if current_event is not None:
+            m = RE_NEW_VENUE.search(line)
+            if m:
+                val = m.group(1).strip()
+                current_event['venue'] = None if val in ('None', '') else val
+                continue
+            m = RE_NEW_CONF.search(line)
+            if m:
+                try:
+                    current_event['confidence'] = float(m.group(1))
+                except ValueError:
+                    pass
+                continue
+            m = RE_NEW_FLAGS.search(line)
+            if m:
+                raw = m.group(1).strip()
+                if raw and raw.lower() != 'none':
+                    for tok in raw.split(','):
+                        tok = tok.strip()
+                        if tok:
+                            current_event['authoritative_flags'].add(tok)
                 continue
 
     flush_current()
@@ -297,14 +504,26 @@ def derive_flags(post_record, event_log, sheet_row, col_indices,
     """
     Compute the canonical set of flags for one event.
 
+    New-format short-circuit: if event_log['authoritative_flags'] is set
+    (not None), it's the actual flag set the pipeline wrote at extract
+    time. Return it directly — no derivation needed.
+
+    Old-format fallback: apply the heuristic derivation rules (A)/(B)/(C)/(D)
+    against post-level informational flags + event fields + sheet fields.
+
     post_record: dict from log parser (has post_flags)
     event_log: dict for this specific event from log
     sheet_row: list of cell values for this row in the sheet
     col_indices: dict of column-name -> index
     nj_lookup: dict of city -> region (from data/nj_municipalities.json)
     all_event_dates_in_post: list of parsed date objects for all events in this post
-    skip_day_mismatch: if True, never apply DATE_DAY_MISMATCH
+    skip_day_mismatch: if True, never apply DATE_DAY_MISMATCH (old format only)
     """
+    # New format: per-event Flags from ✦ line is authoritative. Use as-is.
+    auth = event_log.get('authoritative_flags')
+    if auth is not None:
+        return set(auth)
+
     flags = set()
     log_post_flags = post_record['post_flags']
 
@@ -476,7 +695,17 @@ def main():
     print(f"  Aggressive day-flag:  {args.aggressive_day_mismatch}")
     print(f"  Logs ({len(log_paths)}):")
     for lp in log_paths:
-        print(f"    • {lp}")
+        fmt = detect_log_format(lp)
+        marker = '✓' if fmt == 'new' else '⚠'
+        print(f"    {marker} [{fmt:3s}] {lp}")
+    print()
+    print("  Format notes:")
+    print("    'new' = post-cutover logs with [W<n>] [<post_id>] line tags")
+    print("            and per-event ✦ Flags — flags are AUTHORITATIVE,")
+    print("            no derivation needed.")
+    print("    'old' = pre-cutover logs without per-line tags. Heuristic")
+    print("            derivation applied; ~85-95% accurate due to thread")
+    print("            interleaving in carousel-heavy multi-event posts.")
     print()
 
     # Parse logs
@@ -484,7 +713,15 @@ def main():
     log_by_post = parse_logs(log_paths)
     n_events = sum(len(p['events']) for p in log_by_post.values())
     n_flagged_posts = sum(1 for p in log_by_post.values() if p['post_flags'])
-    print(f"  Parsed {len(log_by_post)} posts with {n_events} events ({n_flagged_posts} posts had flags)")
+    n_new_format = sum(1 for p in log_by_post.values() if p.get('format') == 'new')
+    n_authoritative = sum(
+        1 for p in log_by_post.values() for e in p['events']
+        if e.get('authoritative_flags') is not None
+    )
+    print(f"  Parsed {len(log_by_post)} posts with {n_events} events")
+    print(f"    • {n_new_format} posts from new-format logs (authoritative per-event flags)")
+    print(f"    • {n_authoritative}/{n_events} events have authoritative flags (vs derived)")
+    print(f"    • {n_flagged_posts} posts had any post-level flags recorded")
 
     # Connect + read sheet
     print("\n  Connecting to sheet...")
