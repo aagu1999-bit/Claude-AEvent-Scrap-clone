@@ -46,9 +46,16 @@ OUTPUT
 ──────
 - outputs/recovery_pending_<ts>.csv  (dry-run mode)
 - outputs/recovery_applied_<ts>.csv  (with --apply)
+- outputs/recovery_<pending|applied>_<ts>.md  ← SIDECAR
 
 Each row in the output CSV includes a _source_file and _source_mtime
 column showing which archive file the recovered row came from.
+
+The sidecar .md is the project-wide convention (see OUTPUTS.md): a
+human-readable companion to every generated output file. Carries the
+command that ran, the snapshot of sheet state at the time, what's in
+the file, what to do with it next, and known caveats. Re-runs OVERWRITE
+their own sidecar (timestamp differs, so prior sidecars stay intact).
 """
 
 import argparse
@@ -147,6 +154,93 @@ def load_purge_keys():
         except Exception as e:
             print(f"  ⚠ Could not read purge audit {p.name}: {e}", file=sys.stderr)
     return keys, files_read
+
+
+def write_sidecar_md(csv_path, sidecar_data):
+    """Write a human-readable .md companion next to the CSV. Per OUTPUTS.md
+    project convention: every generated outputs/* file gets a sidecar
+    documenting command, snapshot of state, contents, next steps, caveats."""
+    md_path = csv_path.with_suffix('.md')
+    d = sidecar_data
+    lines = [
+        f"# {csv_path.name}",
+        "",
+        f"**Generated:** {d['generated_at']} by `recover_from_csv_xlsx.py`",
+        f"**Mode:** {d['mode']}",
+        "",
+        "## Command",
+        "```",
+        d['command'],
+        "```",
+        "",
+        "## What's in this file",
+        d['contents_description'],
+        "",
+        "## Canonical key",
+        "`(POST ID, EVENT NAME.upper(), DATE.iso())` — same as audit_log_vs_sheet.py "
+        "and repair_flags_from_log.py.",
+        "",
+        "## Columns",
+        "- Cols 1–N: All_Events sheet schema (POST ID, EVENT NAME, DATE, VENUE NAME, ...)",
+        "- `_source_file`: which archive file in outputs/ this row came from",
+        "- `_source_mtime`: when that archive file was written (used as processed_at when "
+        "backfilling Processed_Log)",
+        "",
+        "## Sheet state at generation time",
+        f"- All_Events: **{d['sheet_keys']:,}** existing keys",
+        f"- Processed_Log: **{d['pl_post_ids']:,}** existing post IDs",
+        f"- Archive scanned: **{d['archive_files']}** files, "
+        f"**{d['archive_rows']:,}** total rows, **{d['archive_unique']:,}** unique events",
+        f"- Already in sheet: **{d['skipped_in_sheet']:,}**",
+        f"- Skipped (purged): **{d['skipped_purged']:,}**",
+        f"- **Recoverable: {d['recoverable']:,}**",
+        f"- New post_ids for Processed_Log: **{d['new_to_pl']:,}**",
+        "",
+        "## What to do with this file",
+    ]
+    if d['mode'].startswith('dry-run'):
+        lines += [
+            "1. **Spot-check 10–20 rows** against the live sheet. Confirm these events are "
+            "truly missing (not just key-mismatched).",
+            "2. **Smoke test** — re-run with `--max-events 50 --apply`, verify the 50 rows "
+            "appear in All_Events as expected.",
+            "3. **Full apply** — re-run with `--apply`. The tool re-computes the delta each "
+            "run, so it's idempotent — re-running is safe if the sheet has changed.",
+        ]
+    else:
+        lines += [
+            "Audit trail of what was written. Cross-reference against All_Events if "
+            "anything looks wrong after the run.",
+            "Re-running `--apply` is idempotent — events already in the sheet will be "
+            "skipped on the next pass.",
+        ]
+    lines += [
+        "",
+        "## Caveats",
+    ]
+    if d['recoverable'] > 5000:
+        lines.append(
+            f"- ⚠ **{d['recoverable']:,} candidates is high.** Some are likely "
+            "key-mismatched (in the sheet under a slightly different EVENT NAME or DATE) "
+            "rather than actually missing. Spot-check before applying."
+        )
+    elif d['recoverable'] < 50 and d['recoverable'] > 0:
+        lines.append(
+            f"- {d['recoverable']} candidates is small enough that you can safely review "
+            "every row by hand before applying."
+        )
+    lines += [
+        "- Snapshot in time. The sheet state shown above is what was true at "
+        f"{d['generated_at']}. Re-running later may produce different numbers if events "
+        "have been added/purged in the meantime.",
+        "- The tool reads `outputs/purge_events_*.csv` to skip prior delete decisions. "
+        "If purge audits are missing (older purges), those events may show up here as "
+        "candidates and get re-added. Use `--include-purged` only when intentionally "
+        "reverting a delete.",
+        "",
+    ]
+    md_path.write_text("\n".join(lines), encoding='utf-8')
+    return md_path
 
 
 def setup_sheet():
@@ -321,6 +415,33 @@ def main():
             out_row['_source_mtime'] = mtime.isoformat()
             w.writerow(out_row)
     print(f"  CSV written: {out_csv}")
+
+    # Sidecar .md (project convention; see OUTPUTS.md)
+    sidecar_data = {
+        'generated_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'mode': 'applied' if args.apply else 'dry-run',
+        'command': 'python3 ' + ' '.join(sys.argv),
+        'contents_description': (
+            f"{len(candidates):,} candidate rows — events from "
+            f"outputs/Events_*.csv|xlsx "
+            f"({'since ' + args.since if args.since else 'all dates'}) "
+            f"with no matching key in live All_Events sheet, not in prior "
+            f"purge audit."
+            + (f" Capped at --max-events {args.max_events}."
+               if args.max_events else "")
+        ),
+        'sheet_keys': len(sheet_keys),
+        'pl_post_ids': len(pl_post_ids),
+        'archive_files': files_read,
+        'archive_rows': rows_total,
+        'archive_unique': len(by_key),
+        'skipped_in_sheet': skipped_in_sheet,
+        'skipped_purged': skipped_purged,
+        'recoverable': len(candidates),
+        'new_to_pl': len(new_to_pl),
+    }
+    md_path = write_sidecar_md(out_csv, sidecar_data)
+    print(f"  Sidecar:     {md_path}")
     print()
 
     if not candidates:
