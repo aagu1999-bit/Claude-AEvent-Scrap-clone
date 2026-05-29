@@ -243,6 +243,14 @@ class InstagramEventPipeline:
         self.retry_attempts = {}
         self.retry_caption_only = set()
         self.retry_metadata = {}
+
+        # Per-worker telemetry. Keyed by worker_id (W1, W2, ...) → Counter
+        # of result tags. Lets the final report surface "W3 had 40% gemini
+        # errors while everyone else had 2%" — invisible in aggregate stats
+        # but trivial here. Always-on; the overhead is one dict lookup +
+        # one counter increment per processed post.
+        from collections import Counter, defaultdict
+        self.worker_stats = defaultdict(Counter)
         self.sheets_client = None
         self.main_sheet = None
         self.log_worksheet = None
@@ -428,11 +436,23 @@ class InstagramEventPipeline:
             # permanently_failed) leave new_retry_count as prior_retries — the
             # row records how many attempts came before this one.
 
+        # Provenance: which worker thread handled this attempt, in which run,
+        # on which attempt number. Persisted on every Processed_Log row AND
+        # every All_Events row so a flagged cell can be traced back to the
+        # exact worker/run/attempt that produced it. attempt_id is 1-based:
+        # first time we see this pid this is attempt 1; first retry is 2; etc.
+        worker_id = get_worker_id()
+        attempt_id = prior_retries + 1
+        self.worker_stats[worker_id][result] += 1
+
         entry = {
             'result': result,
             'account': user,
             'post_date': post_date_str,
             'retry_count': new_retry_count,
+            'worker_id': worker_id,
+            'run_id': self.run_id,
+            'attempt_id': attempt_id,
         }
         if result != 'events_found':
             if caption:
@@ -514,12 +534,23 @@ class InstagramEventPipeline:
                 return
 
             date_processed = str(datetime.now(EAST_TZ).date())
-            log_rows = [
-                [pid, info.get('account', ''), date_processed, "Auto-Bot", "",
-                 info.get('result', ''), info.get('post_date', ''),
-                 str(info.get('retry_count', 0))]
-                for pid, info in pending.items()
-            ]
+            # Source column carries structured provenance now ("Auto-Bot" was
+            # branding, not data). Format: "{run_id}:{worker_id}:a{attempt}".
+            # Example: "20260529_142233:W3:a2" — Run timestamp, worker that
+            # processed it, 2nd attempt. Older "Auto-Bot" rows from prior
+            # runs are untouched; new rows just have richer Source values.
+            log_rows = []
+            for pid, info in pending.items():
+                run_id = info.get('run_id', self.run_id)
+                worker_id = info.get('worker_id', 'main')
+                attempt_id = info.get('attempt_id', 1)
+                source = f"{run_id}:{worker_id}:a{attempt_id}"
+                log_rows.append([
+                    pid, info.get('account', ''), date_processed, source, "",
+                    info.get('result', ''), info.get('post_date', ''),
+                    str(info.get('retry_count', 0)),
+                    run_id, worker_id, str(attempt_id),
+                ])
 
             try:
                 self.log_worksheet.append_rows(log_rows)
@@ -578,6 +609,11 @@ class InstagramEventPipeline:
                 'event_type', 'account_name', 'description', 'performer', 'price',
                 'confidence', 'post_id', 'had_ocr', 'from_calendar', 'is_recurring',
                 'processed_timestamp', 'quality_flags', 'recurrence_pattern',
+                # Provenance — matches the Processed_Log Run/Worker/Attempt
+                # columns for cross-tab joins. A flagged cell can now be
+                # traced via (run_id, worker_id, attempt_id) → the specific
+                # worker/attempt that produced it.
+                'run_id', 'worker_id', 'attempt_id',
             ]
             df['processed_timestamp'] = datetime.now(EAST_TZ).strftime('%Y-%m-%d %H:%M:%S')
             for c in cols:
@@ -608,7 +644,9 @@ class InstagramEventPipeline:
             try:
                 evt_sheet = self.main_sheet.worksheet("All_Events")
             except gspread.WorksheetNotFound:
-                evt_sheet = self.main_sheet.add_worksheet("All_Events", 5000, 27)
+                # Width bumped from 27 → 30 to accommodate the new RUN ID /
+                # WORKER ID / ATTEMPT ID provenance columns at the right edge.
+                evt_sheet = self.main_sheet.add_worksheet("All_Events", 5000, 30)
                 evt_sheet.append_row(df.columns.tolist())
 
             # Track row position for per-cell highlighting AFTER append
@@ -804,7 +842,15 @@ class InstagramEventPipeline:
                 header = all_rows[0] if all_rows else []
                 data_rows = all_rows[1:] if len(all_rows) > 1 else []
 
-                default_header = ["Post ID", "Account", "Date Processed", "Source", "Notes", "Result", "Post Date", "Retry Count"]
+                default_header = [
+                    "Post ID", "Account", "Date Processed", "Source", "Notes",
+                    "Result", "Post Date", "Retry Count",
+                    # Provenance columns — every row records exactly which
+                    # run/worker/attempt produced it. Adding columns at the
+                    # right edge is safe: existing audit scripts index by
+                    # header name (.index("Result")) so positions don't shift.
+                    "Run ID", "Worker", "Attempt",
+                ]
                 updated_header = list(header)
                 needs_update = False
                 if not updated_header or "Post ID" not in updated_header:
@@ -822,6 +868,15 @@ class InstagramEventPipeline:
                         needs_update = True
                     if "Retry Count" not in updated_header:
                         updated_header.append("Retry Count")
+                        needs_update = True
+                    if "Run ID" not in updated_header:
+                        updated_header.append("Run ID")
+                        needs_update = True
+                    if "Worker" not in updated_header:
+                        updated_header.append("Worker")
+                        needs_update = True
+                    if "Attempt" not in updated_header:
+                        updated_header.append("Attempt")
                         needs_update = True
                 if needs_update:
                     self.log_worksheet.update([updated_header], value_input_option='RAW')
@@ -939,8 +994,12 @@ class InstagramEventPipeline:
                 exhausted_note = f", {exhausted_count} exhausted (>={RETRY_MAX_ATTEMPTS} attempts)" if exhausted_count else ""
                 print(f"✓ History Loaded: Skipping {skip_count} IDs, {retry_count} eligible for retry (ocr_failed/gemini_error){exhausted_note}.")
             except gspread.WorksheetNotFound:
-                self.log_worksheet = self.main_sheet.add_worksheet("Processed_Log", 5000, 8)
-                self.log_worksheet.append_row(["Post ID", "Account", "Date Processed", "Source", "Notes", "Result", "Post Date", "Retry Count"])
+                self.log_worksheet = self.main_sheet.add_worksheet("Processed_Log", 5000, 11)
+                self.log_worksheet.append_row([
+                    "Post ID", "Account", "Date Processed", "Source", "Notes",
+                    "Result", "Post Date", "Retry Count",
+                    "Run ID", "Worker", "Attempt",
+                ])
                 print("✓ Created new 'Processed_Log' tab.")
 
         except Exception as e:
@@ -1617,6 +1676,19 @@ class InstagramEventPipeline:
                     if processed_events:
                         self.stats['posts_with_events'] += 1
                         self.stats['events_found'] += len(processed_events)
+                        # Stamp provenance on every event row BEFORE extend.
+                        # _record_post_outcome_locked just wrote the same
+                        # (worker_id, run_id, attempt_id) into post_results[pid],
+                        # so the All_Events row and the Processed_Log row for
+                        # this post agree on all three. If a flagged cell turns
+                        # up later, these three fields point at the exact
+                        # run/worker/attempt that produced it.
+                        prov_worker = get_worker_id()
+                        prov_attempt = self.retry_attempts.get(pid, 0) + 1
+                        for _ev in processed_events:
+                            _ev['worker_id']  = prov_worker
+                            _ev['run_id']     = self.run_id
+                            _ev['attempt_id'] = prov_attempt
                         self.results.extend(processed_events)
                         if len(processed_events) > 1:
                             self.stats['multi_event_posts'] += 1
@@ -1702,15 +1774,27 @@ class InstagramEventPipeline:
         if self.max_workers > 1:
             print(f"\n⚡ Processing with {self.max_workers} parallel workers...\n")
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                # Capture (i, post) per future so the exception handler below
+                # can name the specific post that died. Previously the error
+                # line was "⚠ Worker error: <exception>" with no post_id, so
+                # there was no way to correlate the crash to which post the
+                # worker had been working on.
                 futures = {
-                    executor.submit(self.process_post, post, i + 1, total): i
+                    executor.submit(self.process_post, post, i + 1, total): (i, post)
                     for i, post in enumerate(posts)
                 }
                 for future in as_completed(futures):
+                    i, post = futures[future]
                     try:
                         future.result(timeout=120)
                     except Exception as e:
-                        print(f"⚠ Worker error: {e}")
+                        died_pid = (post.get('id') or post.get('shortCode')
+                                    or post.get('shortcode') or f'idx_{i+1}')
+                        died_handle = post.get('ownerUsername', '')
+                        # [main] tag so it's clearly NOT misattributed to
+                        # whichever worker's lines appear adjacent.
+                        print(f"⚠ [main] Worker error on post {died_pid} "
+                              f"(@{died_handle}, idx {i+1}/{total}): {e}")
                     # Periodic flush — threshold check inside makes most
                     # calls cheap, so this is safe to call on every post.
                     # Without this, killed runs lose 100% of their dedup
@@ -1826,6 +1910,33 @@ class InstagramEventPipeline:
                 print(f"  • still failing:      {retry_outcomes.get('ocr_failed', 0) + retry_outcomes.get('gemini_error', 0)}")
                 print(f"  • permanently_failed: {retry_outcomes.get('permanently_failed', 0)}")
 
+        # ─────────────────────────────────────────────────────────────
+        # Per-worker breakdown. With 10+ parallel workers, a single broken
+        # worker (stuck on a bad API key, hitting Vision quota, hung TLS
+        # session, etc.) can drag the aggregate down without standing out.
+        # This table surfaces who handled how many posts and with what
+        # outcomes — easy to spot one worker with disproportionate errors.
+        # Run ID is printed once so a Replit-log copy/paste retains the
+        # provenance needed to cross-reference the Sheet's Run ID column.
+        # ─────────────────────────────────────────────────────────────
+        if self.worker_stats:
+            print(f"\n👷  PER-WORKER BREAKDOWN (run_id={self.run_id}):")
+            header = f"  {'Worker':<8} {'Total':>6} {'Events':>7} {'NoEvts':>7} {'OCRfail':>8} {'Gemini':>7} {'Perma':>6}"
+            print(header)
+            print(f"  {'─'*7:<8} {'─'*5:>6} {'─'*6:>7} {'─'*6:>7} {'─'*7:>8} {'─'*6:>7} {'─'*5:>6}")
+            for wid in sorted(self.worker_stats.keys(),
+                              key=lambda w: int(w[1:]) if w.startswith('W') and w[1:].isdigit() else 9999):
+                c = self.worker_stats[wid]
+                total = sum(c.values())
+                print(
+                    f"  {wid:<8} {total:>6} "
+                    f"{c.get('events_found', 0):>7} "
+                    f"{c.get('no_events_found', 0):>7} "
+                    f"{c.get('ocr_failed', 0):>8} "
+                    f"{c.get('gemini_error', 0):>7} "
+                    f"{c.get('permanently_failed', 0):>6}"
+                )
+
         shell_accounts = getattr(self, '_shell_accounts', {})
         if shell_accounts:
             print(f"\n⚠ APIFY RETURNED EMPTY (SHELL) RESPONSES FOR {sum(shell_accounts.values())} POSTS")
@@ -1937,8 +2048,10 @@ class InstagramEventPipeline:
             'event_type', 'account_name', 'description', 'performer', 'price',
             'confidence', 'post_id', 'had_ocr', 'from_calendar', 'is_recurring',
             'processed_timestamp',
-            'quality_flags',         # NEW: per-row sanity-check fingerprint
-            'recurrence_pattern',    # NEW: pattern string for recurring events
+            'quality_flags',         # per-row sanity-check fingerprint
+            'recurrence_pattern',    # pattern string for recurring events
+            # Provenance — see _flush_events_to_sheet for details.
+            'run_id', 'worker_id', 'attempt_id',
         ]
 
         df['processed_timestamp'] = datetime.now(EAST_TZ).strftime('%Y-%m-%d %H:%M:%S')

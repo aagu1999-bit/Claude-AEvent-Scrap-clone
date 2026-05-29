@@ -121,36 +121,71 @@ def wprint(*args, **kwargs):
 
 
 # ─────────────────────────────────────────────────────────────────
-# Worker ID — short, stable per-thread identifier ("T-1", "T-2", ...)
-# Derived from threading.current_thread().name so the ID is intrinsic
-# to the thread, not cached via thread.ident (which the OS can recycle
-# after thread death and break attribution).
+# Worker ID — registry-based, per-process counter.
 #
-# ThreadPoolExecutor names its workers "ThreadPoolExecutor-N_M" where
-# M is the per-pool worker index — we extract M as the ID. Main thread
-# becomes 'main'. Other named threads pass through.
+# Previous implementation parsed threading.current_thread().name
+# ("ThreadPoolExecutor-N_M") which is CPython internals — not part
+# of the public API and known to change between Python versions.
+# It also silently produced clashing IDs when a second executor was
+# introduced (two pools, both starting at _0).
+#
+# This registry version assigns each new thread a fresh sequential
+# ID on first call, keyed on threading.get_ident() (stable for the
+# thread's lifetime). The counter resets per process, so each pipeline
+# run starts at W1 — and the run_id (persisted in every row) is what
+# distinguishes Run A's W1 from Run B's W1 in the long-term log.
 # ─────────────────────────────────────────────────────────────────
+
+_worker_ids = {}              # thread.ident -> "W<n>"
+_worker_registry_lock = threading.Lock()
+_worker_counter = [0]         # boxed so the closure can mutate
 
 
 def get_worker_id():
-    """Return a short worker ID for the current thread, stable per actual
-    thread without caching gotchas. Examples:
-      MainThread                 -> 'main'
-      ThreadPoolExecutor-0_2     -> 'W2'
-      ThreadPoolExecutor-1_0     -> 'W0'
-      anything else              -> the thread name as-is
+    """Return a stable short worker ID for the current thread.
 
-    Used by wprint() to prefix every line with [W<n>] and by main.py
-    boundary markers to identify which worker is handling each post.
+      MainThread                 -> 'main'
+      First worker to call this  -> 'W1'
+      Second worker              -> 'W2'
+      ...etc, in arrival order.
+
+    IDs are persistent for the thread's lifetime (registry keyed on
+    threading.get_ident()), so wprint() lines and post-outcome rows
+    written from the same worker always carry the same tag — no
+    matter how the underlying pool was implemented.
+
+    Reset semantics: the counter resets per process. To correlate
+    a [W3] in this run with a [W3] in another run, use the run_id
+    that main.py stamps on every persisted row.
     """
     name = threading.current_thread().name
     if name == 'MainThread':
         return 'main'
-    if '_' in name:
-        suffix = name.rsplit('_', 1)[1]
-        if suffix.isdigit():
-            return f'W{suffix}'
-    return name
+
+    tid = threading.get_ident()
+    wid = _worker_ids.get(tid)
+    if wid is not None:
+        return wid
+
+    with _worker_registry_lock:
+        # Double-check under lock (the lookup above is fast-path).
+        wid = _worker_ids.get(tid)
+        if wid is not None:
+            return wid
+        _worker_counter[0] += 1
+        wid = f'W{_worker_counter[0]}'
+        _worker_ids[tid] = wid
+        return wid
+
+
+def reset_worker_registry():
+    """Wipe the worker ID registry. Call between runs in long-lived
+    processes so the next run starts at W1 again. Currently main.py
+    runs one pipeline per process so this is rarely needed, but it
+    lets tests / wrappers reuse the module cleanly."""
+    with _worker_registry_lock:
+        _worker_ids.clear()
+        _worker_counter[0] = 0
 
 
 # ─────────────────────────────────────────────────────────────────
