@@ -172,6 +172,30 @@ if SCRATCH_MODE:
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 SERVICE_ACCOUNT_FILE = "apt-mark-468506-u9-ec44cabc7335 copy.json"
 
+# ─────────────────────────────────────────────────────────────
+# Active retry queue (added 2026-05-29).
+# Posts marked ocr_failed or gemini_error in Processed_Log were previously
+# only re-attempted if Apify happened to re-scrape them — and with
+# apify_newer_than_days=14, posts age out of the scrape window before
+# they get retried. The retry queue closes this gap: at startup we pull
+# every retry-eligible pid from Processed_Log, look up its raw payload
+# from outputs/apify_raw_*.json (or apify_cache/), and merge those posts
+# back into the work list alongside the new scrape.
+#
+# RETRY_MAX_ATTEMPTS — after this many failed attempts, the post gets
+#   tagged 'permanently_failed' and drops out of the queue.
+# RETRY_ELIGIBLE_TAGS — only these result tags trigger re-processing.
+#   Matches the existing retry_tags set in setup_sheets.
+# STALE_RAW_DAYS — apify_raw_*.json files older than this almost certainly
+#   have dead CDN image URLs (IG CDN URLs expire within ~2wk). When a
+#   retry post's only available payload is stale, we set the
+#   __caption_only_retry__ flag and skip OCR — caption-only Gemini still
+#   catches text-described events.
+# ─────────────────────────────────────────────────────────────
+RETRY_MAX_ATTEMPTS  = 3
+RETRY_ELIGIBLE_TAGS = {'ocr_failed', 'gemini_error'}
+STALE_RAW_DAYS      = 10
+
 
 class _TeeOutput:
     """Forward writes to multiple streams. Used to mirror stdout/stderr to a
@@ -209,6 +233,16 @@ class InstagramEventPipeline:
         self.results = []
         self.failed_ocr = []
         self.successful_ocr = []
+        # Active retry queue state (see RETRY_* constants at module top).
+        # retry_attempts: pid -> prior retry_count read from Processed_Log
+        #   (0 if no Retry Count column yet). Incremented at outcome time.
+        # retry_caption_only: pids whose only available payload is from a
+        #   stale apify_raw dump → skip OCR, send caption directly to Gemini.
+        # retry_metadata: pid -> {prior_result, post_date} so the stale
+        #   detector can decide retry strategy without re-reading the sheet.
+        self.retry_attempts = {}
+        self.retry_caption_only = set()
+        self.retry_metadata = {}
         self.sheets_client = None
         self.main_sheet = None
         self.log_worksheet = None
@@ -375,10 +409,30 @@ class InstagramEventPipeline:
         could snapshot post_results WITHOUT the matching events,
         creating orphans (PR A: orphan hardening)."""
         self.processed_posts.add(pid)
+
+        # Retry-queue accounting. If this pid had a prior retry count loaded
+        # from Processed_Log:
+        #   • a successful outcome (events_found / no_events_found) ends the
+        #     retry cycle — we still write retry_count so the row reflects
+        #     how many attempts it took, but the result is terminal.
+        #   • a re-failure increments the count. If it hits RETRY_MAX_ATTEMPTS
+        #     we tag it permanently_failed so the next setup_sheets skips it.
+        prior_retries = self.retry_attempts.get(pid, 0)
+        new_retry_count = prior_retries
+        if pid in self.retry_attempts:
+            if result in RETRY_ELIGIBLE_TAGS:
+                new_retry_count = prior_retries + 1
+                if new_retry_count >= RETRY_MAX_ATTEMPTS:
+                    result = 'permanently_failed'
+            # If result is a success or terminal (events_found, no_events_found,
+            # permanently_failed) leave new_retry_count as prior_retries — the
+            # row records how many attempts came before this one.
+
         entry = {
             'result': result,
             'account': user,
             'post_date': post_date_str,
+            'retry_count': new_retry_count,
         }
         if result != 'events_found':
             if caption:
@@ -462,7 +516,8 @@ class InstagramEventPipeline:
             date_processed = str(datetime.now(EAST_TZ).date())
             log_rows = [
                 [pid, info.get('account', ''), date_processed, "Auto-Bot", "",
-                 info.get('result', ''), info.get('post_date', '')]
+                 info.get('result', ''), info.get('post_date', ''),
+                 str(info.get('retry_count', 0))]
                 for pid, info in pending.items()
             ]
 
@@ -749,7 +804,7 @@ class InstagramEventPipeline:
                 header = all_rows[0] if all_rows else []
                 data_rows = all_rows[1:] if len(all_rows) > 1 else []
 
-                default_header = ["Post ID", "Account", "Date Processed", "Source", "Notes", "Result", "Post Date"]
+                default_header = ["Post ID", "Account", "Date Processed", "Source", "Notes", "Result", "Post Date", "Retry Count"]
                 updated_header = list(header)
                 needs_update = False
                 if not updated_header or "Post ID" not in updated_header:
@@ -765,6 +820,9 @@ class InstagramEventPipeline:
                     if "Post Date" not in updated_header:
                         updated_header.append("Post Date")
                         needs_update = True
+                    if "Retry Count" not in updated_header:
+                        updated_header.append("Retry Count")
+                        needs_update = True
                 if needs_update:
                     self.log_worksheet.update([updated_header], value_input_option='RAW')
                     print(f"✓ Updated Processed_Log header: {updated_header}")
@@ -773,6 +831,7 @@ class InstagramEventPipeline:
                 result_col = read_header.index("Result") if "Result" in read_header else None
                 post_date_col = read_header.index("Post Date") if "Post Date" in read_header else None
                 date_processed_col = read_header.index("Date Processed") if "Date Processed" in read_header else 1
+                retry_count_col = read_header.index("Retry Count") if "Retry Count" in read_header else None
 
                 _DATE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
                 acct_in_col1 = "Account" in updated_header and updated_header.index("Account") == 1
@@ -790,16 +849,26 @@ class InstagramEventPipeline:
                 else:
                     cutoff = None  # Mode 2: keep full Processed_Log dedup history
 
-                retry_tags = {'ocr_failed', 'gemini_error'}
-                skip_count = 0
-                retry_count = 0
+                retry_tags = RETRY_ELIGIBLE_TAGS
+                # Build a latest-per-pid view first. Append-only Processed_Log
+                # may now contain multiple rows for the same post (each retry
+                # attempt appends a new row), so the *last* row in iteration
+                # order is the current state of that pid. Without this, an
+                # earlier successful retry would be shadowed by an earlier
+                # ocr_failed row and force an unnecessary re-process.
+                latest_per_pid = {}
                 for row in data_rows:
                     if not row:
                         continue
                     pid = row[0].strip() if row else ''
                     if not pid:
                         continue
+                    latest_per_pid[pid] = row  # last write wins
 
+                skip_count = 0
+                retry_count = 0
+                exhausted_count = 0
+                for pid, row in latest_per_pid.items():
                     is_old_row = (
                         acct_in_col1
                         and len(row) > 1
@@ -826,22 +895,52 @@ class InstagramEventPipeline:
                         except ValueError:
                             pass
 
+                    # Retry Count column may not exist on old rows; default 0.
+                    prior_retry_count = 0
+                    if retry_count_col is not None and len(row) > retry_count_col:
+                        raw_rc = row[retry_count_col].strip()
+                        if raw_rc.isdigit():
+                            prior_retry_count = int(raw_rc)
+
                     if cutoff is not None and row_date and row_date < cutoff:
                         self.processed_posts.add(pid)
                         skip_count += 1
                         continue
 
                     if result_tag in retry_tags:
+                        if prior_retry_count >= RETRY_MAX_ATTEMPTS:
+                            # Retry budget exhausted → treat as terminal so
+                            # the post stops cycling through the queue every
+                            # week. _record_post_outcome will tag any new
+                            # appearance as permanently_failed.
+                            self.processed_posts.add(pid)
+                            exhausted_count += 1
+                            continue
+                        # Eligible for active retry: don't add to processed_posts
+                        # so it CAN re-process, and remember the prior count so
+                        # the outcome-recording path increments correctly.
+                        self.retry_attempts[pid] = prior_retry_count
+                        self.retry_metadata[pid] = {
+                            'prior_result': result_tag,
+                            'post_date': post_date_str_row,
+                        }
                         retry_count += 1
+                        continue
+
+                    if result_tag == 'permanently_failed':
+                        # Already given up on this one; skip without re-trying.
+                        self.processed_posts.add(pid)
+                        skip_count += 1
                         continue
 
                     self.processed_posts.add(pid)
                     skip_count += 1
 
-                print(f"✓ History Loaded: Skipping {skip_count} IDs, {retry_count} eligible for retry (ocr_failed/gemini_error).")
+                exhausted_note = f", {exhausted_count} exhausted (>={RETRY_MAX_ATTEMPTS} attempts)" if exhausted_count else ""
+                print(f"✓ History Loaded: Skipping {skip_count} IDs, {retry_count} eligible for retry (ocr_failed/gemini_error){exhausted_note}.")
             except gspread.WorksheetNotFound:
-                self.log_worksheet = self.main_sheet.add_worksheet("Processed_Log", 5000, 7)
-                self.log_worksheet.append_row(["Post ID", "Account", "Date Processed", "Source", "Notes", "Result", "Post Date"])
+                self.log_worksheet = self.main_sheet.add_worksheet("Processed_Log", 5000, 8)
+                self.log_worksheet.append_row(["Post ID", "Account", "Date Processed", "Source", "Notes", "Result", "Post Date", "Retry Count"])
                 print("✓ Created new 'Processed_Log' tab.")
 
         except Exception as e:
@@ -1393,7 +1492,15 @@ class InstagramEventPipeline:
             has_image = bool(display_url)
 
             ocr_text = ""
-            if self.vision_enabled:
+            # Retry-queue posts reconstructed from a stale apify_raw dump have
+            # expired CDN image URLs — calling Vision on them would burn API
+            # quota and 100% fail. The retry-queue builder flags these with
+            # __caption_only_retry__ so we skip OCR entirely. Caption-only
+            # Gemini still catches text-described events. (2026-05-29 design.)
+            caption_only_retry = bool(post.get('__caption_only_retry__'))
+            if caption_only_retry:
+                wprint(f"  ↻ Retry (caption-only): skipping OCR — original image URLs likely expired")
+            elif self.vision_enabled:
                 all_urls = self.collect_carousel_urls(post)
                 if all_urls:
                     num_slides = len(all_urls)
@@ -1427,7 +1534,11 @@ class InstagramEventPipeline:
                 wprint(f"  ⚠ Vision API disabled - relying on text fields only")
 
             has_ocr = bool(ocr_text)
-            ocr_attempted_and_failed = self.vision_enabled and has_image and not has_ocr
+            # caption_only_retry path explicitly didn't run OCR — don't let
+            # downstream tag the outcome as ocr_failed (it isn't).
+            ocr_attempted_and_failed = (
+                self.vision_enabled and has_image and not has_ocr and not caption_only_retry
+            )
             wprint(f"  ↳ Data available: caption={has_caption}, location={has_location}, image={has_image}, OCR={has_ocr}")
 
             all_text = (caption + ' ' + ocr_text).lower()
@@ -1696,10 +1807,24 @@ class InstagramEventPipeline:
             from collections import Counter
             tag_counts = Counter(info.get('result', '') for info in self.post_results.values())
             print(f"\n🏷  RESULT TAG BREAKDOWN:")
-            print(f"  • events_found:    {tag_counts.get('events_found', 0)}")
-            print(f"  • no_events_found: {tag_counts.get('no_events_found', 0)}")
-            print(f"  • ocr_failed:      {tag_counts.get('ocr_failed', 0)}")
-            print(f"  • gemini_error:    {tag_counts.get('gemini_error', 0)}")
+            print(f"  • events_found:       {tag_counts.get('events_found', 0)}")
+            print(f"  • no_events_found:    {tag_counts.get('no_events_found', 0)}")
+            print(f"  • ocr_failed:         {tag_counts.get('ocr_failed', 0)}")
+            print(f"  • gemini_error:       {tag_counts.get('gemini_error', 0)}")
+            if tag_counts.get('permanently_failed', 0):
+                print(f"  • permanently_failed: {tag_counts.get('permanently_failed', 0)} "
+                      f"(retry budget exhausted at {RETRY_MAX_ATTEMPTS} attempts)")
+            retried_pids = [pid for pid in self.post_results if pid in self.retry_attempts]
+            if retried_pids:
+                retry_outcomes = Counter(
+                    self.post_results[pid].get('result', '') for pid in retried_pids
+                )
+                print(f"\n↻  RETRY QUEUE OUTCOMES (this run):")
+                print(f"  • posts retried:      {len(retried_pids)}")
+                print(f"  • now succeeded:      {retry_outcomes.get('events_found', 0)}")
+                print(f"  • no_events_found:    {retry_outcomes.get('no_events_found', 0)}")
+                print(f"  • still failing:      {retry_outcomes.get('ocr_failed', 0) + retry_outcomes.get('gemini_error', 0)}")
+                print(f"  • permanently_failed: {retry_outcomes.get('permanently_failed', 0)}")
 
         shell_accounts = getattr(self, '_shell_accounts', {})
         if shell_accounts:
@@ -1929,6 +2054,13 @@ class InstagramEventPipeline:
                         raw_posts = raw_posts[:cap]
                         print(f"  • Post cap: processing up to {cap} posts")
                     self.setup_sheets()
+                    # Same retry-queue merge as do_force_run — see comment there.
+                    if self.retry_attempts:
+                        in_data_pids = {(p.get('id') or p.get('shortCode')) for p in raw_posts}
+                        in_data_pids.discard(None)
+                        retry_posts = _build_retry_work_list(self, in_data_pids)
+                        if retry_posts:
+                            raw_posts = list(raw_posts) + retry_posts
                     events, ids = self.run_pipeline(raw_posts)
                     self.save_data(events, ids)
 
@@ -2224,6 +2356,110 @@ def _append_dataset_run_log(ts: str, source: str, url: str, dataset_id: str, pos
         print(f"  ⚠ Could not append to dataset_run_log: {e}")
 
 
+def _build_retry_work_list(bot, already_in_data: set) -> list:
+    """Look up payloads for posts in bot.retry_attempts that aren't already
+    being processed via the fresh Apify scrape, and return them as a list
+    of post dicts to merge into the work list.
+
+    Resolution order for each retry pid:
+      1. outputs/apify_raw_*.json  (newest first — this is what main.py writes)
+      2. outputs/apify_cache/*.json (events_from_ids.py's per-dataset cache)
+
+    If the source dump's `fetched_at` is older than STALE_RAW_DAYS, the post's
+    image URLs almost certainly point at expired IG CDN URLs. We still queue
+    the post but tag it with __caption_only_retry__ so _process_post_impl
+    skips OCR and runs Gemini on caption-only. (Approved design — see
+    2026-05-29 conversation: caption-only retry over re-scraping.)
+
+    Pids with no payload available anywhere are silently dropped from this
+    run. They stay in retry_attempts so a future Apify scrape can pick them
+    up if the post comes back into the window.
+    """
+    from glob import glob
+
+    pending = {pid for pid in bot.retry_attempts if pid not in already_in_data}
+    if not pending:
+        return []
+
+    work_list = []
+    found_pids = set()
+    stale_pids = set()
+    cutoff = datetime.now(EAST_TZ) - timedelta(days=STALE_RAW_DAYS)
+
+    def _is_stale(fetched_at_str: str) -> bool:
+        if not fetched_at_str:
+            return True
+        # apify_raw timestamps look like '20260529_142233'
+        try:
+            ts = datetime.strptime(fetched_at_str, '%Y%m%d_%H%M%S').replace(tzinfo=EAST_TZ)
+        except Exception:
+            return True
+        return ts < cutoff
+
+    # Pass 1: newest apify_raw first. Once we find a pid we don't look further.
+    raw_files = sorted(glob('outputs/apify_raw_*.json'), reverse=True)
+    for path in raw_files:
+        if not pending:
+            break
+        try:
+            with open(path) as f:
+                dump = json.load(f)
+        except Exception:
+            continue
+        posts = dump.get('posts') or []
+        fetched_at = dump.get('fetched_at', '')
+        stale = _is_stale(fetched_at)
+        for post in posts:
+            pid = post.get('id') or post.get('shortCode')
+            if not pid or pid not in pending:
+                continue
+            # Shallow copy so we don't mutate the on-disk dump if we add a flag.
+            queued = dict(post)
+            if stale:
+                queued['__caption_only_retry__'] = True
+                stale_pids.add(pid)
+            queued['__is_retry__'] = True
+            work_list.append(queued)
+            found_pids.add(pid)
+            pending.discard(pid)
+
+    # Pass 2: per-dataset apify_cache (used by events_from_ids.py). These don't
+    # carry a fetched_at — we conservatively treat them as stale → caption-only.
+    if pending:
+        cache_files = sorted(glob('outputs/apify_cache/*.json'), reverse=True)
+        for path in cache_files:
+            if not pending:
+                break
+            try:
+                with open(path) as f:
+                    posts = json.load(f)
+            except Exception:
+                continue
+            if not isinstance(posts, list):
+                continue
+            for post in posts:
+                pid = post.get('id') or post.get('shortCode')
+                if not pid or pid not in pending:
+                    continue
+                queued = dict(post)
+                queued['__caption_only_retry__'] = True
+                queued['__is_retry__'] = True
+                stale_pids.add(pid)
+                work_list.append(queued)
+                found_pids.add(pid)
+                pending.discard(pid)
+
+    unresolved = len(bot.retry_attempts) - len(found_pids) - len(
+        {pid for pid in bot.retry_attempts if pid in already_in_data}
+    )
+
+    print(f"  ↻ Retry queue: {len(bot.retry_attempts)} eligible | "
+          f"{len(work_list)} reconstructed from local archives "
+          f"({len(stale_pids)} caption-only due to stale image URLs) | "
+          f"{unresolved} unresolved (no local payload — will wait for Apify rescrape)")
+    return work_list
+
+
 def do_force_run(bot):
     print("\n🚀 Force run initiated...\n")
     run_started_at = datetime.now(EAST_TZ)
@@ -2300,6 +2536,17 @@ def do_force_run(bot):
     if cap:
         data = data[:cap]
         print(f"  • Post cap: processing up to {cap} posts")
+
+    # Merge active-retry queue posts AFTER offset/cap so the per-run cap
+    # only governs the new scrape, not the retry budget. Retries should
+    # be unconditional within RETRY_MAX_ATTEMPTS — they're already a
+    # subset of past failures, not net-new work.
+    if bot.retry_attempts:
+        in_data_pids = {(p.get('id') or p.get('shortCode')) for p in data}
+        in_data_pids.discard(None)
+        retry_posts = _build_retry_work_list(bot, in_data_pids)
+        if retry_posts:
+            data = list(data) + retry_posts
 
     events, ids = bot.run_pipeline(data)
     bot.save_data(events, ids)
