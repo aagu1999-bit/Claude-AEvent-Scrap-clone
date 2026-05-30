@@ -14,6 +14,7 @@ posts fresh because they are no longer in Processed_Log.
 DELETE SCOPE
 ────────────
 STRICT — only rows whose DATE falls in a target window are deleted. Rows
+import os
 from the same post but on other dates are LEFT IN PLACE. (Different from
 reprocess_weekends.py, which sweeps every row sharing a post_id.)
 
@@ -58,7 +59,7 @@ from pathlib import Path
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-SERVICE_ACCOUNT_FILE = "apt-mark-468506-u9-ec44cabc7335 copy.json"
+SERVICE_ACCOUNT_FILE = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or os.environ.get("SERVICE_ACCOUNT_FILE") or "apt-mark-468506-u9-ec44cabc7335 copy.json"
 SHEET_NAME = "Instagram_Events_Master"
 ALL_EVENTS_TAB = "All_Events"
 PROCESSED_LOG_TAB = "Processed_Log"

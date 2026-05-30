@@ -170,7 +170,7 @@ if SCRATCH_MODE:
     CONF["sheet_name"] = scratch_name
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-SERVICE_ACCOUNT_FILE = "apt-mark-468506-u9-ec44cabc7335 copy.json"
+SERVICE_ACCOUNT_FILE = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or os.environ.get("SERVICE_ACCOUNT_FILE") or "apt-mark-468506-u9-ec44cabc7335 copy.json"
 
 # ─────────────────────────────────────────────────────────────
 # Active retry queue (added 2026-05-29).
@@ -643,6 +643,19 @@ class InstagramEventPipeline:
 
             try:
                 evt_sheet = self.main_sheet.worksheet("All_Events")
+                # Existing-tab path: if the tab was created under the prior
+                # 25-col schema and we're now appending 28-col rows (the
+                # provenance migration), explicitly widen first. Same reason
+                # as the Processed_Log resize above — auto-extend is
+                # library-version-dependent, so we make it deterministic.
+                try:
+                    target_cols = len(df.columns)
+                    if evt_sheet.col_count < target_cols:
+                        prev = evt_sheet.col_count
+                        evt_sheet.resize(cols=target_cols)
+                        print(f"  ↳ Widened All_Events: {prev} → {target_cols} cols")
+                except Exception as e:
+                    print(f"  ⚠ Could not pre-resize All_Events (will retry append anyway): {e}")
             except gspread.WorksheetNotFound:
                 # Width bumped from 27 → 30 to accommodate the new RUN ID /
                 # WORKER ID / ATTEMPT ID provenance columns at the right edge.
@@ -879,6 +892,22 @@ class InstagramEventPipeline:
                         updated_header.append("Attempt")
                         needs_update = True
                 if needs_update:
+                    # Explicit width-resize BEFORE the header write. Without
+                    # this, calling .update() with a header wider than the
+                    # current grid relies on gspread's auto-extend behavior,
+                    # which depends on library version + endpoint. For
+                    # Processed_Log going 8 → 11 cols (the v2 schema migration
+                    # this commit ships), we make the resize explicit so
+                    # the first run after a pull never fails with
+                    # "exceeds grid limit".
+                    try:
+                        current_cols = self.log_worksheet.col_count
+                        target_cols = len(updated_header)
+                        if current_cols < target_cols:
+                            self.log_worksheet.resize(cols=target_cols)
+                            print(f"  ↳ Widened Processed_Log: {current_cols} → {target_cols} cols")
+                    except Exception as e:
+                        print(f"  ⚠ Could not pre-resize Processed_Log (will retry update anyway): {e}")
                     self.log_worksheet.update([updated_header], value_input_option='RAW')
                     print(f"✓ Updated Processed_Log header: {updated_header}")
 
@@ -1470,18 +1499,45 @@ class InstagramEventPipeline:
         )
 
         result = None
+        crashed = False
+        crash_summary = ''
         try:
             with post_buffer():
                 result = self._process_post_impl(post, post_num, total, post_id)
             return result
+        except Exception as e:
+            # Tag the crash with [worker_id] [post_id] BEFORE letting it
+            # propagate. The main-thread catch in run_pipeline only sees
+            # (future, exception) and can't infer which worker died — so
+            # the only authoritative attribution happens here, inside the
+            # worker thread. Re-raises so the futures contract is preserved
+            # (run_pipeline still counts/logs the failure).
+            crashed = True
+            crash_summary = f"{type(e).__name__}: {str(e)[:160]}"
+            tb_last = traceback.format_exc().strip().splitlines()[-1] if traceback else ''
+            print_unbuffered(
+                f"❌ [{worker_id}] [{post_num}/{total}] CRASHED on {post_id}: "
+                f"{crash_summary} | {tb_last}"
+            )
+            raise
         finally:
             elapsed = time.time() - t0
             n_events = len(result) if isinstance(result, list) else 0
             plural = '' if n_events == 1 else 's'
-            print_unbuffered(
-                f"[{worker_id}] [{post_num}/{total}] "
-                f"Done in {elapsed:.1f}s ({n_events} event{plural})"
-            )
+            if crashed:
+                # Distinguish "completed with no events" (a normal outcome
+                # for posts that aren't event-related) from "blew up mid-
+                # extraction." Without this, the log line for both cases
+                # was identical: "Done in Xs (0 events)" — misleading.
+                print_unbuffered(
+                    f"[{worker_id}] [{post_num}/{total}] "
+                    f"Crashed after {elapsed:.1f}s ({crash_summary})"
+                )
+            else:
+                print_unbuffered(
+                    f"[{worker_id}] [{post_num}/{total}] "
+                    f"Done in {elapsed:.1f}s ({n_events} event{plural})"
+                )
 
     def _process_post_impl(self, post, post_num, total, post_id):
         with log_post_context(post_id):
@@ -2573,6 +2629,72 @@ def _build_retry_work_list(bot, already_in_data: set) -> list:
     return work_list
 
 
+def preflight_check(strict=False):
+    """Validate that every piece of config required to run end-to-end is
+    actually present. Prints a single banner listing every missing item so
+    the operator can fix them all at once instead of discovering them one
+    crash at a time. Returns the number of missing items.
+
+    Two modes:
+      strict=True  → sys.exit(1) when something is missing. Use for
+                     force-run (--now) so a misconfigured manual run
+                     fails immediately instead of running 20 minutes
+                     before silently degrading.
+      strict=False → log only, return count. Use for the scheduler so
+                     the bot can sit idle waiting for the operator to
+                     drop a secret in without restarting the process.
+
+    Previously the pipeline would log a one-line warning ('⚠ No service
+    account file found. Running in offline mode.') deep in setup output
+    and continue, so a missing GEMINI_API_KEY → forty minutes of failing
+    Gemini calls → no events found → confused operator. This banner
+    fails loud, fails fast, and fails with a fix recipe."""
+    issues = []
+
+    if not os.environ.get("GEMINI_API_KEY", "").strip():
+        issues.append((
+            "GEMINI_API_KEY env var is empty",
+            "Add it under Replit's Secrets (lock icon, left sidebar). "
+            "Required for every Gemini call — pipeline cannot extract events without it.",
+        ))
+
+    apify_on = bool(CONF.get("apify_enabled", True))
+    if apify_on and not os.environ.get("APIFY_API_KEY", "").strip():
+        issues.append((
+            "APIFY_API_KEY env var is empty (apify_enabled=true in config)",
+            "Either add APIFY_API_KEY to Replit Secrets, OR set "
+            "apify_enabled=false in config.json to fall back to instagram_data_url.",
+        ))
+
+    if not os.path.exists(SERVICE_ACCOUNT_FILE):
+        issues.append((
+            f"Google service account JSON not found at '{SERVICE_ACCOUNT_FILE}'",
+            "Either (a) upload a service-account JSON to the repo and set the "
+            "GOOGLE_APPLICATION_CREDENTIALS env var to its path, OR (b) name "
+            "your file 'apt-mark-468506-u9-ec44cabc7335 copy.json' (legacy default). "
+            "Without it: no Sheets sync, no OCR — pipeline runs in degraded local-only mode.",
+        ))
+
+    if not issues:
+        return 0
+
+    print()
+    print("╔══════════════════════════════════════════════════════════════════════╗")
+    print(f"║  ⚠  PREFLIGHT FAILED — {len(issues)} configuration issue(s) detected  " + " " * (16 - len(str(len(issues)))) + "║")
+    print("╚══════════════════════════════════════════════════════════════════════╝")
+    for i, (problem, fix) in enumerate(issues, 1):
+        print(f"\n  [{i}] {problem}")
+        print(f"      → {fix}")
+    print()
+
+    if strict:
+        print("Exiting (use --no-preflight to override, or fix the issues above).\n")
+        sys.exit(1)
+    else:
+        print("Continuing in degraded mode — fix the issues above before the next run.\n")
+    return len(issues)
+
+
 def do_force_run(bot):
     print("\n🚀 Force run initiated...\n")
     run_started_at = datetime.now(EAST_TZ)
@@ -2684,6 +2806,15 @@ if __name__ == "__main__":
     if "--buffered" in sys.argv:
         set_buffered_mode(True)
         print("📦 Buffered-output mode: each post flushes as one atomic block on completion")
+
+    # Preflight: validate every required secret/file BEFORE we spend 20+
+    # minutes silently degrading. --now (manual force-run) gets strict
+    # mode → exit on missing config. The scheduler stays soft so an
+    # operator can drop secrets in mid-process without restarting.
+    # --no-preflight bypasses (useful for offline-mode testing).
+    is_force_run = ("--now" in sys.argv) or bool(CONF.get("run_now", False))
+    if "--no-preflight" not in sys.argv:
+        preflight_check(strict=is_force_run)
 
     bot = InstagramEventPipeline()
     config_forced = CONF.get("run_now", False)

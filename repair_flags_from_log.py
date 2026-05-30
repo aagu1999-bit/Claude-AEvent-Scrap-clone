@@ -86,6 +86,7 @@ SAFETY
 - Preserves manual additions in QUALITY_FLAGS unless --strip-extra
 """
 
+import os
 import argparse
 import csv
 import glob
@@ -101,7 +102,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 from extraction_core import FLAG_TO_COLUMNS, FLAG_BG_COLOR, load_nj_municipalities
 
-SERVICE_ACCOUNT_FILE = "apt-mark-468506-u9-ec44cabc7335 copy.json"
+SERVICE_ACCOUNT_FILE = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or os.environ.get("SERVICE_ACCOUNT_FILE") or "apt-mark-468506-u9-ec44cabc7335 copy.json"
 SHEET_NAME = "Instagram_Events_Master"
 ALL_EVENTS_TAB = "All_Events"
 

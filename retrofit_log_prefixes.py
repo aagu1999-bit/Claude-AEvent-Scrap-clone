@@ -77,8 +77,9 @@ def build_sheet_event_index():
     Post IDs are listed in the order they appear in the sheet.
     """
     import gspread
+    import os as _os
     from oauth2client.service_account import ServiceAccountCredentials
-    SERVICE_ACCOUNT_FILE = "apt-mark-468506-u9-ec44cabc7335 copy.json"
+    SERVICE_ACCOUNT_FILE = _os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or _os.environ.get("SERVICE_ACCOUNT_FILE") or "apt-mark-468506-u9-ec44cabc7335 copy.json"
     SHEET_NAME = "Instagram_Events_Master"
     ALL_EVENTS_TAB = "All_Events"
 

@@ -37,7 +37,7 @@ import pandas as pd
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-SERVICE_ACCOUNT_FILE = "apt-mark-468506-u9-ec44cabc7335 copy.json"
+SERVICE_ACCOUNT_FILE = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or os.environ.get("SERVICE_ACCOUNT_FILE") or "apt-mark-468506-u9-ec44cabc7335 copy.json"
 OUTPUTS_DIR = Path("outputs")
 LOCAL_CSV = OUTPUTS_DIR / "reliable_accounts.csv"
 BLOCKLIST_FILE = Path("promotion_blocklist.json")

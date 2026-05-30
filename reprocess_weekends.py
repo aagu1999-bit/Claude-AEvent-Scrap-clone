@@ -22,7 +22,7 @@ from datetime import datetime, date, timedelta
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-SERVICE_ACCOUNT_FILE = "apt-mark-468506-u9-ec44cabc7335 copy.json"
+SERVICE_ACCOUNT_FILE = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or os.environ.get("SERVICE_ACCOUNT_FILE") or "apt-mark-468506-u9-ec44cabc7335 copy.json"
 SHEET_NAME = "Instagram_Events_Master"
 APIFY_BASE_URL = "https://api.apify.com/v2"
 APIFY_ACTOR = "apify~instagram-scraper"

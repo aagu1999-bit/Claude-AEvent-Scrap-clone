@@ -93,6 +93,7 @@ the file, what to do with it next, and known caveats. Re-runs OVERWRITE
 their own sidecar (timestamp differs, so prior sidecars stay intact).
 """
 
+import os
 import argparse
 import csv
 import sys
@@ -104,7 +105,7 @@ import gspread
 import pandas as pd
 from oauth2client.service_account import ServiceAccountCredentials
 
-SERVICE_ACCOUNT_FILE = "apt-mark-468506-u9-ec44cabc7335 copy.json"
+SERVICE_ACCOUNT_FILE = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or os.environ.get("SERVICE_ACCOUNT_FILE") or "apt-mark-468506-u9-ec44cabc7335 copy.json"
 SHEET_NAME = "Instagram_Events_Master"
 ALL_EVENTS_TAB = "All_Events"
 PROCESSED_LOG_TAB = "Processed_Log"

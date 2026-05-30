@@ -1,3 +1,4 @@
+import os
 import pickle
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -6,7 +7,7 @@ import datetime
 
 # --- CONFIGURATION ---
 CHECKPOINT_FILE = "outputs/pipeline_checkpoint.pkl"  # Correct path
-SERVICE_ACCOUNT_FILE = "apt-mark-468506-u9-ec44cabc7335 copy.json"  # Use your uploaded JSON
+SERVICE_ACCOUNT_FILE = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or os.environ.get("SERVICE_ACCOUNT_FILE") or "apt-mark-468506-u9-ec44cabc7335 copy.json"  # Use your uploaded JSON
 SHEET_NAME = "Instagram_Events_Master"  # The name of the sheet you want to use
 
 

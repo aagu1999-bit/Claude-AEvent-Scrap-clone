@@ -50,7 +50,7 @@ from ig_lookup import normalize_handle, check_handle
 # Config
 # ─────────────────────────────────────────────────────────────
 
-SERVICE_ACCOUNT_FILE = "apt-mark-468506-u9-ec44cabc7335 copy.json"
+SERVICE_ACCOUNT_FILE = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or os.environ.get("SERVICE_ACCOUNT_FILE") or "apt-mark-468506-u9-ec44cabc7335 copy.json"
 SHEET_NAME = "Instagram_Events_Master"
 ACCOUNTS_TAB = "Accounts"
 HYGIENE_TAB = "Account_Hygiene"
