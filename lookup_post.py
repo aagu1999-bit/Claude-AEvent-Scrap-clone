@@ -189,60 +189,107 @@ def get_accounts_set(sheet):
         return None
 
 
+def _row_to_dict(header, row):
+    """Zip a row list with a header list, padding missing cells with ''."""
+    return {col: (row[i] if i < len(row) else '') for i, col in enumerate(header)}
+
+
+def _find_matching_rows(ws, pid):
+    """Robust row-finder. Tries multiple case variants AND falls back to the
+    Instagram URL (which contains the shortcode and is the one column the
+    pipeline does NOT uppercase). Returns:
+      {'header': [...],
+       'row_count': int,
+       'matched_rows': [row_dict, ...],
+       'tried': [list of strings that were searched],
+       'matched_via': str describing how the match was made}
+    """
+    header = ws.row_values(1)
+    # row_count is the worksheet's row dimension, not the populated count
+    populated_row_count = None
+    try:
+        populated_row_count = len(ws.col_values(1))
+    except Exception:
+        populated_row_count = ws.row_count
+
+    candidates = [pid, pid.upper(), pid.lower()]
+    # also try the URL form — instagram_post_url / post_url contain the shortcode
+    # verbatim AND are excluded from save_data's uppercase pass, so case is
+    # preserved. This is the most-likely-to-match fallback if column-based
+    # search misses for any reason.
+    url_form = f"https://www.instagram.com/p/{pid}/"
+    candidates += [url_form, url_form.lower()]
+
+    seen_query = set()
+    cells_found = []
+    matched_via = None
+    tried = []
+    for q in candidates:
+        if q in seen_query or not q:
+            continue
+        seen_query.add(q)
+        tried.append(q)
+        try:
+            hits = ws.findall(q)
+        except Exception as e:
+            tried[-1] = f"{q} (findall error: {e})"
+            continue
+        if hits:
+            cells_found = hits
+            matched_via = q
+            break
+
+    matched_rows = []
+    seen_rownums = set()
+    if cells_found:
+        for cell in cells_found:
+            if cell.row == 1 or cell.row in seen_rownums:
+                continue
+            seen_rownums.add(cell.row)
+            try:
+                row = ws.row_values(cell.row)
+            except Exception:
+                continue
+            matched_rows.append(_row_to_dict(header, row))
+
+    return {
+        'header': header,
+        'row_count': populated_row_count,
+        'matched_rows': matched_rows,
+        'tried': tried,
+        'matched_via': matched_via,
+    }
+
+
 def search_processed_log(sheet, pid):
-    """Return list of dicts (one per matching row, oldest first) or []."""
+    """Return search result dict or None (no sheet access)."""
     if sheet is None:
         return None
     try:
         ws = sheet.worksheet("Processed_Log")
-        all_rows = ws.get_all_values()
-        if not all_rows:
-            return []
-        header = all_rows[0]
-        rows = all_rows[1:]
-        matches = []
-        for row in rows:
-            if row and row[0].strip() == pid:
-                rec = {}
-                for i, col_name in enumerate(header):
-                    rec[col_name] = row[i] if i < len(row) else ''
-                matches.append(rec)
-        return matches
     except Exception as e:
-        print(f"  ⚠ Processed_Log read failed: {e}")
+        print(f"  ⚠ Could not open Processed_Log worksheet: {e}")
+        return None
+    try:
+        return _find_matching_rows(ws, pid)
+    except Exception as e:
+        print(f"  ⚠ Processed_Log search failed: {e}")
         return None
 
 
 def search_all_events(sheet, pid):
-    """Return list of dicts (one per matching row) or []."""
+    """Return search result dict or None (no sheet access)."""
     if sheet is None:
         return None
     try:
         ws = sheet.worksheet("All_Events")
-        all_rows = ws.get_all_values()
-        if not all_rows:
-            return []
-        header = all_rows[0]
-        # Find the POST ID column (case-insensitive)
-        post_id_idx = None
-        for i, h in enumerate(header):
-            if h.strip().upper().replace(' ', '_') in ('POST_ID', 'POSTID', 'POST ID'):
-                post_id_idx = i
-                break
-        if post_id_idx is None:
-            # Fall back to the very last position the schema usually has it
-            return []
-        rows = all_rows[1:]
-        matches = []
-        for row in rows:
-            if post_id_idx < len(row) and row[post_id_idx].strip().upper() == pid.upper():
-                rec = {}
-                for i, col_name in enumerate(header):
-                    rec[col_name] = row[i] if i < len(row) else ''
-                matches.append(rec)
-        return matches
     except Exception as e:
-        print(f"  ⚠ All_Events read failed: {e}")
+        print(f"  ⚠ Could not open All_Events worksheet: {e}")
+        return None
+    try:
+        return _find_matching_rows(ws, pid)
+    except Exception as e:
+        print(f"  ⚠ All_Events search failed: {e}")
         return None
 
 
@@ -397,35 +444,53 @@ def report_post(pid, sheet, accounts_set, run_log):
 
     # ─── 3. Processed_Log ────────────────────────────────────────
     section("PROCESSED_LOG ENTRIES")
-    pl_rows = search_processed_log(sheet, pid)
-    if pl_rows is None:
+    pl_res = search_processed_log(sheet, pid)
+    if pl_res is None:
         print("  ? Could not read Processed_Log (no sheet access).")
-    elif not pl_rows:
-        print("  ✗ No rows in Processed_Log for this post_id.")
-        print("    → The pipeline NEVER processed this post.")
     else:
-        # Show newest first (assume last in iteration = newest)
-        for i, row in enumerate(reversed(pl_rows), 1):
-            print(f"  [{i}] " + " | ".join(
-                f"{k}={v!r}" for k, v in row.items() if v
-            ))
+        print(f"  · tab has ~{pl_res['row_count']} populated rows")
+        print(f"  · header ({len(pl_res['header'])} cols): {pl_res['header']}")
+        print(f"  · queries tried: {pl_res['tried']}")
+        if not pl_res['matched_rows']:
+            print("  ✗ No rows matched any case/URL variant of the post_id.")
+            print("    → The pipeline NEVER processed this post — OR there's a "
+                  "case mismatch we still aren't catching. If you can SEE this "
+                  "post_id in the sheet, copy the EXACT cell text and re-run.")
+        else:
+            print(f"  ✓ matched_via={pl_res['matched_via']!r} → "
+                  f"{len(pl_res['matched_rows'])} row(s):")
+            for i, row in enumerate(reversed(pl_res['matched_rows']), 1):
+                print(f"  [{i}] " + " | ".join(
+                    f"{k}={v!r}" for k, v in row.items() if v
+                ))
 
     # ─── 4. All_Events ───────────────────────────────────────────
     section("ALL_EVENTS ENTRIES")
-    ae_rows = search_all_events(sheet, pid)
-    if ae_rows is None:
+    ae_res = search_all_events(sheet, pid)
+    if ae_res is None:
         print("  ? Could not read All_Events (no sheet access).")
-    elif not ae_rows:
-        print("  ✗ No event rows in All_Events for this post_id.")
     else:
-        print(f"  ✓ {len(ae_rows)} event row(s):")
-        for i, row in enumerate(ae_rows, 1):
+        print(f"  · tab has ~{ae_res['row_count']} populated rows")
+        print(f"  · header ({len(ae_res['header'])} cols): {ae_res['header']}")
+        print(f"  · queries tried: {ae_res['tried']}")
+        if not ae_res['matched_rows']:
+            print("  ✗ No rows matched any case/URL variant of the post_id.")
+        else:
+            print(f"  ✓ matched_via={ae_res['matched_via']!r} → "
+                  f"{len(ae_res['matched_rows'])} event row(s):")
             interesting = ['EVENT NAME', 'DATE', 'START TIME', 'VENUE NAME', 'CITY',
-                           'CONFIDENCE', 'QUALITY FLAGS', 'WORKER ID', 'RUN ID', 'ATTEMPT ID']
-            print(f"    Event #{i}:")
-            for k in interesting:
-                if k in row and row[k]:
-                    print(f"      {k:<14} {row[k]}")
+                           'CONFIDENCE', 'QUALITY FLAGS', 'INSTAGRAM HANDLE',
+                           'INSTAGRAM POST URL', 'WORKER ID', 'RUN ID', 'ATTEMPT ID',
+                           'PROCESSED TIMESTAMP', 'HAD OCR', 'FROM CALENDAR']
+            for i, row in enumerate(ae_res['matched_rows'], 1):
+                print(f"    Event #{i}:")
+                for k in interesting:
+                    if k in row and row[k]:
+                        print(f"      {k:<22} {row[k]}")
+                # also dump any non-empty columns we didn't list above
+                extras = [k for k in row if k not in interesting and row[k]]
+                if extras:
+                    print(f"      (other non-empty: {extras})")
 
     # ─── 5. Anomaly summaries ────────────────────────────────────
     section("ANOMALY SUMMARIES")
@@ -513,6 +578,30 @@ def main():
         print(f"  ⚠ Accounts tab unreadable — owner membership check disabled.")
 
     run_log = load_dataset_run_log()
+
+    # ─── Local archive census ─────────────────────────────────────
+    # The most common "the tool says nothing exists" cause is that Replit
+    # wiped outputs/ between runs. Print archive counts upfront so we know
+    # whether the local-search sections are searching real data or thin air.
+    raw_count    = len(glob.glob(APIFY_RAW_GLOB))
+    cache_count  = len(glob.glob(APIFY_CACHE_GLOB))
+    log_count    = len(glob.glob(RUN_LOG_GLOB))
+    anom_count   = len(glob.glob(ANOMALIES_GLOB))
+    csv_count    = len(glob.glob(EVENTS_CSV_GLOB))
+    print()
+    print(f"  [LOCAL ARCHIVE CENSUS]")
+    print(f"  · apify_raw_*.json    : {raw_count} file(s)")
+    print(f"  · apify_cache/*.json  : {cache_count} file(s)")
+    print(f"  · run_*.log           : {log_count} file(s)")
+    print(f"  · anomalies_*.json    : {anom_count} file(s)")
+    print(f"  · Events_*.csv        : {csv_count} file(s)")
+    print(f"  · dataset_run_log     : {'present' if DATASET_RUN_LOG.exists() else 'MISSING'}")
+    if raw_count == 0 and log_count == 0:
+        print()
+        print(f"  ⚠ NO local apify_raw or run logs found in outputs/. Local-")
+        print(f"    archive sections WILL come back empty for every post; this")
+        print(f"    is a Replit-state issue, not a per-post diagnosis. Sheet-")
+        print(f"    backed sections (Processed_Log, All_Events) are still valid.")
 
     for pid in pids:
         report_post(pid, sheet, accounts_set, run_log)
