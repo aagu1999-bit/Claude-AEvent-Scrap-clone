@@ -72,26 +72,180 @@ def divider(char="─", width=72):
 
 
 # ─────────────────────────────────────────────────────────────────
+# Identifier resolution
+# ─────────────────────────────────────────────────────────────────
+# The pipeline stores `post.get('id') or post.get('shortCode')` as the
+# canonical `pid` in BOTH Processed_Log column 1 and All_Events POST ID.
+# When Apify provides the numeric `id` field (which it does for live
+# scrapes), that numeric id is what's stored — NOT the URL shortcode.
+# The shortcode only survives in the URL columns (INSTAGRAM POST URL,
+# POST URL).
+#
+# So if a user passes the shortcode `DWzhk0Wjf6y` they will:
+#   • match in All_Events via the INSTAGRAM POST URL column
+#   • NOT match in Processed_Log (which only has the numeric id)
+#   • NOT match in apify_raw dumps when our search bug used
+#     `p.get('id') or p.get('shortCode') == pid` (short-circuit picks
+#     id-or-shortCode whichever is truthy first and compares only that)
+#
+# `gather_identifiers` resolves a user-typed shortcode into the FULL
+# identifier set (shortcode + numeric id + URL forms) by cross-referencing
+# All_Events and any local Apify dumps. After this resolution, every
+# downstream search can query by any-of-the-set and stops missing data.
+# ─────────────────────────────────────────────────────────────────
+
+
+def _add_case_variants(s, into):
+    if not s:
+        return
+    into.add(s)
+    into.add(s.strip())
+    into.add(s.strip().upper())
+    into.add(s.strip().lower())
+
+
+def _post_id_col_idx(header):
+    """Return the index of the POST ID column in a sheet header, or None.
+    Tolerant of formatting variations (case, underscore vs space)."""
+    for i, h in enumerate(header):
+        nm = h.strip().upper().replace('_', ' ')
+        if nm in ('POST ID', 'POSTID'):
+            return i
+    return None
+
+
+def gather_identifiers(user_input, sheet):
+    """Build the full identifier set for a post given user input.
+
+    Resolution passes (each pass can add to the set; later passes use
+    earlier-pass results to find more):
+      1. The user input + case variants + URL form (if input looks like a
+         shortcode, i.e. not a pure numeric id).
+      2. All_Events lookup: for every identifier in the set, run findall
+         on All_Events. From each matched row, extract POST ID (numeric
+         id) and INSTAGRAM POST URL (shortcode-bearing URL). Add those.
+      3. Local Apify dumps: for any dump-post whose `id` OR `shortCode`
+         is in the current set, add the OTHER field too. This cross-
+         pollinates id <-> shortCode when the dump knows both.
+
+    Returns: (id_set, resolution_log)
+      id_set: set of all known identifiers for this post
+      resolution_log: list of human-readable steps for the report
+    """
+    ids = set()
+    log = []
+    inp = (user_input or '').strip()
+    if not inp:
+        return ids, log
+
+    # Pass 1: input + variants
+    _add_case_variants(inp, ids)
+    is_shortcode_like = not inp.isdigit() and 'instagram.com' not in inp.lower()
+    if is_shortcode_like:
+        _add_case_variants(f"https://www.instagram.com/p/{inp}/", ids)
+    elif 'instagram.com/p/' in inp.lower():
+        # User passed a full URL — extract the shortcode part
+        sc = inp.rstrip('/').rsplit('/p/', 1)[-1].split('/')[0].split('?')[0]
+        _add_case_variants(sc, ids)
+    log.append(f"pass1 input+variants → {len(ids)} ids")
+
+    before = len(ids)
+
+    # Pass 2: All_Events resolution (only if sheet is available)
+    if sheet is not None:
+        try:
+            ws = sheet.worksheet("All_Events")
+            header = ws.row_values(1)
+            pid_col = _post_id_col_idx(header)
+            url_cols = [i for i, h in enumerate(header)
+                        if h.strip().upper() in
+                        ('INSTAGRAM POST URL', 'POST URL')]
+            queries_to_try = sorted(ids)
+            matched_row_nums = set()
+            for q in queries_to_try:
+                try:
+                    cells = ws.findall(q)
+                except Exception:
+                    continue
+                for cell in cells:
+                    if cell.row == 1 or cell.row in matched_row_nums:
+                        continue
+                    matched_row_nums.add(cell.row)
+            for rn in sorted(matched_row_nums):
+                try:
+                    row = ws.row_values(rn)
+                except Exception:
+                    continue
+                if pid_col is not None and pid_col < len(row) and row[pid_col]:
+                    _add_case_variants(row[pid_col].strip(), ids)
+                for ci in url_cols:
+                    if ci < len(row) and row[ci]:
+                        _add_case_variants(row[ci].strip(), ids)
+                        # Also extract bare shortcode from URL
+                        url_val = row[ci].strip()
+                        if 'instagram.com/p/' in url_val.lower():
+                            sc = url_val.rstrip('/').rsplit('/p/', 1)[-1].split('/')[0].split('?')[0]
+                            _add_case_variants(sc, ids)
+            log.append(f"pass2 All_Events matched {len(matched_row_nums)} row(s) → {len(ids)} ids")
+        except Exception as e:
+            log.append(f"pass2 All_Events failed: {e}")
+    else:
+        log.append("pass2 All_Events skipped (no sheet)")
+
+    after_pass2 = len(ids)
+
+    # Pass 3: Apify dump cross-pollination (id <-> shortCode)
+    raw_files = sorted(glob.glob(APIFY_RAW_GLOB))
+    cache_files = sorted(glob.glob(APIFY_CACHE_GLOB))
+    dump_count = 0
+    for path in raw_files + cache_files:
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            posts = data.get('posts') or []
+        elif isinstance(data, list):
+            posts = data
+        else:
+            continue
+        for p in posts:
+            p_id = str(p.get('id') or '').strip()
+            p_sc = str(p.get('shortCode') or p.get('shortcode') or '').strip()
+            if (p_id and p_id in ids) or (p_sc and p_sc in ids):
+                if p_id:
+                    _add_case_variants(p_id, ids)
+                if p_sc:
+                    _add_case_variants(p_sc, ids)
+                dump_count += 1
+    log.append(f"pass3 Apify dumps cross-pollinated {dump_count} match(es) → {len(ids)} ids")
+
+    # Drop empties
+    ids.discard('')
+    ids.discard(None)
+    return ids, log
+
+
+# ─────────────────────────────────────────────────────────────────
 # 1 & 2. Local Apify dump search
 # ─────────────────────────────────────────────────────────────────
-def search_apify_dumps(pid):
-    """Search every apify_raw_*.json and apify_cache/*.json for the pid.
-    Returns:
-      {
-        'first_seen': (timestamp_str, path),
-        'last_seen' : (timestamp_str, path),
-        'count'     : int,
-        'owner'     : str,
-        'caption'   : str,
-        'image_urls': [str, ...],
-        'dataset_ids': set,
-        'all_hits'  : [(path, dump_meta_dict), ...],
-      } — or None if not found anywhere.
-    """
+def search_apify_dumps(id_set):
+    """Search every apify_raw_*.json and apify_cache/*.json for any post whose
+    `id` OR `shortCode` is in id_set. (Critical: check both fields
+    independently rather than `id or shortCode == pid` — the latter
+    short-circuits and only compares one of the two, missing matches when
+    Apify provides both. This was the original bug that lied about scrape
+    history.)"""
     raw_files = sorted(glob.glob(APIFY_RAW_GLOB))
     cache_files = sorted(glob.glob(APIFY_CACHE_GLOB))
 
     hits = []   # list of (path, post_dict, fetched_at, dataset_id)
+
+    def _match(p):
+        p_id = str(p.get('id') or '').strip()
+        p_sc = str(p.get('shortCode') or p.get('shortcode') or '').strip()
+        return (p_id and p_id in id_set) or (p_sc and p_sc in id_set)
 
     for path in raw_files:
         try:
@@ -103,7 +257,7 @@ def search_apify_dumps(pid):
         fetched_at = dump.get('fetched_at', '')
         dataset_id = dump.get('dataset_id', '')
         for p in posts:
-            if (p.get('id') or p.get('shortCode')) == pid:
+            if _match(p):
                 hits.append((path, p, fetched_at, dataset_id))
 
     for path in cache_files:
@@ -114,11 +268,9 @@ def search_apify_dumps(pid):
             continue
         if not isinstance(posts, list):
             continue
-        # Cache files are named by dataset_id; pull from filename.
         ds_id = Path(path).stem
         for p in posts:
-            if (p.get('id') or p.get('shortCode')) == pid:
-                # Cache files don't have a fetched_at — leave blank.
+            if _match(p):
                 hits.append((path, p, '', ds_id))
 
     if not hits:
@@ -194,40 +346,24 @@ def _row_to_dict(header, row):
     return {col: (row[i] if i < len(row) else '') for i, col in enumerate(header)}
 
 
-def _find_matching_rows(ws, pid):
-    """Robust row-finder. Tries multiple case variants AND falls back to the
-    Instagram URL (which contains the shortcode and is the one column the
-    pipeline does NOT uppercase). Returns:
-      {'header': [...],
-       'row_count': int,
-       'matched_rows': [row_dict, ...],
-       'tried': [list of strings that were searched],
-       'matched_via': str describing how the match was made}
-    """
+def _find_matching_rows(ws, id_set):
+    """Row-finder driven by an identifier set. Runs ws.findall() for every
+    identifier and aggregates matched rows, deduping by row number.
+
+    Returns dict with header, populated row_count, list of matched_rows,
+    list of queries tried, and matched_via (which queries produced hits)."""
     header = ws.row_values(1)
-    # row_count is the worksheet's row dimension, not the populated count
-    populated_row_count = None
     try:
         populated_row_count = len(ws.col_values(1))
     except Exception:
         populated_row_count = ws.row_count
 
-    candidates = [pid, pid.upper(), pid.lower()]
-    # also try the URL form — instagram_post_url / post_url contain the shortcode
-    # verbatim AND are excluded from save_data's uppercase pass, so case is
-    # preserved. This is the most-likely-to-match fallback if column-based
-    # search misses for any reason.
-    url_form = f"https://www.instagram.com/p/{pid}/"
-    candidates += [url_form, url_form.lower()]
-
-    seen_query = set()
-    cells_found = []
-    matched_via = None
+    cells_by_query = {}
+    matched_via = []
     tried = []
-    for q in candidates:
-        if q in seen_query or not q:
+    for q in sorted(id_set):
+        if not q:
             continue
-        seen_query.add(q)
         tried.append(q)
         try:
             hits = ws.findall(q)
@@ -235,14 +371,13 @@ def _find_matching_rows(ws, pid):
             tried[-1] = f"{q} (findall error: {e})"
             continue
         if hits:
-            cells_found = hits
-            matched_via = q
-            break
+            cells_by_query[q] = hits
+            matched_via.append(q)
 
     matched_rows = []
     seen_rownums = set()
-    if cells_found:
-        for cell in cells_found:
+    for q in matched_via:
+        for cell in cells_by_query[q]:
             if cell.row == 1 or cell.row in seen_rownums:
                 continue
             seen_rownums.add(cell.row)
@@ -261,8 +396,7 @@ def _find_matching_rows(ws, pid):
     }
 
 
-def search_processed_log(sheet, pid):
-    """Return search result dict or None (no sheet access)."""
+def search_processed_log(sheet, id_set):
     if sheet is None:
         return None
     try:
@@ -271,14 +405,13 @@ def search_processed_log(sheet, pid):
         print(f"  ⚠ Could not open Processed_Log worksheet: {e}")
         return None
     try:
-        return _find_matching_rows(ws, pid)
+        return _find_matching_rows(ws, id_set)
     except Exception as e:
         print(f"  ⚠ Processed_Log search failed: {e}")
         return None
 
 
-def search_all_events(sheet, pid):
-    """Return search result dict or None (no sheet access)."""
+def search_all_events(sheet, id_set):
     if sheet is None:
         return None
     try:
@@ -287,7 +420,7 @@ def search_all_events(sheet, pid):
         print(f"  ⚠ Could not open All_Events worksheet: {e}")
         return None
     try:
-        return _find_matching_rows(ws, pid)
+        return _find_matching_rows(ws, id_set)
     except Exception as e:
         print(f"  ⚠ All_Events search failed: {e}")
         return None
@@ -296,8 +429,8 @@ def search_all_events(sheet, pid):
 # ─────────────────────────────────────────────────────────────────
 # 6. Anomaly summaries
 # ─────────────────────────────────────────────────────────────────
-def search_anomalies(pid):
-    """Return list of (run_id, anomaly_entry_dict)."""
+def search_anomalies(id_set):
+    """Return list of (run_id, path, anomaly_entry) for any identifier hit."""
     matches = []
     for path in sorted(glob.glob(ANOMALIES_GLOB)):
         try:
@@ -306,28 +439,45 @@ def search_anomalies(pid):
         except Exception:
             continue
         run_id = data.get('run_id', Path(path).stem.replace('anomalies_', ''))
-        # Anomaly file layouts have varied; defend against both:
-        # newer: {'run_id':..., 'anomalies': {pid: {...}}}
-        # older: a dict of pid → entry directly
+        # Newer: {'run_id':..., 'anomalies': {pid: {...}}}
+        # Older: a dict of pid → entry directly
         anomalies = data.get('anomalies') or data
-        if isinstance(anomalies, dict) and pid in anomalies:
-            matches.append((run_id, path, anomalies[pid]))
+        if not isinstance(anomalies, dict):
+            continue
+        for ident in id_set:
+            if ident and ident in anomalies:
+                matches.append((run_id, path, anomalies[ident]))
+                break  # one entry per file
     return matches
 
 
 # ─────────────────────────────────────────────────────────────────
 # 7. Run log grep
 # ─────────────────────────────────────────────────────────────────
-def search_run_logs(pid, max_lines_per_file=80):
-    """Return list of (logfile_path, [matching_line, ...])."""
-    pattern = f"[{pid}]"  # the worker tag includes [pid] explicitly
+def search_run_logs(id_set, max_lines_per_file=120):
+    """Return list of (logfile_path, [matching_line, ...]).
+    Matches a line if ANY identifier in id_set appears in it. Worker tags
+    use `[pid]` format, so the bracket-wrapped form is the strongest signal,
+    but bare identifier hits are still informative (e.g. setup logs)."""
+    bracket_patterns = {f"[{ident}]" for ident in id_set if ident}
+    bare_patterns = {ident for ident in id_set if ident and len(ident) > 4}
     matches = []
     for path in sorted(glob.glob(RUN_LOG_GLOB)):
         hits = []
         try:
             with open(path, errors='replace') as f:
                 for line in f:
-                    if pattern in line:
+                    matched = False
+                    for bp in bracket_patterns:
+                        if bp in line:
+                            matched = True
+                            break
+                    if not matched:
+                        for bp in bare_patterns:
+                            if bp in line:
+                                matched = True
+                                break
+                    if matched:
                         hits.append(line.rstrip())
                         if len(hits) >= max_lines_per_file:
                             hits.append(f"  ... ({len(hits)}+ matches, truncated)")
@@ -342,21 +492,22 @@ def search_run_logs(pid, max_lines_per_file=80):
 # ─────────────────────────────────────────────────────────────────
 # 8. Events CSV history
 # ─────────────────────────────────────────────────────────────────
-def search_events_csvs(pid):
-    """Return list of (csv_path, list_of_row_dicts_for_this_pid)."""
+def search_events_csvs(id_set):
+    """Return list of (csv_path, list_of_row_dicts) for any identifier hit
+    in the POST ID column (across schema variants)."""
     matches = []
+    id_set_upper = {i.upper() for i in id_set if i}
     for path in sorted(glob.glob(EVENTS_CSV_GLOB)):
         rows = []
         try:
             with open(path, newline='', errors='replace') as f:
                 reader = csv.DictReader(f)
-                # Schemas have changed over time — try multiple column names
                 for r in reader:
                     pid_in_row = (
                         r.get('POST ID') or r.get('post_id') or r.get('POST_ID')
                         or r.get('Post ID') or ''
                     ).strip()
-                    if pid_in_row.upper() == pid.upper():
+                    if pid_in_row.upper() in id_set_upper:
                         rows.append(r)
         except Exception:
             continue
@@ -405,9 +556,27 @@ def report_post(pid, sheet, accounts_set, run_log):
     print(f"  URL : https://www.instagram.com/p/{pid}/")
     divider("═")
 
+    # ─── 0. Identifier resolution ────────────────────────────────
+    # CRITICAL step: the pipeline stores `post.get('id') or post.get('shortCode')`
+    # as the canonical pid. When Apify provides both, the numeric `id` wins,
+    # so Processed_Log / All_Events POST ID hold the numeric id and the
+    # shortcode lives only in URL columns. Resolve user input to all known
+    # forms before doing any search.
+    section("IDENTIFIER RESOLUTION")
+    id_set, res_log = gather_identifiers(pid, sheet)
+    for line in res_log:
+        print(f"  · {line}")
+    if id_set:
+        print(f"  → Final identifier set ({len(id_set)} entries):")
+        for ident in sorted(id_set):
+            short = ident if len(ident) <= 80 else ident[:77] + "..."
+            print(f"      • {short}")
+    else:
+        print("  ⚠ Could not resolve any identifiers for this input.")
+
     # ─── 1. Apify scrape history ─────────────────────────────────
     section("APIFY SCRAPE HISTORY")
-    scrape = search_apify_dumps(pid)
+    scrape = search_apify_dumps(id_set)
     if scrape is None:
         print("  ✗ Not found in any local apify_raw_*.json or apify_cache/")
         print("    → Either never scraped, OR raw dumps have been deleted.")
@@ -444,20 +613,22 @@ def report_post(pid, sheet, accounts_set, run_log):
 
     # ─── 3. Processed_Log ────────────────────────────────────────
     section("PROCESSED_LOG ENTRIES")
-    pl_res = search_processed_log(sheet, pid)
+    pl_res = search_processed_log(sheet, id_set)
     if pl_res is None:
         print("  ? Could not read Processed_Log (no sheet access).")
     else:
         print(f"  · tab has ~{pl_res['row_count']} populated rows")
         print(f"  · header ({len(pl_res['header'])} cols): {pl_res['header']}")
-        print(f"  · queries tried: {pl_res['tried']}")
+        print(f"  · queries tried ({len(pl_res['tried'])}): "
+              f"{pl_res['tried'][:5]}{' ...' if len(pl_res['tried']) > 5 else ''}")
         if not pl_res['matched_rows']:
-            print("  ✗ No rows matched any case/URL variant of the post_id.")
-            print("    → The pipeline NEVER processed this post — OR there's a "
-                  "case mismatch we still aren't catching. If you can SEE this "
-                  "post_id in the sheet, copy the EXACT cell text and re-run.")
+            print("  ✗ No rows matched any identifier.")
+            print("    → If this post genuinely processed but isn't here, it was")
+            print("      either added to All_Events via a recovery tool that")
+            print("      bypasses Processed_Log, OR the worker crashed before")
+            print("      writing Processed_Log (orphan).")
         else:
-            print(f"  ✓ matched_via={pl_res['matched_via']!r} → "
+            print(f"  ✓ matched via {pl_res['matched_via']} → "
                   f"{len(pl_res['matched_rows'])} row(s):")
             for i, row in enumerate(reversed(pl_res['matched_rows']), 1):
                 print(f"  [{i}] " + " | ".join(
@@ -466,21 +637,23 @@ def report_post(pid, sheet, accounts_set, run_log):
 
     # ─── 4. All_Events ───────────────────────────────────────────
     section("ALL_EVENTS ENTRIES")
-    ae_res = search_all_events(sheet, pid)
+    ae_res = search_all_events(sheet, id_set)
     if ae_res is None:
         print("  ? Could not read All_Events (no sheet access).")
     else:
         print(f"  · tab has ~{ae_res['row_count']} populated rows")
         print(f"  · header ({len(ae_res['header'])} cols): {ae_res['header']}")
-        print(f"  · queries tried: {ae_res['tried']}")
+        print(f"  · queries tried ({len(ae_res['tried'])}): "
+              f"{ae_res['tried'][:5]}{' ...' if len(ae_res['tried']) > 5 else ''}")
         if not ae_res['matched_rows']:
-            print("  ✗ No rows matched any case/URL variant of the post_id.")
+            print("  ✗ No rows matched any identifier.")
         else:
-            print(f"  ✓ matched_via={ae_res['matched_via']!r} → "
+            print(f"  ✓ matched via {ae_res['matched_via']} → "
                   f"{len(ae_res['matched_rows'])} event row(s):")
-            interesting = ['EVENT NAME', 'DATE', 'START TIME', 'VENUE NAME', 'CITY',
-                           'CONFIDENCE', 'QUALITY FLAGS', 'INSTAGRAM HANDLE',
-                           'INSTAGRAM POST URL', 'WORKER ID', 'RUN ID', 'ATTEMPT ID',
+            interesting = ['POST ID', 'EVENT NAME', 'DATE', 'START TIME',
+                           'VENUE NAME', 'CITY', 'CONFIDENCE', 'QUALITY FLAGS',
+                           'QUALITY_FLAGS', 'INSTAGRAM HANDLE', 'INSTAGRAM POST URL',
+                           'WORKER ID', 'RUN ID', 'ATTEMPT ID',
                            'PROCESSED TIMESTAMP', 'HAD OCR', 'FROM CALENDAR']
             for i, row in enumerate(ae_res['matched_rows'], 1):
                 print(f"    Event #{i}:")
@@ -494,7 +667,7 @@ def report_post(pid, sheet, accounts_set, run_log):
 
     # ─── 5. Anomaly summaries ────────────────────────────────────
     section("ANOMALY SUMMARIES")
-    anom = search_anomalies(pid)
+    anom = search_anomalies(id_set)
     if not anom:
         print("  · No anomaly entries (post either succeeded or pre-dates anomaly tracking).")
     else:
@@ -509,7 +682,7 @@ def report_post(pid, sheet, accounts_set, run_log):
 
     # ─── 6. Run logs ─────────────────────────────────────────────
     section("RUN LOG SNIPPETS")
-    logs = search_run_logs(pid)
+    logs = search_run_logs(id_set)
     if not logs:
         print("  · No matches in any run_*.log (either never logged, or logs cleaned up).")
     else:
@@ -520,7 +693,7 @@ def report_post(pid, sheet, accounts_set, run_log):
 
     # ─── 7. Events CSVs ──────────────────────────────────────────
     section("EVENTS_*.CSV HISTORY")
-    csvs = search_events_csvs(pid)
+    csvs = search_events_csvs(id_set)
     if not csvs:
         print("  · No event rows for this post in any Events_*.csv file.")
     else:
