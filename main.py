@@ -102,8 +102,8 @@ def load_configuration():
         "rate_limit_delay": 0.5,
         "history_max_age_days": 30,
         "apify_enabled": True,
-        "apify_posts_per_profile": 9,
-        "apify_newer_than_days": 14,
+        "apify_posts_per_profile": 25,
+        "apify_newer_than_days": 21,
     }
 
     if os.path.exists("config.json"):
