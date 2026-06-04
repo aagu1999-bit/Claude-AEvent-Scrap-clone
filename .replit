@@ -60,6 +60,19 @@ args = "python reprocess_weekends.py --confirm"
 [workflows.workflow.metadata]
 outputType = "console"
 
+# UI Dashboard — Streamlit on port 8080. Replit's webview previews it
+# automatically. Spawns main.py / lookup_post.py / audits as subprocess.
+[[workflows.workflow]]
+name = "UI Dashboard"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "streamlit run ui.py --server.port 8080 --server.address 0.0.0.0"
+
+[workflows.workflow.metadata]
+outputType = "console"
+
 [userenv]
 
 [userenv.shared]
