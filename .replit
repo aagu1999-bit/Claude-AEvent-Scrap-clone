@@ -7,67 +7,15 @@ channel = "stable-25_05"
 packages = ["glibcLocales"]
 
 [workflows]
-# Replit's big "Run" button launches the UI Dashboard — a safe entry point
-# that lets you choose what to do next (start a pipeline run, look up a
-# post, run an audit). The old default ("Project") ran main.py +
-# migrate_history.py + reprocess_weekends.py --confirm in PARALLEL, which
-# is not safe (reprocess_weekends with --confirm destroys data without a
-# prompt). That workflow still exists below but is no longer the default.
+# The UI Dashboard is the single Replit workflow now. All previous
+# workflows (Event Pipeline, History Migration, Reprocess Weekends, and
+# the parallel "Project" that fired all three at once with --confirm
+# bypasses) are launched from inside the UI instead, where they have
+# proper confirms, progress tails, and live state. Consolidating to
+# one workflow removes the footgun of accidentally selecting a
+# destructive workflow from the dropdown.
 runButton = "UI Dashboard"
 
-[[workflows.workflow]]
-name = "Project"
-mode = "parallel"
-author = "agent"
-
-[[workflows.workflow.tasks]]
-task = "workflow.run"
-args = "Event Pipeline"
-
-[[workflows.workflow.tasks]]
-task = "workflow.run"
-args = "History Migration"
-
-[[workflows.workflow.tasks]]
-task = "workflow.run"
-args = "Reprocess Weekends"
-
-[[workflows.workflow]]
-name = "Event Pipeline"
-author = "agent"
-mode = "sequential"
-
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "python main.py"
-
-[workflows.workflow.metadata]
-outputType = "console"
-
-[[workflows.workflow]]
-name = "History Migration"
-author = "agent"
-
-[workflows.workflow.metadata]
-outputType = "console"
-
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "python migrate_history.py"
-
-[[workflows.workflow]]
-name = "Reprocess Weekends"
-author = "agent"
-
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "python reprocess_weekends.py --confirm"
-
-[workflows.workflow.metadata]
-outputType = "console"
-
-# UI Dashboard — Streamlit on port 8080. Replit's webview previews it
-# automatically. Spawns main.py / lookup_post.py / audits as subprocess.
 [[workflows.workflow]]
 name = "UI Dashboard"
 author = "agent"

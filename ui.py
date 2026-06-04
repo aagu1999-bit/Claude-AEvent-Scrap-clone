@@ -716,6 +716,13 @@ AUDIT_TOOLS = [
                        "extractions look off and you want a fresh pass.",
         "needs_confirm_arg": True,  # this one requires --confirm
     },
+    {
+        "name": "History Migration",
+        "script": "migrate_history.py",
+        "description": "One-time migration: copy IDs from outputs/pipeline_checkpoint.pkl into "
+                       "the Processed_Log sheet. Used to import a local-only history into Sheets. "
+                       "Safe to re-run (skips IDs already present).",
+    },
 ]
 
 
