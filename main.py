@@ -67,6 +67,7 @@ from extraction_core import (
     FLAG_TO_COLUMNS           as ec_FLAG_TO_COLUMNS,
     FLAG_BG_COLOR             as ec_FLAG_BG_COLOR,
     FLAG_TO_COLOR             as ec_FLAG_TO_COLOR,
+    FLAG_TO_TEXT_COLOR        as ec_FLAG_TO_TEXT_COLOR,
     # PR B — shared prompt builder; replaces the inline f-string in
     # process_post. Both main.py and events_from_ids.py call this so
     # extractions stay in lockstep.
@@ -672,6 +673,37 @@ class InstagramEventPipeline:
                         print(f"  ↳ Widened All_Events: {prev} → {target_cols} cols")
                 except Exception as e:
                     print(f"  ⚠ Could not pre-resize All_Events (will retry append anyway): {e}")
+
+                # Header row refresh: when the schema added columns at the
+                # end (RUN ID / WORKER ID / ATTEMPT ID at Z/AA/AB), existing
+                # sheets kept their old 25-col header — Z/AA/AB had data but
+                # no labels. Rewrite row 1 to match the current df.columns
+                # whenever the live header doesn't already match.
+                #
+                # Cache after first successful pass so we don't re-read row
+                # 1 on every subsequent EVENTS_FLUSH_THRESHOLD-sized flush
+                # (1 API call * many flushes = wasted quota). Reset on
+                # process restart, which is what we want — confirms once
+                # per run.
+                #
+                # current[:len(expected)] is a slice, not a pad — when
+                # current is shorter than expected (e.g., 25 vs 28), the
+                # slice returns the 25-element list, which won't equal the
+                # 28-element expected, so the rewrite triggers correctly.
+                if not getattr(self, '_all_events_header_verified', False):
+                    try:
+                        expected = [str(c) for c in df.columns]
+                        current  = [str(v) for v in evt_sheet.row_values(1)]
+                        if current[:len(expected)] != expected:
+                            evt_sheet.update(
+                                range_name='A1',
+                                values=[expected],
+                                value_input_option='USER_ENTERED',
+                            )
+                            print(f"  ↳ Refreshed All_Events header row ({len(expected)} cols)")
+                        self._all_events_header_verified = True
+                    except Exception as e:
+                        print(f"  ⚠ Could not refresh All_Events header: {e}")
             except gspread.WorksheetNotFound:
                 # Width bumped from 27 → 30 to accommodate the new RUN ID /
                 # WORKER ID / ATTEMPT ID provenance columns at the right edge.
@@ -2065,27 +2097,31 @@ class InstagramEventPipeline:
                 print(f"     ... and {len(shell_accounts) - 20} more (full list in anomaly summary)")
 
     def _apply_quality_flag_formatting(self, evt_sheet, df, start_row):
-        """B5: apply per-cell highlighting based on each event's
-        quality_flags. Uses the canonical FLAG_TO_COLUMNS + FLAG_TO_COLOR
-        mappings from extraction_core so main.py and events_from_ids.py
-        produce identical visual signals on All_Events.
+        """B5: apply per-cell highlighting AND rich-text styling based on
+        each event's quality_flags. Uses the canonical FLAG_TO_COLUMNS +
+        FLAG_TO_COLOR + FLAG_TO_TEXT_COLOR mappings from extraction_core
+        so main.py and events_from_ids.py produce identical visual signals
+        on All_Events.
 
-        Each flag in an event's quality_flags maps to specific sheet columns
-        (DATE for date flags, CITY+SECTION OF NJ for region flags, etc.).
-        Only the cells corresponding to the flags get highlighted — not the
-        entire row — so operators can identify WHICH field is uncertain at
-        a glance.
+        Two layers, applied independently to each row:
 
-        Per-flag color (round 2, 2026-06):
-          • PINK   — "wrong field" flags (VENUE_IS_HANDLE, VENUE_EQUALS_*,
-                     VENUE_TRUNCATED, VENUE_OUT_OF_NJ_REGION)
-          • ORANGE — "probably not an event" flags (PERSONAL_POST_SIGNALS,
-                     NO_EVENT_SIGNALS, EVENT_NAME_GENERIC, CAPTION_ONLY_NO_OCR)
-          • YELLOW — legacy + missing-field flags (default)
+        1. Data-cell background color (legacy). Each flag's FLAG_TO_COLUMNS
+           list names sheet columns; their cells get backgroundColor set per
+           FLAG_TO_COLOR. Multiple flags on one cell → strongest color wins
+           per pink > orange > yellow priority. (Orange-tier flags have no
+           FLAG_TO_COLUMNS entries in round 2 — they style only the token
+           inside the QUALITY FLAGS cell. See FLAG_TO_TEXT_COLOR.)
 
-        When multiple flags target the SAME cell, the strongest color wins
-        per the priority pink > orange > yellow — so a cell flagged with
-        both VENUE_IS_HANDLE and MISSING_VENUE gets pink, not yellow."""
+        2. Rich-text token styling in QUALITY FLAGS (round 2, 2026-06-04).
+           Every flag in FLAG_TO_TEXT_COLOR renders its literal token bold
+           + colored (pink for "wrong field", orange for "probably not
+           event") inside the comma-separated cell content. Yellow-tier
+           tokens stay unstyled. This is applied via the Sheets API's
+           textFormatRuns mechanism, batched into ONE batch_update call.
+
+        Only NEW rows being appended (start_row → end) are styled. Back-
+        catalog rows are intentionally left as-is — per the user's
+        2026-06-04 review, retroactive repaint is out of scope."""
         if 'QUALITY FLAGS' not in df.columns:
             return
         try:
@@ -2094,9 +2130,10 @@ class InstagramEventPipeline:
             return
 
         # Build column-letter map from canonical header → A1 letter.
-        # df.columns are already uppercase + space-separated (line 1181
-        # in save_data uppercases them); convert to the same form
-        # FLAG_TO_COLUMNS uses.
+        # df.columns are uppercase + space-separated by the time we get
+        # here (save_data uppercases and replaces underscores), so
+        # FLAG_TO_COLUMNS keys MUST also use spaces (round-1 bug fixed
+        # 2026-06-04: 'QUALITY_FLAGS' silently lost the lookup).
         col_letter_by_name = {}
         for i, c in enumerate(df.columns):
             if i < 26:
@@ -2105,30 +2142,42 @@ class InstagramEventPipeline:
                 col_letter_by_name[c] = chr(ord('A') + (i // 26) - 1) + chr(ord('A') + (i % 26))
 
         # Color priority — higher rank wins when multiple flags hit one cell.
-        # PINK (wrong field) > ORANGE (not-an-event) > YELLOW (legacy/missing).
+        # PINK (wrong field) > YELLOW (legacy/missing). Orange-tier flags
+        # have NO FLAG_TO_COLUMNS entries in round 2 — they only style the
+        # token inside the QUALITY FLAGS cell via FLAG_TO_TEXT_COLOR, never
+        # paint a data cell. So the rank function only needs to disambiguate
+        # pink-vs-yellow on the data-cell path.
         def _color_rank(color):
-            if color is ec_FLAG_TO_COLOR.get('VENUE_IS_HANDLE'):  # pink
+            if color is ec_FLAG_TO_COLOR.get('VENUE_IS_HANDLE'):  # pink sentinel
                 return 2
-            # Compare against any orange flag's color
-            if color is ec_FLAG_TO_COLOR.get('PERSONAL_POST_SIGNALS'):  # orange
-                return 1
             return 0  # yellow default
 
-        format_requests = []
+        format_requests = []   # data-cell background highlights (gspread batch_format)
+        text_run_requests = [] # rich-text styling (Sheets batch_update updateCells)
+
+        # Resolve QUALITY FLAGS column index for the rich-text path. We
+        # need this both as a string -> letter (for the data-cell path) and
+        # as a numeric 0-based index (for the textFormatRuns request).
+        quality_flags_col_letter = col_letter_by_name.get('QUALITY FLAGS')
+
         rows_list = df.values.tolist()
         for offset, row in enumerate(rows_list):
             flags_str = row[flag_col_idx] if flag_col_idx < len(row) else ''
             if not flags_str:
                 continue
             row_num = start_row + offset
-            # Map (col_label) → best (highest-rank) color from all flags hitting it
+
+            # ── Data-cell background highlights ─────────────────────────
             cell_color = {}
             for f in str(flags_str).split(','):
                 f = f.strip()
                 if not f:
                     continue
                 cols = ec_FLAG_TO_COLUMNS.get(f, [])
-                color = ec_FLAG_TO_COLOR.get(f, ec_FLAG_BG_COLOR)
+                color = ec_FLAG_TO_COLOR.get(f)
+                if not color:
+                    # Yellow-tier flag (or unmapped) — use default yellow
+                    color = ec_FLAG_BG_COLOR
                 for col_label in cols:
                     existing = cell_color.get(col_label)
                     if existing is None or _color_rank(color) > _color_rank(existing):
@@ -2142,21 +2191,166 @@ class InstagramEventPipeline:
                     'format': {'backgroundColor': color},
                 })
 
-        if not format_requests:
+            # ── Rich-text token styling inside QUALITY FLAGS ───────────
+            if quality_flags_col_letter:
+                runs = self._build_quality_flag_text_runs(str(flags_str))
+                if runs:
+                    text_run_requests.append({
+                        'row_num':  row_num,
+                        'col_idx':  flag_col_idx,
+                        'runs':     runs,
+                        'value':    str(flags_str),
+                    })
+
+        # ── Apply data-cell highlights via gspread batch_format ─────────
+        if format_requests:
+            try:
+                evt_sheet.batch_format(format_requests)
+                print(f"✓ Applied {len(format_requests)} per-cell quality-flag highlights")
+            except AttributeError:
+                # Older gspread without batch_format — fall back to per-cell
+                for fr in format_requests:
+                    try:
+                        evt_sheet.format(fr['range'], fr['format'])
+                        time.sleep(0.3)
+                    except Exception as e2:
+                        print(f"    ⚠ Format failed for {fr['range']}: {str(e2)[:80]}")
+            except Exception as e:
+                print(f"  ⚠ batch_format failed: {str(e)[:120]}")
+
+        # ── Apply rich-text token styling via Sheets batchUpdate ────────
+        if text_run_requests:
+            self._apply_quality_flag_text_runs(evt_sheet, text_run_requests)
+
+    @staticmethod
+    def _build_quality_flag_text_runs(flags_str):
+        """For a QUALITY FLAGS cell content like 'FLAG_A,FLAG_B,FLAG_C',
+        produce Sheets API textFormatRuns that style each pink/orange flag
+        token bold + colored. Yellow-tier tokens stay in default formatting.
+
+        Returns a list of {startIndex, format} dicts ready for inclusion in
+        an updateCells request, or [] if nothing in the string needs styling.
+
+        Sheets API note: a TextFormatRun starts at startIndex and applies
+        until the next run's startIndex. To "reset" after a styled token,
+        we emit a run at the position AFTER the token with the default
+        format (bold=False, foregroundColor=black). When two adjacent
+        styled tokens have the same format, we collapse intermediate
+        resets so the comma between them stays in default format too."""
+        if not flags_str:
+            return []
+        s = str(flags_str)
+        # Build a list of (start, end, color) for every token that needs
+        # styling. We scan token boundaries (comma-delimited) rather than
+        # using regex search to avoid accidentally matching a flag name
+        # that's a substring of another (e.g., "NO_EVENT_SIGNALS" inside
+        # a hypothetical "X_NO_EVENT_SIGNALS_Y").
+        spans = []
+        cursor = 0
+        for part in s.split(','):
+            # The token starts where leading whitespace ends.
+            stripped = part.lstrip()
+            lead_ws = len(part) - len(stripped)
+            token_start = cursor + lead_ws
+            token_text = stripped.rstrip()
+            token_end = token_start + len(token_text)
+            if token_text:
+                color = ec_FLAG_TO_TEXT_COLOR.get(token_text)
+                if color:
+                    spans.append((token_start, token_end, color))
+            cursor += len(part) + 1  # +1 for the comma we split on
+
+        if not spans:
+            return []
+
+        # Sort by start (already sorted, but defensive)
+        spans.sort(key=lambda t: t[0])
+
+        # Build TextFormatRuns:
+        #   • A styled run at each token's start (bold + colored)
+        #   • A default run right after each styled token to reset
+        # The Sheets API requires the first run to start at index 0 if
+        # we want any preceding text to use the default. Emit an initial
+        # default run if the first styled span doesn't start at 0.
+        #
+        # CRITICAL invariant (per Sheets API spec): every TextFormatRun's
+        # startIndex must be strictly less than len(cell_value). A run at
+        # exactly len(s) makes Sheets reject the entire batchUpdate with
+        # INVALID_ARGUMENT, which aborts ALL styling for the flush — not
+        # just this row. So when a styled token ends AT the end of the
+        # string, we omit the trailing reset (there's no text after it
+        # that would need resetting anyway).
+        n = len(s)
+        DEFAULT_FORMAT = {"bold": False, "foregroundColor": {"red": 0.0, "green": 0.0, "blue": 0.0}}
+        runs = []
+        if spans[0][0] > 0:
+            runs.append({"startIndex": 0, "format": DEFAULT_FORMAT})
+        for start, end, color in spans:
+            runs.append({
+                "startIndex": start,
+                "format": {"bold": True, "foregroundColor": color},
+            })
+            if end < n:
+                runs.append({
+                    "startIndex": end,
+                    "format": DEFAULT_FORMAT,
+                })
+        # Defensive: confirm runs are strictly ascending by startIndex.
+        # With the emission pattern above this is guaranteed (spans are
+        # sorted, tokens don't overlap, and the trailing-reset guard means
+        # no run ever lands at len(s)). Asserting catches future regressions.
+        for i in range(1, len(runs)):
+            assert runs[i]["startIndex"] > runs[i - 1]["startIndex"], (
+                f"TextFormatRuns out of order: {runs[i-1]} → {runs[i]} for {s!r}"
+            )
+        return runs
+
+    def _apply_quality_flag_text_runs(self, evt_sheet, requests):
+        """Apply rich-text styling to QUALITY FLAGS cells via the Sheets
+        API batchUpdate. Each request specifies a row, a column index, the
+        textFormatRuns to apply, and the cell value (preserved so that the
+        update doesn't blank the text content).
+
+        Bundles ALL row updates into ONE batch_update call — keeps API
+        cost at one round trip even when we're styling thousands of rows."""
+        if not requests:
             return
         try:
-            evt_sheet.batch_format(format_requests)
-            print(f"✓ Applied {len(format_requests)} per-cell quality-flag highlights")
-        except AttributeError:
-            # Older gspread without batch_format — fall back to per-cell
-            for fr in format_requests:
-                try:
-                    evt_sheet.format(fr['range'], fr['format'])
-                    time.sleep(0.3)
-                except Exception as e2:
-                    print(f"    ⚠ Format failed for {fr['range']}: {str(e2)[:80]}")
+            sheet_id = evt_sheet.id
         except Exception as e:
-            print(f"  ⚠ batch_format failed: {str(e)[:120]}")
+            print(f"  ⚠ Could not resolve sheet id for rich-text runs: {e}")
+            return
+
+        body_requests = []
+        for r in requests:
+            row_zero = r['row_num'] - 1  # API is 0-indexed
+            col_zero = r['col_idx']
+            body_requests.append({
+                "updateCells": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": row_zero,
+                        "endRowIndex": row_zero + 1,
+                        "startColumnIndex": col_zero,
+                        "endColumnIndex": col_zero + 1,
+                    },
+                    "rows": [{
+                        "values": [{
+                            # Preserve the cell value — without this the
+                            # updateCells request clears it.
+                            "userEnteredValue": {"stringValue": r['value']},
+                            "textFormatRuns": r['runs'],
+                        }]
+                    }],
+                    "fields": "userEnteredValue,textFormatRuns",
+                }
+            })
+
+        try:
+            self.main_sheet.batch_update({"requests": body_requests})
+            print(f"✓ Applied {len(body_requests)} rich-text quality-flag styles")
+        except Exception as e:
+            print(f"  ⚠ rich-text batch_update failed: {str(e)[:160]}")
 
     def save_data(self, events, post_log):
         # Final Processed_Log flush. Most entries are already there from

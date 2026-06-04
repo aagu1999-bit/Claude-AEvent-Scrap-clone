@@ -106,14 +106,17 @@ FLAG_TO_COLUMNS = {
     'CITY_NOT_IN_NJ_LOOKUP': ['CITY', 'SECTION OF NJ'],
     'REGION_AUTOFIXED':      ['SECTION OF NJ'],
     'LOW_CONFIDENCE':        ['CONFIDENCE'],
-    # Post-level flags: only the flag cell itself is highlighted, not specific
-    # data fields (since these concerns are about the post overall). The
-    # QUALITY_FLAGS cell becomes the visual signal — its content names the
-    # flag, the highlight provides quick scan-ability.
-    'CALENDAR_LOW_EVENTS':   ['QUALITY_FLAGS'],
-    'CAROUSEL_LOW_EVENTS':   ['QUALITY_FLAGS'],
-    'OCR_RICH_LOW_EVENTS':   ['QUALITY_FLAGS'],
-    'ACCOUNT_PATTERN_DROP':  ['QUALITY_FLAGS'],
+    # Post-level flags: only the QUALITY FLAGS cell itself is highlighted,
+    # not specific data fields (since these concerns are about the post
+    # overall). The column key MUST be 'QUALITY FLAGS' (with a space) — the
+    # consumer's column-letter map is built from df.columns AFTER the
+    # underscore-to-space replacement in main.py's save_data, so the
+    # underscore form 'QUALITY_FLAGS' silently failed to look up a letter
+    # and the cell never got highlighted. Round 1 bug, found 2026-06-04.
+    'CALENDAR_LOW_EVENTS':   ['QUALITY FLAGS'],
+    'CAROUSEL_LOW_EVENTS':   ['QUALITY FLAGS'],
+    'OCR_RICH_LOW_EVENTS':   ['QUALITY FLAGS'],
+    'ACCOUNT_PATTERN_DROP':  ['QUALITY FLAGS'],
     # NO_GROUNDING fires when the source post had no caption + no OCR text,
     # yet events were extracted. The DESCRIPTION field is the most suspect —
     # it's the field Gemini fabricates most aggressively when there's nothing
@@ -121,17 +124,31 @@ FLAG_TO_COLUMNS = {
     # source mentions). Highlighting DESCRIPTION points the reviewer at the
     # field that's most likely hallucinated.
     'NO_GROUNDING':          ['DESCRIPTION'],
-    # ── Round 2 (2026-06) "wrong field" flags — pink highlight, see FLAG_TO_COLOR ──
+    # ── Round 2 (2026-06) "wrong field" flags — PINK data-cell highlight.
+    # Also styled bold + pink inside the QUALITY FLAGS cell via the
+    # textFormatRuns path (see FLAG_TO_TEXT_COLOR below + main.py's
+    # _apply_quality_flag_text_runs). Pink keeps the data-cell highlight
+    # because the whole point of these flags is "this specific field is
+    # wrong" — coloring the field cell tells you which one to look at.
     'VENUE_IS_HANDLE':         ['VENUE NAME'],
     'VENUE_EQUALS_EVENT_NAME': ['VENUE NAME', 'EVENT NAME'],
     'VENUE_EQUALS_ACCOUNT':    ['VENUE NAME'],
     'VENUE_TRUNCATED':         ['VENUE NAME'],
     'VENUE_OUT_OF_NJ_REGION':  ['CITY', 'SECTION OF NJ'],
-    # ── Round 2 "probably not an event" flags — orange highlight ──
-    'PERSONAL_POST_SIGNALS':   ['QUALITY_FLAGS'],
-    'NO_EVENT_SIGNALS':        ['QUALITY_FLAGS'],
-    'EVENT_NAME_GENERIC':      ['EVENT NAME'],
-    'CAPTION_ONLY_NO_OCR':     ['HAD OCR'],
+    # ── Round 2 "probably not an event" flags — ORANGE rich-text only.
+    # These intentionally do NOT have data-cell entries. Per the user's
+    # 2026-06-04 review: orange-tier flags should style the flag *token*
+    # inside the QUALITY FLAGS cell (bold + orange text) rather than
+    # painting an unrelated data cell (e.g., EVENT_NAME_GENERIC used to
+    # paint the EVENT NAME cell orange, which was confusing — the issue
+    # is the overall post quality, not the event-name field per se).
+    # Wiring lives in FLAG_TO_TEXT_COLOR below.
+    #
+    # 'PERSONAL_POST_SIGNALS': (rich text only)
+    # 'NO_EVENT_SIGNALS':      (rich text only)
+    # 'EVENT_NAME_GENERIC':    (rich text only)
+    # 'CAPTION_ONLY_NO_OCR':   (rich text only)
+
     # ── Round 2 "missing field" flags — yellow (default) ──
     'MISSING_VENUE':           ['VENUE NAME'],
     'MISSING_CITY':            ['CITY'],
@@ -155,18 +172,57 @@ FLAG_BG_COLOR        = {"red": 1.0,  "green": 0.97, "blue": 0.78}  # YELLOW  —
 FLAG_BG_COLOR_PINK   = {"red": 0.99, "green": 0.83, "blue": 0.87}  # PINK    — wrong field
 FLAG_BG_COLOR_ORANGE = {"red": 1.0,  "green": 0.88, "blue": 0.72}  # ORANGE  — probably not event
 
-# Per-flag color dispatch. Flags not listed fall back to FLAG_BG_COLOR
-# (yellow). New "wrong field" flags get pink — they signal the model
-# named a specific field incorrectly. New "probably not event" flags
-# get orange — they signal the whole row likely shouldn't exist.
+# Per-flag DATA-CELL color dispatch. Flags not listed fall back to
+# FLAG_BG_COLOR (yellow). "Wrong field" flags get pink — they signal
+# the model named a specific field incorrectly, so the data cell
+# (VENUE NAME, CITY, etc.) gets the highlight.
+#
+# Orange-tier "probably not event" flags are NOT in this dict — they
+# style the flag *token* inside the QUALITY FLAGS cell via the rich-text
+# path (FLAG_TO_TEXT_COLOR + _apply_quality_flag_text_runs in main.py).
+# Per the user's 2026-06-04 review: highlighting EVENT NAME orange when
+# EVENT_NAME_GENERIC fired was confusing — the issue is the overall
+# post quality, not a specific field being wrong.
 FLAG_TO_COLOR = {
-    # Pink: wrong-field signals
+    # Pink: wrong-field signals — paints the offending data cell pink
     'VENUE_IS_HANDLE':         FLAG_BG_COLOR_PINK,
     'VENUE_EQUALS_EVENT_NAME': FLAG_BG_COLOR_PINK,
     'VENUE_EQUALS_ACCOUNT':    FLAG_BG_COLOR_PINK,
     'VENUE_TRUNCATED':         FLAG_BG_COLOR_PINK,
     'VENUE_OUT_OF_NJ_REGION':  FLAG_BG_COLOR_PINK,
-    # Orange: probably-not-an-event signals
+}
+
+# ─────────────────────────────────────────────────────────────────
+# Rich-text styling for flag tokens inside the QUALITY FLAGS cell.
+# ─────────────────────────────────────────────────────────────────
+# When a flag in this dict appears in the QUALITY FLAGS comma-separated
+# string, the *token* (the literal flag name characters) renders bold +
+# colored — pink for "wrong field" flags, orange for "probably not
+# event" flags. Yellow-tier flags (legacy + missing) are NOT styled —
+# they render in default unbolded text.
+#
+# This is independent of FLAG_TO_COLOR (which controls data-cell
+# background). A row with VENUE_EQUALS_EVENT_NAME gets BOTH:
+#   · VENUE NAME + EVENT NAME cell backgrounds painted pink
+#     (via FLAG_TO_COLOR + FLAG_TO_COLUMNS)
+#   · the "VENUE_EQUALS_EVENT_NAME" token inside QUALITY FLAGS rendered
+#     bold + pink (via FLAG_TO_TEXT_COLOR)
+# A row with PERSONAL_POST_SIGNALS gets ONLY:
+#   · the token rendered bold + orange in QUALITY FLAGS
+#   · no data-cell background highlight (orange-tier flags don't
+#     attribute to a specific field)
+#
+# Per-character formatting in Sheets cells is the textFormatRuns feature
+# of spreadsheets.values.batchUpdateByDataFilter / spreadsheets.batchUpdate
+# updateCells request. main.py builds the runs and applies them per row.
+FLAG_TO_TEXT_COLOR = {
+    # Pink-tier — bold + pink token text
+    'VENUE_IS_HANDLE':         FLAG_BG_COLOR_PINK,
+    'VENUE_EQUALS_EVENT_NAME': FLAG_BG_COLOR_PINK,
+    'VENUE_EQUALS_ACCOUNT':    FLAG_BG_COLOR_PINK,
+    'VENUE_TRUNCATED':         FLAG_BG_COLOR_PINK,
+    'VENUE_OUT_OF_NJ_REGION':  FLAG_BG_COLOR_PINK,
+    # Orange-tier — bold + orange token text (no data-cell highlight)
     'PERSONAL_POST_SIGNALS':   FLAG_BG_COLOR_ORANGE,
     'NO_EVENT_SIGNALS':        FLAG_BG_COLOR_ORANGE,
     'EVENT_NAME_GENERIC':      FLAG_BG_COLOR_ORANGE,

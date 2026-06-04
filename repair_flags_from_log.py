@@ -755,6 +755,13 @@ def main():
     if missing:
         print(f"❌ Missing required columns in sheet header: {missing}", file=sys.stderr)
         sys.exit(1)
+    # 2026-06-04: alias the QUALITY FLAGS column index under both header
+    # forms. Round-2 FLAG_TO_COLUMNS now uses 'QUALITY FLAGS' (with space)
+    # as the canonical column name (e.g. CALENDAR_LOW_EVENTS,
+    # CAROUSEL_LOW_EVENTS, etc.). Without the alias, the paint/wipe loop
+    # below silently skips those post-level flags because cols.get(col_name)
+    # returns None.
+    cols['QUALITY FLAGS'] = cols['QUALITY_FLAGS']
 
     # Build sheet index by composite key
     print("  Indexing sheet rows...")

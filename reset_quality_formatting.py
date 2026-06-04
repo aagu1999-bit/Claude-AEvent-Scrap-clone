@@ -106,15 +106,28 @@ def main():
     sh = setup_sheet()
     ws = sh.worksheet(ALL_EVENTS_TAB)
     header = ws.row_values(1)
-    if 'QUALITY_FLAGS' not in header:
-        print(f"❌ QUALITY_FLAGS column not in header — nothing to do", file=sys.stderr)
+    # Accept either header form. 2026-06-04: main.py rewrites row 1 to use
+    # SPACE-separated column names ('QUALITY FLAGS'), but sheets that
+    # haven't been touched by the new main.py still have the underscore
+    # form. Take whichever exists.
+    if 'QUALITY FLAGS' in header:
+        flags_col_idx = header.index('QUALITY FLAGS')
+    elif 'QUALITY_FLAGS' in header:
+        flags_col_idx = header.index('QUALITY_FLAGS')
+    else:
+        print(f"❌ QUALITY FLAGS / QUALITY_FLAGS column not in header — nothing to do", file=sys.stderr)
         sys.exit(1)
 
-    flags_col_idx = header.index('QUALITY_FLAGS')
     last_col_letter = idx_to_col_letter(len(header) - 1)
 
-    # Map header column names → A1 letters
+    # Map header column names → A1 letters. Add both forms of the QUALITY
+    # FLAGS key so downstream FLAG_TO_COLUMNS lookups (which may use either
+    # 'QUALITY FLAGS' or 'QUALITY_FLAGS' depending on the flag's vintage)
+    # all resolve to the right cell letter.
     col_letter_by_name = {name: idx_to_col_letter(i) for i, name in enumerate(header)}
+    qf_letter = idx_to_col_letter(flags_col_idx)
+    col_letter_by_name.setdefault('QUALITY FLAGS', qf_letter)
+    col_letter_by_name.setdefault('QUALITY_FLAGS', qf_letter)
 
     print(f"  Reading All_Events rows...")
     all_data = ws.get_all_values()

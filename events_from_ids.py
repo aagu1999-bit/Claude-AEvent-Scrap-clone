@@ -115,11 +115,17 @@ ALL_EVENTS_HEADER = [
     "EVENT TYPE", "ACCOUNT NAME", "DESCRIPTION", "PERFORMER", "PRICE",
     "CONFIDENCE", "POST ID", "HAD OCR", "FROM CALENDAR",
     "IS RECURRING", "PROCESSED TIMESTAMP",
-    "QUALITY_FLAGS",        # added today: per-row sanity-check fingerprint
-    "RECURRENCE_PATTERN",   # added today: e.g., "Mon-Fri", "Every Saturday", "Daily"
+    # 2026-06-04: Header column names now use SPACES (was underscores).
+    # main.py's save_data() normalizes columns via .upper().replace('_', ' '),
+    # and main.py now rewrites row 1 to match. Keeping these in sync with
+    # main.py's df.columns prevents a header ping-pong on shared sheets.
+    "QUALITY FLAGS",        # per-row sanity-check fingerprint
+    "RECURRENCE PATTERN",   # e.g., "Mon-Fri", "Every Saturday", "Daily"
+    # Provenance — matches main.py's All_Events output and Processed_Log.
+    "RUN ID", "WORKER ID", "ATTEMPT ID",
 ]
-QUALITY_FLAGS_COL_IDX = ALL_EVENTS_HEADER.index("QUALITY_FLAGS")
-RECURRENCE_PATTERN_COL_IDX = ALL_EVENTS_HEADER.index("RECURRENCE_PATTERN")
+QUALITY_FLAGS_COL_IDX = ALL_EVENTS_HEADER.index("QUALITY FLAGS")
+RECURRENCE_PATTERN_COL_IDX = ALL_EVENTS_HEADER.index("RECURRENCE PATTERN")
 
 BATCH_SIZE = 25
 BATCH_DELAY_SEC = 1.5
@@ -920,8 +926,16 @@ def event_to_row(event: dict, run_tag: str = "") -> list:
         "FROM CALENDAR": up(event.get('from_calendar', '')),
         "IS RECURRING": up(event.get('is_recurring', '')),
         "PROCESSED TIMESTAMP": event.get('processed_timestamp', ''),
-        "QUALITY_FLAGS": event.get('quality_flags', ''),
-        "RECURRENCE_PATTERN": up(event.get('recurrence_pattern', '')),
+        # Header column names now use SPACES (see ALL_EVENTS_HEADER above).
+        # main.py 2026-06-04 made these the canonical form.
+        "QUALITY FLAGS":      event.get('quality_flags', ''),
+        "RECURRENCE PATTERN": up(event.get('recurrence_pattern', '')),
+        # Provenance — populated when available; empty string is the safe
+        # default for events_from_ids.py since this tool doesn't track
+        # main.py's run_id / worker_id / attempt_id metadata.
+        "RUN ID":     event.get('run_id', ''),
+        "WORKER ID":  event.get('worker_id', ''),
+        "ATTEMPT ID": event.get('attempt_id', ''),
     }
     return [fields[col] for col in ALL_EVENTS_HEADER]
 

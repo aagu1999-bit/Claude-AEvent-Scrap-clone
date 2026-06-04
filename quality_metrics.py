@@ -93,7 +93,12 @@ def compute_metrics(rows, header, since=None):
     # Resolve column indices once
     col = {name: header.index(name) for name in header}
     pid_idx     = col.get('POST ID')
-    flags_idx   = col.get('QUALITY_FLAGS')
+    # 2026-06-04: accept either header form. main.py rewrites row 1 to use
+    # SPACE-separated 'QUALITY FLAGS' as the canonical, but older sheets
+    # still have the underscore form. Prefer canonical first.
+    flags_idx   = col.get('QUALITY FLAGS')
+    if flags_idx is None:
+        flags_idx = col.get('QUALITY_FLAGS')
     conf_idx    = col.get('CONFIDENCE')
     city_idx    = col.get('CITY')
     date_idx    = col.get('DATE')
