@@ -479,7 +479,11 @@ def screen_run():
                 st.error("No dataset URL set.")
             else:
                 save_config({"instagram_data_url": new_url, "apify_enabled": False})
-                pid = _spawn([sys.executable, "main.py"], JOB_KIND_RUN, extra={"trigger": "path_a"})
+                # --now forces immediate execution. Without it, main.py
+                # enters scheduler mode and waits for the schedule_day/time
+                # match instead of running. The user clicking Run Pipeline
+                # almost always wants "now," not "next Thursday."
+                pid = _spawn([sys.executable, "main.py", "--now"], JOB_KIND_RUN, extra={"trigger": "path_a"})
                 st.success(f"Pipeline started (PID {pid}).")
                 time.sleep(0.6)
                 st.rerun()
@@ -776,8 +780,11 @@ def screen_settings():
     with st.expander("**Schedule**", expanded=False):
         st.markdown(
             '<span class="muted">'
-            "Only relevant if main.py is run in scheduler mode (via cron / Replit deployment). "
-            "Has no effect on manual UI-triggered runs."
+            "main.py has two modes: <b>scheduler</b> (loops forever waiting for the next "
+            "schedule_day/time match) and <b>run now</b> (fires immediately). The UI's Run "
+            "Pipeline buttons always use <code>--now</code>, so these schedule settings only "
+            "matter if you launch main.py from a cron job or the Replit shell without "
+            "<code>--now</code>."
             "</span>",
             unsafe_allow_html=True,
         )
@@ -802,6 +809,31 @@ def screen_settings():
                         "schedule_time": sched_time.strip(),
                     })
                     st.success("Saved to config.json")
+
+        # Quick "run now" shortcut from the Schedule section — same effect
+        # as the Run screen's Run Pipeline (Path A) button.
+        st.markdown("---")
+        run_status, _ = _job_status(JOB_KIND_RUN)
+        if run_status == "running":
+            st.info("A pipeline run is already in progress — go to **Run** to see the live log.")
+        else:
+            st.markdown(
+                '<span class="muted">'
+                "Skip the schedule and trigger main.py right now."
+                "</span>",
+                unsafe_allow_html=True,
+            )
+            if st.button("⚡ Run Now (skip schedule)", key="settings_run_now", type="primary"):
+                current_url = cfg.get("instagram_data_url", "").strip()
+                if not current_url:
+                    st.error("No dataset URL is set in config.json. Set one in **Run** (Path A) first.")
+                else:
+                    pid = _spawn(
+                        [sys.executable, "main.py", "--now"],
+                        JOB_KIND_RUN,
+                        extra={"trigger": "settings_run_now"},
+                    )
+                    st.success(f"Pipeline started (PID {pid}). Go to **Run** to see the live log.")
 
     # ── Outage watchdog (env-var only — display only) ───────────────────
     with st.expander("**Outage watchdog**", expanded=False):
