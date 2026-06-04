@@ -76,6 +76,8 @@ from worker_log import (
     post_buffer, print_unbuffered,
 )
 
+import outage_watchdog
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%I:%M:%S %p')
 logger = get_logger(__name__)
 
@@ -1117,7 +1119,12 @@ class InstagramEventPipeline:
                     if error_msg not in self.stats['vision_errors']:
                         self.stats['vision_errors'][error_msg] = 0
                     self.stats['vision_errors'][error_msg] += 1
-                if 'quota' in error_msg.lower() or '429' in error_msg:
+                low = error_msg.lower()
+                if '403' in error_msg and 'billing' in low:
+                    outage_watchdog.record('vision_403_billing', error_msg)
+                elif '403' in error_msg:
+                    outage_watchdog.record('vision_403', error_msg)
+                if 'quota' in low or '429' in error_msg:
                     with self.lock:
                         self.rate_limit_delay = min(self.rate_limit_delay * 1.5, 5.0)
                     wprint(f"    ⚠ Rate limited - increasing delay to {self.rate_limit_delay:.1f}s")
@@ -1155,7 +1162,12 @@ class InstagramEventPipeline:
             with self.lock:
                 self.stats['ocr_failed'] += 1
                 self.failed_ocr.append(post_id)
-            if '429' in error_str or 'quota' in error_str.lower():
+            low = error_str.lower()
+            if '403' in error_str and 'billing' in low:
+                outage_watchdog.record('vision_403_billing', error_str)
+            elif '403' in error_str:
+                outage_watchdog.record('vision_403', error_str)
+            if '429' in error_str or 'quota' in low:
                 with self.lock:
                     self.rate_limit_delay = min(self.rate_limit_delay * 1.5, 5.0)
                 wprint(f"    ⚠ Increasing delay to {self.rate_limit_delay:.1f}s")
@@ -1252,7 +1264,10 @@ class InstagramEventPipeline:
                 return None
             text = resp.text.strip()
         except Exception as e:
-            wprint(f"    ✗ Gemini error in {tier_name}: {str(e)[:120]}")
+            err = str(e)
+            wprint(f"    ✗ Gemini error in {tier_name}: {err[:120]}")
+            if '429' in err or 'quota' in err.lower():
+                outage_watchdog.record('gemini_429', err)
             return None
         return self._parse_gemini_json(text)
 
@@ -1497,6 +1512,18 @@ class InstagramEventPipeline:
         print_unbuffered(
             f"\n[{worker_id}] [{post_num}/{total}] Processing post: {post_id}{url_suffix}"
         )
+
+        # If a prior worker tripped the outage watchdog (Vision 403 spike,
+        # Gemini 429 spike), skip the rest of the queue. Don't burn API
+        # calls into the same outage — the run will exit cleanly once all
+        # workers drain. The marker file in outputs/ tells the user why.
+        if outage_watchdog.is_aborted():
+            info = outage_watchdog.get_abort_info() or {}
+            print_unbuffered(
+                f"[{worker_id}] [{post_num}/{total}] "
+                f"⛔ skipped — outage abort active ({info.get('category', '?')})"
+            )
+            return None
 
         result = None
         crashed = False
