@@ -409,7 +409,7 @@ with st.sidebar:
     st.markdown("&nbsp;")
     screen = st.radio(
         "Section",
-        ("Run", "Lookup Post", "Accounts", "Audits & Tools"),
+        ("Run", "Settings", "Lookup Post", "Accounts", "Audits & Tools"),
         label_visibility="collapsed",
     )
     st.markdown("---")
@@ -614,6 +614,249 @@ def render_apify_scrape_panel(info: dict):
     st.rerun()
 
 
+# ─── Screen: Settings ────────────────────────────────────────────────────
+
+# Defaults mirror the ones main.py applies if config.json is absent. Source
+# of truth for these values is main.py's `config = {...}` block — when that
+# block changes, update this one too so the UI doesn't drift.
+CONFIG_DEFAULTS = {
+    "max_workers": 10,
+    "rate_limit_delay": 0.5,
+    "gemini_model": "gemini-2.0-flash-lite",
+    "history_max_age_days": 30,
+    "apify_enabled": True,
+    "apify_posts_per_profile": 25,
+    "apify_newer_than_days": 21,
+    "sheet_name": "Instagram_Events_Master",
+    "schedule_day": "Thursday",
+    "schedule_time": "14:00",
+}
+
+GEMINI_MODEL_OPTIONS = [
+    "gemini-2.0-flash-lite",
+    "gemini-2.0-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+]
+
+DAY_OPTIONS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+
+def _env_state(name: str) -> str:
+    """Return 'set' / 'not set' for env-var display (don't leak values)."""
+    return "✓ set" if os.environ.get(name, "").strip() else "✗ not set"
+
+
+def screen_settings():
+    st.title("Settings")
+    st.markdown(
+        '<span class="muted">'
+        "Edit values in <code>config.json</code> for the next pipeline run. "
+        "Changes save when you click <b>Save</b> in each section — partial edits in a section "
+        "without Save are discarded on navigation."
+        "</span>",
+        unsafe_allow_html=True,
+    )
+
+    cfg = load_config()
+
+    # ── Pipeline run tuning ─────────────────────────────────────────────
+    with st.expander("**Pipeline run tuning**", expanded=True):
+        st.markdown(
+            '<span class="muted">'
+            "Worker count + rate-limit delay control how fast main.py burns through the post list. "
+            "More workers = faster but more API contention; lower delay = faster OCR calls but "
+            "higher chance of Vision quota errors."
+            "</span>",
+            unsafe_allow_html=True,
+        )
+        with st.form("form_run_tuning", clear_on_submit=False):
+            workers = st.number_input(
+                "max_workers (ThreadPoolExecutor)",
+                min_value=1, max_value=50,
+                value=int(cfg.get("max_workers", CONFIG_DEFAULTS["max_workers"])),
+                help="How many post-processors run in parallel. 10 is the historical default; 15+ "
+                     "increases Sheets API quota risk on flushes.",
+            )
+            rl_delay = st.number_input(
+                "rate_limit_delay (seconds between Vision calls)",
+                min_value=0.0, max_value=10.0, step=0.1,
+                value=float(cfg.get("rate_limit_delay", CONFIG_DEFAULTS["rate_limit_delay"])),
+                help="Sleep duration between successive Vision API calls inside a worker. The "
+                     "pipeline auto-increases this on 429s, so set the floor here.",
+            )
+            history_days = st.number_input(
+                "history_max_age_days",
+                min_value=0, max_value=365,
+                value=int(cfg.get("history_max_age_days", CONFIG_DEFAULTS["history_max_age_days"])),
+                help="In live-Apify mode, posts older than this many days are excluded from the "
+                     "history loaded at run start. Doesn't apply to static_url mode.",
+            )
+            model = st.selectbox(
+                "gemini_model (tier 1–3 model)",
+                options=GEMINI_MODEL_OPTIONS,
+                index=(GEMINI_MODEL_OPTIONS.index(cfg.get("gemini_model", CONFIG_DEFAULTS["gemini_model"]))
+                       if cfg.get("gemini_model", CONFIG_DEFAULTS["gemini_model"]) in GEMINI_MODEL_OPTIONS else 0),
+                help="Flash-Lite is the cheapest. Switching to Flash or Pro escalates cost on every "
+                     "post — tier 4 already uses Pro for fallbacks, so changing this rarely helps.",
+            )
+            saved = st.form_submit_button("💾 Save run tuning")
+            if saved:
+                save_config({
+                    "max_workers": int(workers),
+                    "rate_limit_delay": float(rl_delay),
+                    "history_max_age_days": int(history_days),
+                    "gemini_model": model,
+                })
+                st.success("Saved to config.json")
+
+    # ── Apify ───────────────────────────────────────────────────────────
+    with st.expander("**Apify (Path B / live API mode)**", expanded=False):
+        st.markdown(
+            '<span class="muted">'
+            "These knobs only apply when main.py calls Apify directly (Path B from the Run screen). "
+            "In your normal workflow (Path A — paste a dataset URL), they are ignored. "
+            "<code>apify_enabled</code> is set to <b>false</b> automatically every time you save a "
+            "dataset URL or click Run Pipeline from Path A."
+            "</span>",
+            unsafe_allow_html=True,
+        )
+        with st.form("form_apify", clear_on_submit=False):
+            apify_on = st.checkbox(
+                "apify_enabled",
+                value=bool(cfg.get("apify_enabled", CONFIG_DEFAULTS["apify_enabled"])),
+                help="When true, main.py calls Apify itself (~20–40 min wait). When false, "
+                     "main.py reads from instagram_data_url (a pre-existing dataset).",
+            )
+            apify_limit = st.number_input(
+                "apify_posts_per_profile (resultsLimit)",
+                min_value=1, max_value=200,
+                value=int(cfg.get("apify_posts_per_profile", CONFIG_DEFAULTS["apify_posts_per_profile"])),
+                help="How many posts to pull per IG account in a live Apify run. Was 9; bumped to "
+                     "25 on 2026-06-04 because high-volume accounts were falling off the bottom.",
+            )
+            apify_days = st.number_input(
+                "apify_newer_than_days",
+                min_value=0, max_value=365,
+                value=int(cfg.get("apify_newer_than_days", CONFIG_DEFAULTS["apify_newer_than_days"])),
+                help="Apify's onlyPostsNewerThan filter. 0 = no filter (returns up to resultsLimit "
+                     "regardless of post age).",
+            )
+            saved = st.form_submit_button("💾 Save Apify settings")
+            if saved:
+                save_config({
+                    "apify_enabled": bool(apify_on),
+                    "apify_posts_per_profile": int(apify_limit),
+                    "apify_newer_than_days": int(apify_days),
+                })
+                st.success("Saved to config.json")
+
+    # ── Sheets ──────────────────────────────────────────────────────────
+    with st.expander("**Sheets**", expanded=False):
+        st.markdown(
+            '<span class="muted">'
+            "Which Google Sheet the pipeline writes to. The link-out buttons on Run / Accounts "
+            "use this name."
+            "</span>",
+            unsafe_allow_html=True,
+        )
+        with st.form("form_sheets", clear_on_submit=False):
+            sheet = st.text_input(
+                "sheet_name",
+                value=cfg.get("sheet_name", CONFIG_DEFAULTS["sheet_name"]),
+                help="Exact case-sensitive Google Sheet name (must already exist).",
+            )
+            saved = st.form_submit_button("💾 Save sheet name")
+            if saved:
+                save_config({"sheet_name": sheet.strip()})
+                st.success("Saved to config.json")
+
+    # ── Schedule ────────────────────────────────────────────────────────
+    with st.expander("**Schedule**", expanded=False):
+        st.markdown(
+            '<span class="muted">'
+            "Only relevant if main.py is run in scheduler mode (via cron / Replit deployment). "
+            "Has no effect on manual UI-triggered runs."
+            "</span>",
+            unsafe_allow_html=True,
+        )
+        with st.form("form_schedule", clear_on_submit=False):
+            day_val = cfg.get("schedule_day", CONFIG_DEFAULTS["schedule_day"])
+            sched_day = st.selectbox(
+                "schedule_day",
+                options=DAY_OPTIONS,
+                index=DAY_OPTIONS.index(day_val) if day_val in DAY_OPTIONS else 3,
+            )
+            sched_time = st.text_input(
+                "schedule_time (24h, HH:MM)",
+                value=cfg.get("schedule_time", CONFIG_DEFAULTS["schedule_time"]),
+            )
+            saved = st.form_submit_button("💾 Save schedule")
+            if saved:
+                if not re.match(r"^\d{1,2}:\d{2}$", sched_time.strip()):
+                    st.error("schedule_time must look like HH:MM (e.g., 14:00)")
+                else:
+                    save_config({
+                        "schedule_day": sched_day,
+                        "schedule_time": sched_time.strip(),
+                    })
+                    st.success("Saved to config.json")
+
+    # ── Outage watchdog (env-var only — display only) ───────────────────
+    with st.expander("**Outage watchdog**", expanded=False):
+        st.markdown(
+            '<span class="muted">'
+            "Thresholds for Vision 403 / Gemini 429 aborts. These are environment variables, "
+            "not config.json — change them on the Replit <b>Secrets</b> tab. Defaults shown "
+            "in italics."
+            "</span>",
+            unsafe_allow_html=True,
+        )
+        rows = [
+            ("WATCHDOG_VISION_403_BILLING_LIMIT", "3", os.environ.get("WATCHDOG_VISION_403_BILLING_LIMIT", "")),
+            ("WATCHDOG_VISION_403_BILLING_WINDOW", "120", os.environ.get("WATCHDOG_VISION_403_BILLING_WINDOW", "")),
+            ("WATCHDOG_VISION_403_LIMIT", "5", os.environ.get("WATCHDOG_VISION_403_LIMIT", "")),
+            ("WATCHDOG_VISION_403_WINDOW", "60", os.environ.get("WATCHDOG_VISION_403_WINDOW", "")),
+            ("WATCHDOG_GEMINI_429_LIMIT", "10", os.environ.get("WATCHDOG_GEMINI_429_LIMIT", "")),
+            ("WATCHDOG_GEMINI_429_WINDOW", "60", os.environ.get("WATCHDOG_GEMINI_429_WINDOW", "")),
+        ]
+        st.dataframe(
+            {
+                "Variable":        [r[0] for r in rows],
+                "Default":         [r[1] for r in rows],
+                "Current (env)":   [r[2] or "—" for r in rows],
+            },
+            use_container_width=True, hide_index=True,
+        )
+
+    # ── Email notifications (env-var only — display only) ──────────────
+    with st.expander("**Email notifications (outage)**", expanded=False):
+        st.markdown(
+            '<span class="muted">'
+            "Set these on the Replit <b>Secrets</b> tab. Passwords never appear in the UI. "
+            "<code>ADMIN_EMAIL</code> accepts a comma-separated list."
+            "</span>",
+            unsafe_allow_html=True,
+        )
+        rows = [
+            ("ADMIN_EMAIL",  os.environ.get("ADMIN_EMAIL", "(not set)")),
+            ("SMTP_HOST",    _env_state("SMTP_HOST")),
+            ("SMTP_PORT",    _env_state("SMTP_PORT")),
+            ("SMTP_USER",    _env_state("SMTP_USER")),
+            ("SMTP_PASS",    _env_state("SMTP_PASS")),
+            ("APIFY_API_KEY", _env_state("APIFY_API_KEY")),
+        ]
+        st.dataframe(
+            {"Variable": [r[0] for r in rows], "State / value": [r[1] for r in rows]},
+            use_container_width=True, hide_index=True,
+        )
+
+    # ── Raw config.json view (for power users) ─────────────────────────
+    with st.expander("**Show raw config.json**", expanded=False):
+        st.code(json.dumps(load_config(), indent=2), language="json")
+
+
 # ─── Screen: Lookup Post ─────────────────────────────────────────────────
 
 def screen_lookup():
@@ -788,6 +1031,8 @@ def screen_audits():
 
 if screen == "Run":
     screen_run()
+elif screen == "Settings":
+    screen_settings()
 elif screen == "Lookup Post":
     screen_lookup()
 elif screen == "Accounts":
