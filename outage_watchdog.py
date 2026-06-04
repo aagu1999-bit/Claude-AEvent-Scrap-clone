@@ -47,6 +47,9 @@ SMTP_USER/SMTP_PASS are all set. Silent best-effort — failure to send does
 not block the abort or crash the pipeline. If ADMIN_EMAIL is set but SMTP
 isn't, we log "email skipped — SMTP not configured" so you know.
 
+ADMIN_EMAIL accepts a single address OR a comma-separated list of recipients:
+    ADMIN_EMAIL=aagu1999@gmail.com,centralgroupevents@gmail.com
+
 A marker file is ALWAYS written to outputs/OUTAGE_ABORT_<ts>.json regardless
 of email success — that's the authoritative record.
 """
@@ -165,15 +168,21 @@ def _write_marker(info):
 
 
 def _send_email(info):
-    admin = os.environ.get('ADMIN_EMAIL', '').strip()
-    if not admin:
+    # ADMIN_EMAIL accepts a single address OR a comma-separated list:
+    #   ADMIN_EMAIL=aagu1999@gmail.com,centralgroupevents@gmail.com
+    raw = os.environ.get('ADMIN_EMAIL', '').strip()
+    if not raw:
+        return
+    recipients = [e.strip() for e in raw.split(',') if e.strip()]
+    if not recipients:
         return
     host = os.environ.get('SMTP_HOST', '').strip()
     port = os.environ.get('SMTP_PORT', '').strip()
     user = os.environ.get('SMTP_USER', '').strip()
     pwd  = os.environ.get('SMTP_PASS', '').strip()
     if not (host and port and user and pwd):
-        _print(f"  ✉ outage email skipped — ADMIN_EMAIL set but SMTP_HOST/PORT/USER/PASS not configured")
+        _print(f"  ✉ outage email skipped — ADMIN_EMAIL set ({len(recipients)} recipient(s)) "
+               f"but SMTP_HOST/PORT/USER/PASS not configured")
         return
     try:
         subject = f"[Apify Pipeline] OUTAGE ABORT: {info['category']}"
@@ -191,13 +200,13 @@ def _send_email(info):
         msg = MIMEText(body)
         msg['Subject'] = subject
         msg['From'] = user
-        msg['To'] = admin
+        msg['To'] = ', '.join(recipients)
 
         with smtplib.SMTP(host, int(port), timeout=15) as s:
             s.starttls()
             s.login(user, pwd)
-            s.send_message(msg)
-        _print(f"  ✉ outage email sent to {admin}")
+            s.sendmail(user, recipients, msg.as_string())
+        _print(f"  ✉ outage email sent to {len(recipients)} recipient(s): {', '.join(recipients)}")
     except Exception as e:
         _print(f"  ⚠ outage email failed: {e}")
 
