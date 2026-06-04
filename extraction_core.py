@@ -121,6 +121,21 @@ FLAG_TO_COLUMNS = {
     # source mentions). Highlighting DESCRIPTION points the reviewer at the
     # field that's most likely hallucinated.
     'NO_GROUNDING':          ['DESCRIPTION'],
+    # ── Round 2 (2026-06) "wrong field" flags — pink highlight, see FLAG_TO_COLOR ──
+    'VENUE_IS_HANDLE':         ['VENUE NAME'],
+    'VENUE_EQUALS_EVENT_NAME': ['VENUE NAME', 'EVENT NAME'],
+    'VENUE_EQUALS_ACCOUNT':    ['VENUE NAME'],
+    'VENUE_TRUNCATED':         ['VENUE NAME'],
+    'VENUE_OUT_OF_NJ_REGION':  ['CITY', 'SECTION OF NJ'],
+    # ── Round 2 "probably not an event" flags — orange highlight ──
+    'PERSONAL_POST_SIGNALS':   ['QUALITY_FLAGS'],
+    'NO_EVENT_SIGNALS':        ['QUALITY_FLAGS'],
+    'EVENT_NAME_GENERIC':      ['EVENT NAME'],
+    'CAPTION_ONLY_NO_OCR':     ['HAD OCR'],
+    # ── Round 2 "missing field" flags — yellow (default) ──
+    'MISSING_VENUE':           ['VENUE NAME'],
+    'MISSING_CITY':            ['CITY'],
+    'MISSING_TIME':            ['START TIME'],
 }
 
 # Flags that should escalate to the next tier (post-level "low events"
@@ -132,8 +147,31 @@ ESCALATION_FLAGS = {
     "ACCOUNT_PATTERN_DROP",
 }
 
-# Conditional formatting: light yellow for flagged cells
-FLAG_BG_COLOR = {"red": 1.0, "green": 0.97, "blue": 0.78}
+# Conditional formatting: legacy + round 2 colors. FLAG_BG_COLOR (yellow)
+# stays as the default; callers that already look it up by name continue
+# to work. Round 2 introduces two new categories — see FLAG_TO_COLOR for
+# per-flag dispatch.
+FLAG_BG_COLOR        = {"red": 1.0,  "green": 0.97, "blue": 0.78}  # YELLOW  — legacy / missing
+FLAG_BG_COLOR_PINK   = {"red": 0.99, "green": 0.83, "blue": 0.87}  # PINK    — wrong field
+FLAG_BG_COLOR_ORANGE = {"red": 1.0,  "green": 0.88, "blue": 0.72}  # ORANGE  — probably not event
+
+# Per-flag color dispatch. Flags not listed fall back to FLAG_BG_COLOR
+# (yellow). New "wrong field" flags get pink — they signal the model
+# named a specific field incorrectly. New "probably not event" flags
+# get orange — they signal the whole row likely shouldn't exist.
+FLAG_TO_COLOR = {
+    # Pink: wrong-field signals
+    'VENUE_IS_HANDLE':         FLAG_BG_COLOR_PINK,
+    'VENUE_EQUALS_EVENT_NAME': FLAG_BG_COLOR_PINK,
+    'VENUE_EQUALS_ACCOUNT':    FLAG_BG_COLOR_PINK,
+    'VENUE_TRUNCATED':         FLAG_BG_COLOR_PINK,
+    'VENUE_OUT_OF_NJ_REGION':  FLAG_BG_COLOR_PINK,
+    # Orange: probably-not-an-event signals
+    'PERSONAL_POST_SIGNALS':   FLAG_BG_COLOR_ORANGE,
+    'NO_EVENT_SIGNALS':        FLAG_BG_COLOR_ORANGE,
+    'EVENT_NAME_GENERIC':      FLAG_BG_COLOR_ORANGE,
+    'CAPTION_ONLY_NO_OCR':     FLAG_BG_COLOR_ORANGE,
+}
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -231,7 +269,20 @@ def count_distinct_dates(text: str) -> int:
 def check_date_day_match(event: dict, source_text: str) -> Optional[str]:
     """Flag if extracted date doesn't fall on a day that the source text
     indicates. Handles day ranges (mon-fri, weekend, daily) so it doesn't
-    fire false positives on multi-day recurring deals."""
+    fire false positives on multi-day recurring deals.
+
+    2026-06 tightening: only fire when source mentions a SINGLE distinct
+    day. Previously, captions like "After Friday's launch, join us
+    Saturday" produced mentioned_days={Fri, Sat}; if extracted date was a
+    Sunday this fired DATE_DAY_MISMATCH even when "Sunday" was the model's
+    correct read of the actual event date. The false positives showed up
+    in All_Events as DATE-column highlights on rows where the date was
+    clearly right (per the user's 2026-06 screenshot review).
+
+    The cost of tightening: we miss real mismatches where the caption
+    mentions multiple days (e.g. multi-event calendar posts). For those,
+    CALENDAR_LOW_EVENTS and the multi-event extraction path are the
+    better backstop."""
     date_str = event.get('date', '')
     if not date_str or not source_text:
         return None
@@ -246,12 +297,27 @@ def check_date_day_match(event: dict, source_text: str) -> Optional[str]:
     for name, num in DAY_NAMES.items():
         if re.search(rf'\b{name}\b', src_lower):
             mentioned_days.add(num)
-    mentioned_days.update(expand_day_ranges(src_lower))
+    range_days = expand_day_ranges(src_lower)
+    mentioned_days.update(range_days)
 
+    # No days mentioned at all → can't verify, don't fire.
     if not mentioned_days:
         return None
-    if actual_day not in mentioned_days:
+    # Day ranges in source ("Mon-Fri", "weekend", "daily") legitimately
+    # cover multiple days — the actual event day belongs to one of them.
+    # If the actual day falls inside the range, we're fine; otherwise fire.
+    if range_days:
+        if actual_day in mentioned_days:
+            return None
         return "DATE_DAY_MISMATCH"
+    # Single-day case: caption mentions exactly one specific day, and the
+    # extracted date doesn't match → high-confidence mismatch.
+    if len(mentioned_days) == 1 and actual_day not in mentioned_days:
+        return "DATE_DAY_MISMATCH"
+    # Multiple distinct days in source without an explicit range — model
+    # had ambiguous input. Don't punish a plausible pick. The earlier
+    # behavior (fire on any miss) created false positives on correct dates
+    # whenever a caption cross-referenced another event's day.
     return None
 
 
@@ -404,6 +470,243 @@ def check_no_grounding(caption: str, ocr_text: str, num_events: int) -> Optional
     if (ocr_text or '').strip():
         return None
     return "NO_GROUNDING"
+
+
+# ─────────────────────────────────────────────────────────────────
+# Round 2 (2026-06): bad-extraction signal flags
+# ─────────────────────────────────────────────────────────────────
+# These were added after running lookup_post.py against ~5 misextracted
+# posts (Whitney Museum hallucination, 4loversonly/Consigliere mis-venue,
+# JAM N SKATE EVENT@JAM N SKATE padding, etc.) and finding the existing
+# flag set never caught the patterns that actually pollute All_Events.
+#
+# Two semantic categories:
+#   • "PROBABLY NOT AN EVENT" (PERSONAL_POST_SIGNALS, NO_EVENT_SIGNALS,
+#     EVENT_NAME_GENERIC, CAPTION_ONLY_NO_OCR) — caller should treat as
+#     candidates for bulk review/delete
+#   • "WRONG FIELD" (VENUE_IS_HANDLE, VENUE_EQUALS_EVENT_NAME,
+#     VENUE_EQUALS_ACCOUNT, VENUE_TRUNCATED) — the extraction names a
+#     field that's obviously wrong, even if event-shape is plausible
+#
+# The color-classification logic lives in FLAG_TO_COLOR below so callers
+# can pick the right highlight without re-encoding the semantics.
+
+_NJ_REGION_HINTS_OUT = {
+    # Common cities that come up in scrapes but are clearly out of NJ.
+    "NEW YORK", "NYC", "MANHATTAN", "BROOKLYN", "QUEENS", "BRONX", "STATEN ISLAND",
+    "PHILADELPHIA", "PHILLY",
+    "BEVERLY HILLS", "LOS ANGELES", "LA",
+    "MIAMI", "ATLANTA", "CHICAGO", "BOSTON",
+}
+
+_NON_NJ_STATE_SUFFIXES = (", CA", ", NY", ", PA", ", FL", ", TX", ", IL", ", MA", ", GA")
+
+_EVENT_NAME_GENERIC_SET = {
+    "EVENT", "PARTY", "NIGHT", "SHOW", "MEETUP", "GATHERING",
+    "POPUP", "POP UP", "POP-UP", "FUNCTION", "AFFAIR",
+}
+
+_PERSONAL_HASHTAGS = (
+    "#fyp", "#fypシ", "#ootd", "#selfie", "#me", "#stylish", "#streetwear",
+    "#instagood", "#mood", "#vibes", "#aesthetic", "#sundayfunday",
+    "#photodump", "#dump", "#photooftheday",
+)
+
+# Signals that a caption/OCR is event-shaped: tickets, RSVP, doors,
+# time-of-day, price markers. If NONE of these appear in caption+OCR,
+# whatever Gemini "extracted" is unmoored from the source.
+_EVENT_GROUNDING_RX = re.compile(
+    r"\b(?:"
+    r"tickets?|rsvp|join us|hosted by|presents?|doors\s+open|showtime|"
+    r"happy\s+hour|cover|free\s+entry|cash\s+bar|early\s+bird|"
+    r"link\s+in\s+bio|swipe\s+up|"
+    r"\d{1,2}\s*[ap]\.?m\.?|\d{1,2}:\d{2}\s*(?:[ap]\.?m\.?)?|"
+    r"\$\d+|\d+\.\d{2}"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_DATE_PATTERN_RX = re.compile(
+    r"\b(?:"
+    r"\d{1,2}/\d{1,2}(?:/\d{2,4})?|"
+    r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{1,2}|"
+    r"(?:mon|tue|wed|thu|fri|sat|sun)\w*\s+\d{1,2}"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Loose IG-handle shape: 3-30 chars, [a-z0-9._], no spaces.
+_IG_HANDLE_RX = re.compile(r"^@?[a-z0-9._]{3,30}$", re.IGNORECASE)
+
+
+def _venue_norm(s: str) -> str:
+    """Lowercase, strip non-alphanumerics. For comparison only."""
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+def check_venue_is_handle(event: dict) -> Optional[str]:
+    """Fire when the venue field is an Instagram handle (@-mention or
+    handle-shaped string with no spaces). Catches BRICKCITYJAM rows where
+    venue ended up as `@worldcupcorner` because the caption used the
+    @-mention as the only "venue" reference."""
+    venue = (event.get('venue_name') or '').strip()
+    if not venue:
+        return None
+    if venue.startswith('@'):
+        return "VENUE_IS_HANDLE"
+    if (' ' not in venue
+            and venue == venue.lower()
+            and _IG_HANDLE_RX.match(venue)
+            and ('.' in venue or '_' in venue)):
+        # Containing . or _ tightens the heuristic so we don't false-fire
+        # on single-word venue names like "Stateside" or "Westlight".
+        return "VENUE_IS_HANDLE"
+    return None
+
+
+def check_venue_equals_event_name(event: dict) -> Optional[str]:
+    """Fire when venue is just a restatement of the event name. The model
+    padded missing data — used the event name as the venue too. Catches
+    'JAM N SKATE EVENT' at venue 'JAM N SKATE'."""
+    v = _venue_norm(event.get('venue_name'))
+    n = _venue_norm(event.get('event_name'))
+    if not v or not n:
+        return None
+    if v == n:
+        return "VENUE_EQUALS_EVENT_NAME"
+    short, long = sorted((v, n), key=len)
+    # Subset only counts as a hit when the shorter side is substantial,
+    # so brief generic words ("party"/"the") don't trigger this.
+    if len(short) >= 6 and short in long:
+        return "VENUE_EQUALS_EVENT_NAME"
+    return None
+
+
+def check_venue_equals_account(event: dict) -> Optional[str]:
+    """Fire when the venue is just the account's own handle or display
+    name. The model lifted the account context as the venue rather than
+    finding the real venue from caption/OCR. Catches the 4loversonly /
+    Consigliere case (real venue was Consigliere on the flyer, but model
+    used the posting account as the venue)."""
+    v = _venue_norm(event.get('venue_name'))
+    if not v:
+        return None
+    h = _venue_norm((event.get('instagram_handle') or '').lstrip('@'))
+    a = _venue_norm(event.get('account_name'))
+    if h and v == h:
+        return "VENUE_EQUALS_ACCOUNT"
+    if a and v == a:
+        return "VENUE_EQUALS_ACCOUNT"
+    return None
+
+
+def check_personal_post_signals(caption: str, num_events: int) -> Optional[str]:
+    """Fire when caption has multiple personal-post markers (selfie/style
+    hashtags, no event keywords) yet events were extracted. Catches the
+    Whitney Museum hallucination pattern: personal selfie post → model
+    invented an event from a venue hashtag."""
+    if num_events == 0:
+        return None
+    c = (caption or '').lower()
+    if not c:
+        return None
+    n_personal = sum(1 for tag in _PERSONAL_HASHTAGS if tag in c)
+    has_event_signal = bool(_EVENT_GROUNDING_RX.search(c)) or bool(_DATE_PATTERN_RX.search(c))
+    if n_personal >= 2 and not has_event_signal:
+        return "PERSONAL_POST_SIGNALS"
+    return None
+
+
+def check_no_event_signals(caption: str, ocr_text: str, num_events: int) -> Optional[str]:
+    """Fire when caption+OCR have content but NO event-shape signals (no
+    date pattern, no time pattern, no ticket/RSVP/$ keywords). Distinct
+    from NO_GROUNDING — that one only fires when both caption AND OCR
+    are empty. This one catches the case where there IS source text but
+    none of it looks event-related."""
+    if num_events == 0:
+        return None
+    combined = ((caption or '') + ' ' + (ocr_text or '')).strip()
+    if not combined:
+        return None
+    if _EVENT_GROUNDING_RX.search(combined) or _DATE_PATTERN_RX.search(combined):
+        return None
+    return "NO_EVENT_SIGNALS"
+
+
+def check_venue_out_of_nj_region(event: dict) -> Optional[str]:
+    """Fire when city is clearly outside NJ + NJ-adjacent metros. Distinct
+    from CITY_NOT_IN_NJ_LOOKUP, which only checks against the canonical
+    NJ municipality list. This one catches Brooklyn / Philadelphia /
+    Beverly Hills explicitly so they don't fall into the silent gap of
+    'not in NJ list but also not flagged.'"""
+    city = (event.get('city') or '').strip().upper()
+    if not city:
+        return None
+    if city in _NJ_REGION_HINTS_OUT:
+        return "VENUE_OUT_OF_NJ_REGION"
+    if any(suffix in city for suffix in _NON_NJ_STATE_SUFFIXES):
+        return "VENUE_OUT_OF_NJ_REGION"
+    return None
+
+
+def check_venue_truncated(event: dict) -> Optional[str]:
+    """Fire when venue ends with truncation markers (…, ...) or exceeds
+    a length the model usually doesn't produce naturally (>60 chars
+    typically means the model returned a sentence as the venue)."""
+    venue = (event.get('venue_name') or '').strip()
+    if not venue:
+        return None
+    if venue.endswith(('…', '...')):
+        return "VENUE_TRUNCATED"
+    if len(venue) > 60:
+        return "VENUE_TRUNCATED"
+    return None
+
+
+def check_event_name_generic(event: dict) -> Optional[str]:
+    """Fire when the event name is just a placeholder word (EVENT, PARTY,
+    NIGHT, etc.). Almost always means the model couldn't read a real name
+    off the flyer."""
+    name = (event.get('event_name') or '').strip().upper()
+    if not name:
+        return None
+    if name in _EVENT_NAME_GENERIC_SET:
+        return "EVENT_NAME_GENERIC"
+    return None
+
+
+def check_caption_only_no_ocr(event: dict) -> Optional[str]:
+    """Fire when this event was extracted with no OCR signal. Derivable
+    from the HAD OCR column directly, but as a quality flag it becomes
+    sortable + composable with other flags in QUALITY_FLAGS without
+    needing a separate column filter."""
+    had_ocr = event.get('had_ocr')
+    if had_ocr is False or str(had_ocr).strip().lower() in ('false', 'no', '0', ''):
+        # 'False'/'no'/'0' all map to "no OCR" — covers the bool, the
+        # sheet-serialized string form, and the post-CSV roundtrip form.
+        return "CAPTION_ONLY_NO_OCR"
+    return None
+
+
+def check_missing_venue(event: dict) -> Optional[str]:
+    v = (event.get('venue_name') or '').strip()
+    if not v or v.lower() in ('none', 'null', 'tbd', 'tba', 'n/a'):
+        return "MISSING_VENUE"
+    return None
+
+
+def check_missing_city(event: dict) -> Optional[str]:
+    c = (event.get('city') or '').strip()
+    if not c or c.lower() in ('none', 'null', 'tbd', 'tba', 'n/a'):
+        return "MISSING_CITY"
+    return None
+
+
+def check_missing_time(event: dict) -> Optional[str]:
+    t = (event.get('start_time') or '').strip()
+    if not t or t.lower() in ('none', 'null', 'tbd', 'tba', 'n/a'):
+        return "MISSING_TIME"
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────

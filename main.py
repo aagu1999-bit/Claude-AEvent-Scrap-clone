@@ -51,8 +51,22 @@ from extraction_core import (
     check_carousel_low_events as ec_check_carousel_low_events,
     check_ocr_rich_low_events as ec_check_ocr_rich_low_events,
     check_no_grounding        as ec_check_no_grounding,
+    # Round 2 (2026-06) flag detectors. See extraction_core for rationale.
+    check_venue_is_handle         as ec_check_venue_is_handle,
+    check_venue_equals_event_name as ec_check_venue_equals_event_name,
+    check_venue_equals_account    as ec_check_venue_equals_account,
+    check_personal_post_signals   as ec_check_personal_post_signals,
+    check_no_event_signals        as ec_check_no_event_signals,
+    check_venue_out_of_nj_region  as ec_check_venue_out_of_nj_region,
+    check_venue_truncated         as ec_check_venue_truncated,
+    check_event_name_generic      as ec_check_event_name_generic,
+    check_caption_only_no_ocr     as ec_check_caption_only_no_ocr,
+    check_missing_venue           as ec_check_missing_venue,
+    check_missing_city            as ec_check_missing_city,
+    check_missing_time            as ec_check_missing_time,
     FLAG_TO_COLUMNS           as ec_FLAG_TO_COLUMNS,
     FLAG_BG_COLOR             as ec_FLAG_BG_COLOR,
+    FLAG_TO_COLOR             as ec_FLAG_TO_COLOR,
     # PR B — shared prompt builder; replaces the inline f-string in
     # process_post. Both main.py and events_from_ids.py call this so
     # extractions stay in lockstep.
@@ -1369,12 +1383,26 @@ class InstagramEventPipeline:
         for ev in enriched:
             row_flags = []
             for name, fn, args in [
+                # ── Legacy checks (round 1) ──
                 ('region_against_lookup', ec_check_region_against_lookup, (ev, self._safety_net_region_lookup)),
                 ('date_day_match',        ec_check_date_day_match,        (ev, source_text)),
                 ('venue_city',            ec_check_venue_city,            (ev, self._safety_net_venue_lookup)),
                 ('low_confidence',        ec_check_low_confidence,        (ev,)),
                 ('missing_date',          ec_check_missing_date,          (ev,)),
                 ('date_sanity',           ec_check_date_sanity,           (ev, post_date)),
+                # ── Round 2 (2026-06): wrong-field flags (pink highlight) ──
+                ('venue_is_handle',         ec_check_venue_is_handle,         (ev,)),
+                ('venue_equals_event_name', ec_check_venue_equals_event_name, (ev,)),
+                ('venue_equals_account',    ec_check_venue_equals_account,    (ev,)),
+                ('venue_truncated',         ec_check_venue_truncated,         (ev,)),
+                ('venue_out_of_nj_region',  ec_check_venue_out_of_nj_region,  (ev,)),
+                # ── Round 2: probably-not-event flags (orange highlight) ──
+                ('event_name_generic',      ec_check_event_name_generic,      (ev,)),
+                ('caption_only_no_ocr',     ec_check_caption_only_no_ocr,     (ev,)),
+                # ── Round 2: missing-field flags (yellow / legacy color) ──
+                ('missing_venue',           ec_check_missing_venue,           (ev,)),
+                ('missing_city',            ec_check_missing_city,            (ev,)),
+                ('missing_time',            ec_check_missing_time,            (ev,)),
             ]:
                 f = self._safe_check(name, fn, *args)
                 if f:
@@ -1386,10 +1414,14 @@ class InstagramEventPipeline:
         n_events = len(enriched)
         post_flags = []
         for name, fn, args in [
+            # Legacy round 1
             ('calendar_low_events',  ec_check_calendar_low_events,  (caption or '', ocr_text or '', n_events)),
             ('carousel_low_events',  ec_check_carousel_low_events,  (slide_count, slides_with_text, n_events)),
             ('ocr_rich_low_events',  ec_check_ocr_rich_low_events,  (ocr_text or '', n_events)),
             ('no_grounding',         ec_check_no_grounding,         (caption or '', ocr_text or '', n_events)),
+            # Round 2 (2026-06) — orange highlight on the QUALITY_FLAGS cell
+            ('personal_post_signals', ec_check_personal_post_signals, (caption or '', n_events)),
+            ('no_event_signals',      ec_check_no_event_signals,      (caption or '', ocr_text or '', n_events)),
         ]:
             f = self._safe_check(name, fn, *args)
             if f:
@@ -2033,16 +2065,27 @@ class InstagramEventPipeline:
                 print(f"     ... and {len(shell_accounts) - 20} more (full list in anomaly summary)")
 
     def _apply_quality_flag_formatting(self, evt_sheet, df, start_row):
-        """B5: apply per-cell light-yellow highlighting based on each event's
-        quality_flags. Uses the canonical FLAG_TO_COLUMNS mapping from
-        extraction_core so main.py and events_from_ids.py produce identical
-        visual signals on All_Events.
+        """B5: apply per-cell highlighting based on each event's
+        quality_flags. Uses the canonical FLAG_TO_COLUMNS + FLAG_TO_COLOR
+        mappings from extraction_core so main.py and events_from_ids.py
+        produce identical visual signals on All_Events.
 
         Each flag in an event's quality_flags maps to specific sheet columns
-        (DATE for date flags, CITY+SECTION OF NJ for region flags, DESCRIPTION
-        for NO_GROUNDING, etc.). Only the cells corresponding to the flags
-        get highlighted — not the entire row — so operators can identify
-        WHICH field is uncertain at a glance."""
+        (DATE for date flags, CITY+SECTION OF NJ for region flags, etc.).
+        Only the cells corresponding to the flags get highlighted — not the
+        entire row — so operators can identify WHICH field is uncertain at
+        a glance.
+
+        Per-flag color (round 2, 2026-06):
+          • PINK   — "wrong field" flags (VENUE_IS_HANDLE, VENUE_EQUALS_*,
+                     VENUE_TRUNCATED, VENUE_OUT_OF_NJ_REGION)
+          • ORANGE — "probably not an event" flags (PERSONAL_POST_SIGNALS,
+                     NO_EVENT_SIGNALS, EVENT_NAME_GENERIC, CAPTION_ONLY_NO_OCR)
+          • YELLOW — legacy + missing-field flags (default)
+
+        When multiple flags target the SAME cell, the strongest color wins
+        per the priority pink > orange > yellow — so a cell flagged with
+        both VENUE_IS_HANDLE and MISSING_VENUE gets pink, not yellow."""
         if 'QUALITY FLAGS' not in df.columns:
             return
         try:
@@ -2061,6 +2104,16 @@ class InstagramEventPipeline:
             else:
                 col_letter_by_name[c] = chr(ord('A') + (i // 26) - 1) + chr(ord('A') + (i % 26))
 
+        # Color priority — higher rank wins when multiple flags hit one cell.
+        # PINK (wrong field) > ORANGE (not-an-event) > YELLOW (legacy/missing).
+        def _color_rank(color):
+            if color is ec_FLAG_TO_COLOR.get('VENUE_IS_HANDLE'):  # pink
+                return 2
+            # Compare against any orange flag's color
+            if color is ec_FLAG_TO_COLOR.get('PERSONAL_POST_SIGNALS'):  # orange
+                return 1
+            return 0  # yellow default
+
         format_requests = []
         rows_list = df.values.tolist()
         for offset, row in enumerate(rows_list):
@@ -2068,18 +2121,25 @@ class InstagramEventPipeline:
             if not flags_str:
                 continue
             row_num = start_row + offset
-            cells_to_color = set()
+            # Map (col_label) → best (highest-rank) color from all flags hitting it
+            cell_color = {}
             for f in str(flags_str).split(','):
                 f = f.strip()
+                if not f:
+                    continue
                 cols = ec_FLAG_TO_COLUMNS.get(f, [])
-                cells_to_color.update(cols)
-            for col_label in cells_to_color:
+                color = ec_FLAG_TO_COLOR.get(f, ec_FLAG_BG_COLOR)
+                for col_label in cols:
+                    existing = cell_color.get(col_label)
+                    if existing is None or _color_rank(color) > _color_rank(existing):
+                        cell_color[col_label] = color
+            for col_label, color in cell_color.items():
                 letter = col_letter_by_name.get(col_label)
                 if not letter:
                     continue
                 format_requests.append({
                     'range': f'{letter}{row_num}',
-                    'format': {'backgroundColor': ec_FLAG_BG_COLOR},
+                    'format': {'backgroundColor': color},
                 })
 
         if not format_requests:
