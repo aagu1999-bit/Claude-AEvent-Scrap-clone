@@ -7,7 +7,13 @@ channel = "stable-25_05"
 packages = ["glibcLocales"]
 
 [workflows]
-runButton = "Project"
+# Replit's big "Run" button launches the UI Dashboard — a safe entry point
+# that lets you choose what to do next (start a pipeline run, look up a
+# post, run an audit). The old default ("Project") ran main.py +
+# migrate_history.py + reprocess_weekends.py --confirm in PARALLEL, which
+# is not safe (reprocess_weekends with --confirm destroys data without a
+# prompt). That workflow still exists below but is no longer the default.
+runButton = "UI Dashboard"
 
 [[workflows.workflow]]
 name = "Project"
