@@ -559,13 +559,46 @@ def screen_run():
 
     cols = st.columns([3, 2])
     with cols[0]:
-        accts_default = "\n".join(load_accounts_from_file()[:50])
+        # Load the FULL accounts.json list — no truncation. Previously this
+        # capped at [:50] which silently dropped 95%+ of the user's 1000+
+        # handles every time they triggered Path B/C. With the cap gone
+        # all handles flow through as one JSON array in the Apify API
+        # call (Python list → requests' json= → application/json body).
+        all_handles = load_accounts_from_file()
+        # Streamlit's text_area state is keyed; if the user has previously
+        # edited it in this session, respect their edit. On first render
+        # (no session-state value yet), seed it with the full file list.
+        seeded = st.session_state.get("scrape_accounts")
+        accts_default = seeded if seeded is not None else "\n".join(all_handles)
         accts_input = st.text_area(
-            "Accounts (one per line, with or without @)",
+            f"Accounts (one per line, with or without @) — "
+            f"{len(all_handles)} loaded from accounts.json",
             value=accts_default,
-            height=200,
+            height=260,
             key="scrape_accounts",
+            help="The full accounts.json list is pre-loaded. Edit freely — what's in "
+                 "this box at click time is what gets sent to Apify as a JSON array.",
         )
+        # Live count of what will ACTUALLY be sent (reflects user edits).
+        current_count = sum(1 for line in (accts_input or "").splitlines() if line.strip())
+        if current_count != len(all_handles):
+            st.markdown(
+                f'<span class="muted">'
+                f'Will send <b>{current_count}</b> handle(s) (file has '
+                f'{len(all_handles)}).'
+                f'</span>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f'<span class="muted">Will send all {current_count} handle(s).</span>',
+                unsafe_allow_html=True,
+            )
+        # Reset button — useful if the user accidentally deleted half the
+        # list while editing and wants to restore the file content.
+        if st.button("↺ Reload from accounts.json", key="reload_accts"):
+            st.session_state["scrape_accounts"] = "\n".join(all_handles)
+            st.rerun()
     with cols[1]:
         results_limit = st.number_input(
             "Posts per profile",
