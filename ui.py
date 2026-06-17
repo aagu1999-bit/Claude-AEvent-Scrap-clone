@@ -491,12 +491,15 @@ def screen_run():
 
     st.markdown("---")
 
-    # ── Path B: trigger Apify via API + just-scrape ────────────────────
-    st.subheader("Path B — Trigger Apify (just scrape, doesn't run pipeline)")
+    # ── Path B / C: trigger Apify via API ──────────────────────────────
+    st.subheader("Path B / C — Trigger Apify (with optional auto-chain)")
     st.markdown(
         '<span class="muted">'
-        "Kicks off an Apify run via API. When it finishes, paste the resulting dataset URL above "
-        "and click <b>Run Pipeline</b>."
+        "Kicks off an Apify run via API. <b>Path B</b> stops after the scrape — you sanity-check the "
+        "dataset and click Run Pipeline yourself. <b>Path C</b> auto-triggers the pipeline as soon as "
+        "Apify succeeds with at least the configured minimum number of posts. Path C requires the UI "
+        "tab to stay open; if you close it before Apify finishes, you'll still get the scrape-complete "
+        "email and can click Run Pipeline manually."
         "</span>",
         unsafe_allow_html=True,
     )
@@ -522,18 +525,50 @@ def screen_run():
             key="scrape_newer_than",
         )
         skip_pinned = st.checkbox("Skip pinned posts", value=False, key="scrape_skip_pinned")
+        auto_min_posts = st.number_input(
+            "Path C safety: min posts to auto-chain",
+            min_value=1, max_value=10000,
+            value=int(cfg.get("apify_min_posts_for_auto_run", 10)),
+            help="Path C refuses to auto-trigger the pipeline if Apify returns fewer than this many "
+                 "posts — guards against running 30 min of Gemini calls on a busted scrape.",
+            key="auto_min_posts",
+        )
 
     apify_token = os.environ.get("APIFY_API_KEY", "").strip()
     if not apify_token:
-        st.warning("APIFY_API_KEY is not set in environment. Set it in Replit Secrets to use Path B.")
+        st.warning("APIFY_API_KEY is not set in environment. Set it in Replit Secrets to use Path B/C.")
 
-    if st.button("🚀 Scrape only (Apify API)", key="scrape_only", disabled=not apify_token):
+    btn_cols = st.columns([1, 1, 3])
+    with btn_cols[0]:
+        scrape_only_clicked = st.button(
+            "🚀 Scrape only (Path B)",
+            key="scrape_only",
+            disabled=not apify_token,
+            help="Kicks off Apify and stops. You'll get an email when it finishes; "
+                 "then come back and click Run Pipeline.",
+        )
+    with btn_cols[1]:
+        scrape_and_run_clicked = st.button(
+            "🔗 Scrape & Run (Path C)",
+            key="scrape_and_run",
+            disabled=not apify_token,
+            type="primary",
+            help="Triggers Apify, polls until done, then auto-starts the pipeline as long as the "
+                 "scrape returned at least the minimum post count above.",
+        )
+
+    if scrape_only_clicked or scrape_and_run_clicked:
         names = [a.strip().lstrip("@") for a in accts_input.splitlines() if a.strip()]
         if not names:
             st.error("Add at least one account.")
         else:
             try:
                 result = apify_trigger_scrape(names, results_limit, newer_than, skip_pinned, apify_token)
+                # Persist the chosen min-posts threshold so the panel's
+                # auto-chain decision uses the value at trigger time, not
+                # whatever's in the form when the panel re-renders 30 min later.
+                if scrape_and_run_clicked:
+                    save_config({"apify_min_posts_for_auto_run": int(auto_min_posts)})
                 _write_job(JOB_KIND_SCRAPE, {
                     "pid": 0,  # no local subprocess — Apify is remote
                     "remote": True,
@@ -542,8 +577,11 @@ def screen_run():
                     "accounts": names,
                     "results_limit": results_limit,
                     "newer_than_days": newer_than,
+                    "auto_chain": bool(scrape_and_run_clicked),
+                    "auto_chain_min_posts": int(auto_min_posts),
                 })
-                st.success(f"Apify run started: {result['run_id']}")
+                label = "Path C (auto-chain)" if scrape_and_run_clicked else "Path B (scrape only)"
+                st.success(f"Apify run started: {result['run_id']} · {label}")
                 time.sleep(0.6)
                 st.rerun()
             except Exception as e:
@@ -643,6 +681,72 @@ def render_apify_scrape_panel(info: dict):
     if status == "SUCCEEDED":
         post_count = _fetch_apify_dataset_count(apify_dataset_id, token)
         _maybe_send_apify_scrape_email(info, status, post_count=post_count)
+
+        # ── Path C: auto-chain to pipeline if requested ────────────────
+        # Only triggers when:
+        #   · this scrape was kicked off via the "Scrape & Run" (Path C) button
+        #   · the scrape returned at least the user's safety threshold of posts
+        #   · no pipeline run is currently in progress (defensive — shouldn't
+        #     happen given the Run screen would render the run panel instead,
+        #     but covers the case where someone manually started main.py from
+        #     the shell at the same time)
+        if info.get("auto_chain") and not info.get("auto_chain_triggered"):
+            threshold = int(info.get("auto_chain_min_posts", 10) or 10)
+            run_status, _ = _job_status(JOB_KIND_RUN)
+            if run_status == "running":
+                st.warning(
+                    "Path C wanted to auto-trigger the pipeline, but another pipeline "
+                    "run is already in progress. Letting that one finish — you can "
+                    "click Auto-fill below to manually queue this dataset after."
+                )
+            elif post_count < threshold:
+                st.error(
+                    f"Path C safety guard: Apify returned only **{post_count} posts**, below your "
+                    f"minimum of **{threshold}**. The pipeline was NOT auto-triggered — this is "
+                    f"the guard catching what's probably a busted scrape (quota issue, dead accounts, "
+                    f"wrong actor settings, etc.). Investigate the dataset before processing."
+                )
+                cols = st.columns([1, 1, 3])
+                with cols[0]:
+                    if st.button("Run pipeline anyway", key="auto_chain_override"):
+                        save_config({"instagram_data_url": apify_dataset_url(apify_dataset_id),
+                                     "apify_enabled": False})
+                        pid = _spawn([sys.executable, "main.py", "--now"],
+                                     JOB_KIND_RUN, extra={"trigger": "path_c_override"})
+                        info["auto_chain_triggered"] = True
+                        _write_job(JOB_KIND_SCRAPE, info)
+                        _clear_job(JOB_KIND_SCRAPE)
+                        st.success(f"Pipeline started (PID {pid}). Switch to **Run** for the log.")
+                        time.sleep(0.6)
+                        st.rerun()
+                with cols[1]:
+                    if st.button("Cancel — keep the dataset", key="auto_chain_cancel"):
+                        # Treat as Path B from here: user can manually fill URL into Path A.
+                        info["auto_chain"] = False
+                        _write_job(JOB_KIND_SCRAPE, info)
+                        st.rerun()
+                return
+            else:
+                # Happy Path C: enough posts, no conflict — chain it.
+                save_config({"instagram_data_url": apify_dataset_url(apify_dataset_id),
+                             "apify_enabled": False})
+                pid = _spawn([sys.executable, "main.py", "--now"],
+                             JOB_KIND_RUN, extra={"trigger": "path_c_auto"})
+                # Stamp the job so we don't re-spawn on the next poll tick
+                # in the brief window before _clear_job takes effect.
+                info["auto_chain_triggered"] = True
+                _write_job(JOB_KIND_SCRAPE, info)
+                _clear_job(JOB_KIND_SCRAPE)
+                st.success(
+                    f"🔗 Path C auto-chained · Apify returned {post_count:,} posts · "
+                    f"pipeline started (PID {pid}). Switch to **Run** to watch the live log."
+                )
+                time.sleep(0.8)
+                st.rerun()
+                return
+
+        # Path B (or Path C after manual cancellation) lands here:
+        # show the dataset, let the user manually trigger.
         st.success(
             f"Scrape complete ({post_count:,} posts). Copy the dataset URL above into "
             f"Path A and click Run Pipeline."
@@ -685,6 +789,7 @@ CONFIG_DEFAULTS = {
     "apify_enabled": True,
     "apify_posts_per_profile": 25,
     "apify_newer_than_days": 21,
+    "apify_min_posts_for_auto_run": 10,
     "sheet_name": "Instagram_Events_Master",
     "schedule_day": "Thursday",
     "schedule_time": "14:00",
