@@ -193,9 +193,19 @@ def load_accounts_from_file() -> list[str]:
 
 def apify_trigger_scrape(usernames: list[str], results_limit: int,
                          newer_than_days: int, skip_pinned: bool,
-                         token: str) -> dict:
+                         token: str, memory_mb: int = 4096,
+                         timeout_secs: int = 3600) -> dict:
     """Kick off an Apify actor run. Returns {'run_id', 'dataset_id'} or
-    raises on HTTP error. Non-blocking — caller polls status separately."""
+    raises on HTTP error. Non-blocking — caller polls status separately.
+
+    Memory tier matters: the actor uses the memory allocation to decide
+    how many parallel scraping workers to spawn internally. Default 4096
+    MB matches Apify's actor default and is what we were sending before;
+    bumping to 8192 or 16384 typically halves or quarters wall-clock for
+    large account lists (1000+ usernames) — at the cost of consuming
+    compute units faster. Total compute spend is similar (memory × time
+    is what's billed), just compressed.
+    """
     import requests
     newer_than_date = ""
     if newer_than_days > 0:
@@ -211,9 +221,15 @@ def apify_trigger_scrape(usernames: list[str], results_limit: int,
     if newer_than_date:
         payload["onlyPostsNewerThan"] = newer_than_date
 
+    # Memory + timeout are query parameters on the run-creation endpoint
+    # per Apify's API spec; they're separate from the actor-input payload.
     r = requests.post(
         f"{APIFY_API_BASE}/acts/{APIFY_ACTOR}/runs",
-        params={"token": token},
+        params={
+            "token": token,
+            "memory": int(memory_mb),
+            "timeout": int(timeout_secs),
+        },
         json=payload,
         timeout=30,
     )
@@ -533,6 +549,29 @@ def screen_run():
                  "posts — guards against running 30 min of Gemini calls on a busted scrape.",
             key="auto_min_posts",
         )
+        memory_options = {
+            "4096 MB (default, ~30 min for 1000 accts)": 4096,
+            "8192 MB (~15 min for 1000 accts)": 8192,
+            "16384 MB (fastest, ~7 min for 1000 accts)": 16384,
+            "32768 MB (overkill for most cases)": 32768,
+        }
+        default_mem = int(cfg.get("apify_memory_mb", 8192))
+        # Match the saved value to a label; fall back to the closest higher tier
+        default_label = next(
+            (k for k, v in memory_options.items() if v == default_mem),
+            "8192 MB (~15 min for 1000 accts)",
+        )
+        memory_label = st.selectbox(
+            "Apify compute tier",
+            options=list(memory_options.keys()),
+            index=list(memory_options.keys()).index(default_label),
+            help="Apify charges for compute-units (memory × time). Higher tiers finish faster "
+                 "but burn the same total CUs. Match this to what you see when triggering on "
+                 "the Apify website — the API was defaulting to the actor's lowest tier (4096), "
+                 "which is why API-triggered scrapes felt slower than your manual runs.",
+            key="apify_memory_label",
+        )
+        memory_mb = memory_options[memory_label]
 
     apify_token = os.environ.get("APIFY_API_KEY", "").strip()
     if not apify_token:
@@ -563,12 +602,17 @@ def screen_run():
             st.error("Add at least one account.")
         else:
             try:
-                result = apify_trigger_scrape(names, results_limit, newer_than, skip_pinned, apify_token)
-                # Persist the chosen min-posts threshold so the panel's
-                # auto-chain decision uses the value at trigger time, not
-                # whatever's in the form when the panel re-renders 30 min later.
-                if scrape_and_run_clicked:
-                    save_config({"apify_min_posts_for_auto_run": int(auto_min_posts)})
+                result = apify_trigger_scrape(
+                    names, results_limit, newer_than, skip_pinned, apify_token,
+                    memory_mb=memory_mb,
+                )
+                # Persist the chosen settings so subsequent panels render with
+                # the same defaults without the user re-picking each time.
+                save_config({
+                    "apify_memory_mb": int(memory_mb),
+                    **({"apify_min_posts_for_auto_run": int(auto_min_posts)}
+                       if scrape_and_run_clicked else {}),
+                })
                 _write_job(JOB_KIND_SCRAPE, {
                     "pid": 0,  # no local subprocess — Apify is remote
                     "remote": True,
@@ -577,11 +621,42 @@ def screen_run():
                     "accounts": names,
                     "results_limit": results_limit,
                     "newer_than_days": newer_than,
+                    "apify_memory_mb": int(memory_mb),
                     "auto_chain": bool(scrape_and_run_clicked),
                     "auto_chain_min_posts": int(auto_min_posts),
                 })
+                # Spawn the background watcher subprocess so the scrape-
+                # complete email + the Path C auto-chain still fire when
+                # the user closes the browser tab. The watcher polls
+                # Apify on its own cadence and writes back to the same
+                # JSON state file the UI reads. Idempotent guards in
+                # both processes prevent double emails / double spawns.
+                try:
+                    watcher_log = OUTPUTS / "UI_apify_watcher.log"
+                    OUTPUTS.mkdir(parents=True, exist_ok=True)
+                    with open(watcher_log, "ab") as _wlog:
+                        subprocess.Popen(
+                            [sys.executable, "apify_watcher.py", str(_job_path(JOB_KIND_SCRAPE))],
+                            stdout=_wlog,
+                            stderr=subprocess.STDOUT,
+                            start_new_session=True,
+                            cwd=str(ROOT),
+                        )
+                except Exception as wexc:
+                    # Watcher spawn failure is non-fatal — the UI's own
+                    # polling still handles the case where the tab stays
+                    # open. We just warn the user that browser-close
+                    # fallback won't work for this scrape.
+                    st.warning(
+                        f"Background watcher couldn't be spawned ({wexc}). "
+                        f"Email and Path C auto-chain will only fire if you keep this tab open."
+                    )
+
                 label = "Path C (auto-chain)" if scrape_and_run_clicked else "Path B (scrape only)"
-                st.success(f"Apify run started: {result['run_id']} · {label}")
+                st.success(
+                    f"Apify run started: {result['run_id']} · {label} · "
+                    f"compute tier {memory_mb} MB"
+                )
                 time.sleep(0.6)
                 st.rerun()
             except Exception as e:
@@ -790,6 +865,7 @@ CONFIG_DEFAULTS = {
     "apify_posts_per_profile": 25,
     "apify_newer_than_days": 21,
     "apify_min_posts_for_auto_run": 10,
+    "apify_memory_mb": 8192,
     "sheet_name": "Instagram_Events_Master",
     "schedule_day": "Thursday",
     "schedule_time": "14:00",
