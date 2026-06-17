@@ -571,6 +571,54 @@ def screen_run():
     )
 
 
+def _maybe_send_apify_scrape_email(info: dict, status: str, post_count: int = 0):
+    """Send the Apify-scrape-finished email exactly once per (run_id, status).
+
+    Streamlit's poll loop re-enters this code path every few seconds while
+    the user is on the screen — without dedup we'd flood the inbox. The
+    'apify_notified' field in the job state file is the source of truth.
+    """
+    if info.get("apify_notified"):
+        return
+    try:
+        import email_run_summary
+        email_run_summary.send_apify_scrape_notification(
+            run_id=info.get("apify_run_id", ""),
+            dataset_id=info.get("apify_dataset_id", ""),
+            status=status,
+            post_count=int(post_count or 0),
+            accounts_requested=len(info.get("accounts", []) or []),
+            triggered_at=info.get("started_at", ""),
+        )
+    except Exception as e:
+        # Non-fatal — UI shouldn't break because email failed
+        print(f"  ⚠ apify-complete email path raised: {e}")
+        return
+    # Stamp 'notified' on the job state so future polls don't re-send
+    info["apify_notified"] = True
+    info["apify_notified_status"] = status
+    _write_job(JOB_KIND_SCRAPE, info)
+
+
+def _fetch_apify_dataset_count(dataset_id: str, token: str) -> int:
+    """Quick HEAD/limited GET to learn how many posts the scrape returned.
+    Returns 0 on any failure — count is informational, not load-bearing."""
+    if not (dataset_id and token):
+        return 0
+    try:
+        import requests
+        r = requests.get(
+            f"https://api.apify.com/v2/datasets/{dataset_id}",
+            params={"token": token},
+            timeout=10,
+        )
+        if r.ok:
+            return int((r.json().get("data") or {}).get("itemCount") or 0)
+    except Exception:
+        pass
+    return 0
+
+
 def render_apify_scrape_panel(info: dict):
     """For remote Apify runs, poll status via API rather than tail a log."""
     apify_run_id = info.get("apify_run_id")
@@ -593,7 +641,12 @@ def render_apify_scrape_panel(info: dict):
     st.markdown(f"Dataset (when ready): {apify_dataset_url(apify_dataset_id)}")
 
     if status == "SUCCEEDED":
-        st.success("Scrape complete. Copy the dataset URL above into Path A and click Run Pipeline.")
+        post_count = _fetch_apify_dataset_count(apify_dataset_id, token)
+        _maybe_send_apify_scrape_email(info, status, post_count=post_count)
+        st.success(
+            f"Scrape complete ({post_count:,} posts). Copy the dataset URL above into "
+            f"Path A and click Run Pipeline."
+        )
         if st.button("Auto-fill into Path A and continue", key="fill_url"):
             save_config({"instagram_data_url": apify_dataset_url(apify_dataset_id), "apify_enabled": False})
             _clear_job(JOB_KIND_SCRAPE)
@@ -604,6 +657,7 @@ def render_apify_scrape_panel(info: dict):
         return
 
     if status in ("FAILED", "TIMED-OUT", "ABORTED") or status.startswith("POLL_ERROR"):
+        _maybe_send_apify_scrape_email(info, status, post_count=0)
         st.error(f"Apify run ended with status: {status}")
         if st.button("Clear failed scrape", key="clear_failed_scrape"):
             _clear_job(JOB_KIND_SCRAPE)

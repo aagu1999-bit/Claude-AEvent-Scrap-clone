@@ -2479,6 +2479,26 @@ class InstagramEventPipeline:
             f"  OCR failed          : {s.get('ocr_failed', 0):>6}",
             f"  Gemini errors       : {s.get('gemini_errors', 0):>6}",
         ]
+
+        # Accounts hygiene: surface Apify shell records — accounts that
+        # returned no posts (private / suspended / deleted / typo'd /
+        # zero-recent-posts). Even a small count is worth seeing in the
+        # email so the user can prune their Accounts tab before the next
+        # run instead of discovering it weeks later.
+        shell_accounts = s.get('apify_shell_accounts') or {}
+        if shell_accounts:
+            total_empty = sum(shell_accounts.values())
+            unique_count = len(shell_accounts)
+            lines.append("")
+            lines.append(f"  ⚠ Dead/typo'd handles: {unique_count} unique, "
+                         f"{total_empty} empty Apify responses")
+            top = sorted(shell_accounts.items(), key=lambda kv: -kv[1])[:8]
+            for acct, n in top:
+                lines.append(f"      {n:4d}×  {acct or '(no inputUrl)'}")
+            if unique_count > 8:
+                lines.append(f"      … and {unique_count - 8} more "
+                             f"(full list in outputs/anomalies_*.json)")
+
         info = outage_watchdog.get_abort_info()
         if info:
             lines.append("")
@@ -2501,10 +2521,51 @@ class InstagramEventPipeline:
         print(f"   Target: Every {target_day} at {target_time} ({SCHEDULE_TZ})")
         print("   Status: Waiting...")
 
+        # Resolve target weekday number once.
+        _day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday',
+                      'Friday', 'Saturday', 'Sunday']
+        try:
+            _target_weekday = _day_names.index(target_day)
+        except ValueError:
+            _target_weekday = 3  # default Thursday
+
+        def _next_scheduled(now_dt):
+            """Compute the next datetime that matches (target_day, target_time)
+            in SCHEDULE_TZ. Used for the 1-hour-before warning."""
+            try:
+                hh, mm = target_time.split(":")
+                hh, mm = int(hh), int(mm)
+            except (ValueError, AttributeError):
+                hh, mm = 14, 0
+            days_ahead = (_target_weekday - now_dt.weekday()) % 7
+            candidate = now_dt.replace(hour=hh, minute=mm, second=0, microsecond=0) \
+                              + timedelta(days=days_ahead)
+            if candidate <= now_dt:
+                candidate += timedelta(days=7)
+            return candidate
+
         while True:
             now = datetime.now(SCHEDULE_TZ)
             day = now.strftime("%A")
             hm = now.strftime("%H:%M")
+
+            # 1-hour-before warning email. Fires when "now" is between 65
+            # and 55 minutes before the next scheduled run, which gives
+            # the 10-second scheduler tick plenty of slop without firing
+            # more than once (the marker-file dedup in send_scheduled_run_warning
+            # also guards against the case where this branch happens to
+            # be entered multiple times within the same minute).
+            try:
+                next_run = _next_scheduled(now)
+                until = (next_run - now).total_seconds() / 60.0
+                if 55.0 <= until <= 65.0:
+                    email_run_summary.send_scheduled_run_warning(
+                        target_dt_iso=next_run.isoformat(),
+                        minutes_until=60,
+                    )
+            except Exception as e:
+                # Email path must never block the scheduler.
+                print(f"⚠ scheduler-warning email path raised: {e}")
 
             if day == target_day and hm == target_time:
                 print(f"\n🚀 STARTING RUN: {now}")
@@ -3111,6 +3172,24 @@ def do_force_run(bot):
             print(f"⚠ Audit failed (non-fatal): {e}")
 
 
+def _capture_unhandled_exception(exc_type, exc_value, exc_tb):
+    """sys.excepthook: capture the full traceback so the atexit-fired
+    run-summary email includes it in the body. Without this, the only
+    way to find out why a run died was to ssh in and tail the log.
+
+    Re-calls the default excepthook afterwards so stderr printing of the
+    traceback still happens. SystemExit and KeyboardInterrupt skip the
+    capture — those are intentional exits, not bugs we need to surface."""
+    import traceback as _tb
+    if exc_type and not issubclass(exc_type, (SystemExit, KeyboardInterrupt)):
+        try:
+            formatted = "".join(_tb.format_exception(exc_type, exc_value, exc_tb))
+            email_run_summary.capture_exception(formatted)
+        except Exception:
+            pass
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+
 def _email_summary_on_exit():
     """atexit handler: fires when the process exits for any reason.
 
@@ -3165,6 +3244,7 @@ if __name__ == "__main__":
     # crashes during the bot's __init__.
     atexit.register(_email_summary_on_exit)
     signal.signal(signal.SIGTERM, _sigterm_to_exit)
+    sys.excepthook = _capture_unhandled_exception
 
     # --buffered: each worker buffers its post's lines and flushes the whole
     # block atomically when the post finishes. Trades real-time visibility
