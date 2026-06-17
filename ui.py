@@ -233,7 +233,44 @@ def apify_trigger_scrape(usernames: list[str], results_limit: int,
         json=payload,
         timeout=30,
     )
-    r.raise_for_status()
+
+    # Friendly error path. Apify returns a JSON body on 4xx/5xx with an
+    # error.type and error.message that's much more useful than the raw
+    # HTTP status. Surface that to the UI; otherwise the user sees the
+    # bare `requests.HTTPError` string which is hard to act on. The
+    # memory-quota case is the one we care about most for compute-tier
+    # selection — translate it into plain English with a specific
+    # remediation step.
+    if not r.ok:
+        body_err = ""
+        body_err_type = ""
+        try:
+            j = r.json()
+            err = (j.get("error") or {}) if isinstance(j, dict) else {}
+            body_err = err.get("message", "") or ""
+            body_err_type = err.get("type", "") or ""
+        except Exception:
+            body_err = (r.text or "")[:300]
+
+        low = (body_err + " " + body_err_type).lower()
+        if ("memory" in low and ("limit" in low or "quota" in low or "exceed" in low or "available" in low)) \
+                or r.status_code == 402:
+            raise RuntimeError(
+                f"Apify rejected memory={memory_mb} MB (HTTP {r.status_code}). "
+                f"Your Apify account plan probably caps actor memory below this tier. "
+                f"Try a lower compute tier (e.g., 8192 or 4096 MB) — or upgrade your "
+                f"Apify plan at https://console.apify.com/billing if you want to keep "
+                f"running larger tiers. Apify said: {body_err or '(no message)'}"
+            )
+        if r.status_code == 401 or r.status_code == 403:
+            raise RuntimeError(
+                f"Apify rejected the request (HTTP {r.status_code}). "
+                f"Check APIFY_API_KEY in Replit Secrets. Apify said: {body_err or '(no message)'}"
+            )
+        raise RuntimeError(
+            f"Apify returned HTTP {r.status_code}. Body: {body_err or '(no message)'}"
+        )
+
     data = r.json()["data"]
     return {"run_id": data["id"], "dataset_id": data["defaultDatasetId"]}
 
@@ -565,13 +602,21 @@ def screen_run():
             "Apify compute tier",
             options=list(memory_options.keys()),
             index=list(memory_options.keys()).index(default_label),
-            help="Apify charges for compute-units (memory × time). Higher tiers finish faster "
-                 "but burn the same total CUs. Match this to what you see when triggering on "
-                 "the Apify website — the API was defaulting to the actor's lowest tier (4096), "
-                 "which is why API-triggered scrapes felt slower than your manual runs.",
+            help="This is Apify's server-side memory allocation, not your computer's. "
+                 "Caps depend on your Apify plan: Free=4GB, Personal=32GB, Team=64GB+. "
+                 "If you pick a tier above your plan, Apify rejects the run with a clear "
+                 "error message — the scrape just won't start, nothing else breaks. "
+                 "Drop to a lower tier and retry.",
             key="apify_memory_label",
         )
         memory_mb = memory_options[memory_label]
+        st.markdown(
+            '<span class="muted">'
+            "Caps by plan: Free 4 GB · Personal 32 GB · Team 64 GB+. "
+            "If your run is rejected, lower the tier and retry."
+            "</span>",
+            unsafe_allow_html=True,
+        )
 
     apify_token = os.environ.get("APIFY_API_KEY", "").strip()
     if not apify_token:
