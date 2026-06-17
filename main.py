@@ -92,6 +92,7 @@ from worker_log import (
 )
 
 import outage_watchdog
+import email_run_summary
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%I:%M:%S %p')
 logger = get_logger(__name__)
@@ -2454,6 +2455,37 @@ class InstagramEventPipeline:
         except Exception as e:
             print(f"⚠ Reliable Accounts refresh failed: {e}")
 
+        # Email the freshly-written CSV + Excel exports. Idempotent — if the
+        # atexit handler also fires (process exit / SIGTERM), it'll no-op.
+        try:
+            stats_summary = self._format_email_stats()
+            email_run_summary.send_run_summary(
+                status='completed',
+                stats_summary=stats_summary,
+                run_id=getattr(self, 'run_id', '') or '',
+            )
+        except Exception as e:
+            print(f"⚠ run-summary email path raised: {e}")
+
+    def _format_email_stats(self) -> str:
+        """Compact run stats block for the email body."""
+        s = self.stats or {}
+        lines = [
+            f"  Posts scraped       : {s.get('scraped', 0):>6}",
+            f"  Events extracted    : {s.get('events_found', 0):>6}",
+            f"  Posts with events   : {s.get('posts_with_events', 0):>6}",
+            f"  No events found     : {s.get('no_events_found', 0):>6}",
+            f"  OCR success         : {s.get('ocr_success', 0):>6}",
+            f"  OCR failed          : {s.get('ocr_failed', 0):>6}",
+            f"  Gemini errors       : {s.get('gemini_errors', 0):>6}",
+        ]
+        info = outage_watchdog.get_abort_info()
+        if info:
+            lines.append("")
+            lines.append(f"  ⛔ Outage abort     : {info.get('category', '?')} "
+                         f"({info.get('count', '?')} in {info.get('window_seconds', '?')}s)")
+        return "\n".join(lines)
+
     def start_scheduler(self):
         target_day = CONF["schedule_day"]
         target_time = CONF["schedule_time"]
@@ -3079,7 +3111,61 @@ def do_force_run(bot):
             print(f"⚠ Audit failed (non-fatal): {e}")
 
 
+def _email_summary_on_exit():
+    """atexit handler: fires when the process exits for any reason.
+
+    If the explicit completion-path send_run_summary() inside save_data()
+    has already fired (normal completion), this is a no-op thanks to
+    email_run_summary's idempotency flag. Otherwise (UI Stop button →
+    SIGTERM, watchdog abort, crash, KeyboardInterrupt), this sends the
+    email with a status that reflects what actually happened.
+
+    The status precedence:
+      · outage_watchdog tripped     → 'aborted'
+      · everything else              → 'stopped'  (covers UI Stop, Ctrl-C,
+                                                   uncaught crash, etc.)
+    Normal completion never reaches this branch because save_data() set
+    the flag first.
+    """
+    if email_run_summary.already_sent():
+        return
+    info = outage_watchdog.get_abort_info()
+    status = 'aborted' if info else 'stopped'
+    note = ''
+    if info:
+        note = (f"Outage abort: {info.get('category', '?')} "
+                f"({info.get('count', '?')} failures in "
+                f"{info.get('window_seconds', '?')}s)")
+    try:
+        email_run_summary.send_run_summary(
+            status=status,
+            stats_summary=note,
+        )
+    except Exception as e:
+        # Don't let an email failure mask the original exit reason.
+        print(f"⚠ atexit run-summary email path raised: {e}")
+
+
+def _sigterm_to_exit(signum, frame):
+    """Convert SIGTERM into a clean sys.exit(0).
+
+    Python's default SIGTERM handler terminates the process WITHOUT
+    running atexit callbacks. The UI's Stop button sends SIGTERM (see
+    ui.py _stop_job). Installing this handler ensures the atexit-
+    registered _email_summary_on_exit() actually fires when the user
+    stops a run from the dashboard.
+    """
+    print(f"\n📨 Received SIGTERM (signal {signum}) — exiting cleanly so atexit handlers run.")
+    sys.exit(0)
+
+
 if __name__ == "__main__":
+    # Wire the run-summary email infrastructure FIRST so it covers the
+    # entire main entry, including preflight failures and import-time
+    # crashes during the bot's __init__.
+    atexit.register(_email_summary_on_exit)
+    signal.signal(signal.SIGTERM, _sigterm_to_exit)
+
     # --buffered: each worker buffers its post's lines and flushes the whole
     # block atomically when the post finishes. Trades real-time visibility
     # for clean per-post blocks in the run log — good for retrospective
