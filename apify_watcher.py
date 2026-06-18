@@ -125,6 +125,22 @@ def maybe_send_email(info: dict, status: str, post_count: int):
         print(f"[watcher] email failed: {e}", file=sys.stderr)
 
 
+# Fields the pipeline ACTUALLY reads from each Apify item. Matches the
+# URL form the user has been pasting manually (confirmed 2026-06-18),
+# plus `childPosts` which is critical for carousel/multi-image posts —
+# main.py reads carousel slides via post.get('childPosts') and would
+# silently process them as single-image posts without it.
+#
+# Sticking to a curated list (vs. requesting all fields) cuts the items
+# JSON payload by roughly an order of magnitude for typical posts — big
+# deal on Replit where memory + bandwidth matter for 1000+ post scrapes.
+_APIFY_ITEM_FIELDS = (
+    "alt,caption,childPosts,displayUrl,videoUrl,locationId,locationName,"
+    "profilePicUrl,username,url,timestamp,ownerUsername,ownerFullName,"
+    "inputUrl,images,fullName,firstComment,id,isPinned,shortCode"
+)
+
+
 def _api_items_url(dataset_id: str, token: str) -> str:
     """Build the URL main.py needs to fetch dataset items as JSON.
 
@@ -136,17 +152,31 @@ def _api_items_url(dataset_id: str, token: str) -> str:
         column 1 (char 0)" — which is the exact crash the user hit
         when Path C auto-chain saved this form to config.json.
 
-      · api.apify.com/v2/datasets/<id>/items?token=<key>&format=json&clean=false
-        JSON endpoint. Authenticated. This is what we want.
+      · api.apify.com/v2/datasets/<id>/items?token=<key>&format=json
+        &fields=<list>&clean=true
+        JSON endpoint. This is what we want.
 
-    The token is required because the dataset is private to the user's
-    Apify account. We pull APIFY_API_KEY from env (same env var the
-    initial scrape used to trigger the run).
+    URL params:
+      · token=    : optional for public datasets, required for private.
+                    We always include it to be safe; pulled from
+                    APIFY_API_KEY env (same one the scrape was triggered with).
+      · format=json : returns array of items (default would be JSONL)
+      · fields=   : whitelist of keys to include per item. Massively
+                    smaller payload than requesting all fields. List
+                    is the union of (a) what the user's hand-pasted
+                    URL has, and (b) what main.py actually reads from
+                    each post — see _APIFY_ITEM_FIELDS comment above.
+      · clean=true : drops null/empty fields per item, smaller still.
+                     Apify's actor populates fields conditionally; clean
+                     turns "all None values" into no key at all, which
+                     main.py's .get(...) calls handle identically.
     """
     if not (dataset_id and token):
         return ""
     return (f"https://api.apify.com/v2/datasets/{dataset_id}/items"
-            f"?token={token}&format=json&clean=false")
+            f"?token={token}&format=json"
+            f"&fields={_APIFY_ITEM_FIELDS}"
+            f"&clean=true")
 
 
 def maybe_auto_chain(info: dict, post_count: int, repo_root: Path):

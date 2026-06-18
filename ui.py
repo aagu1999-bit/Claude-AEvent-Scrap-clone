@@ -293,18 +293,42 @@ def apify_dataset_url(dataset_id: str) -> str:
     return f"https://console.apify.com/storage/datasets/{dataset_id}"
 
 
+# Whitelist of fields the pipeline reads from each post — see the
+# matching constant in apify_watcher.py for full background. The two
+# must stay in sync; the safer fix would be to import from a shared
+# module, but ui.py is intentionally light on imports from the bot
+# code so it can stand alone if the rest of the repo breaks.
+_APIFY_ITEM_FIELDS = (
+    "alt,caption,childPosts,displayUrl,videoUrl,locationId,locationName,"
+    "profilePicUrl,username,url,timestamp,ownerUsername,ownerFullName,"
+    "inputUrl,images,fullName,firstComment,id,isPinned,shortCode"
+)
+
+
 def apify_items_api_url(dataset_id: str, token: str = "") -> str:
     """API endpoint that returns dataset items as JSON. THIS is what
     main.py's static_url path needs — the console URL returns HTML and
     crashes response.json(). Token is required because the dataset is
     private to the user's Apify account; falls back to env var if not
-    passed in. Returns "" if either piece is missing."""
+    passed in. Returns "" if either piece is missing.
+
+    URL params:
+      · format=json : array of items (not JSONL)
+      · fields=     : whitelist of keys per item — see _APIFY_ITEM_FIELDS
+      · clean=true  : drops null/empty fields, smaller payload
+
+    The token + clean=true + fields filter match the URL form the user
+    has been pasting manually (confirmed 2026-06-18). Adding childPosts
+    to the field list is the one mandatory addition — main.py uses it
+    for carousel slides."""
     if not token:
         token = os.environ.get("APIFY_API_KEY", "").strip()
     if not (dataset_id and token):
         return ""
     return (f"https://api.apify.com/v2/datasets/{dataset_id}/items"
-            f"?token={token}&format=json&clean=false")
+            f"?token={token}&format=json"
+            f"&fields={_APIFY_ITEM_FIELDS}"
+            f"&clean=true")
 
 
 # ─── Log tailing ──────────────────────────────────────────────────────────

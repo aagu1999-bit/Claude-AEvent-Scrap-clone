@@ -3153,8 +3153,16 @@ def do_force_run(bot):
                 token = os.environ.get("APIFY_API_KEY", "").strip()
                 dataset_id = _extract_dataset_id_from_url(url) or ""
                 if dataset_id and token:
+                    # Keep this in sync with apify_watcher.py's
+                    # _APIFY_ITEM_FIELDS and ui.py's _APIFY_ITEM_FIELDS.
+                    fields = ("alt,caption,childPosts,displayUrl,videoUrl,"
+                              "locationId,locationName,profilePicUrl,username,"
+                              "url,timestamp,ownerUsername,ownerFullName,"
+                              "inputUrl,images,fullName,firstComment,id,"
+                              "isPinned,shortCode")
                     fixed = (f"https://api.apify.com/v2/datasets/{dataset_id}/items"
-                             f"?token={token}&format=json&clean=false")
+                             f"?token={token}&format=json"
+                             f"&fields={fields}&clean=true")
                     print(f"  ⚠ instagram_data_url was the Apify CONSOLE URL "
                           f"(returns HTML, not JSON). Auto-translating to the "
                           f"API items endpoint so this run works.")
