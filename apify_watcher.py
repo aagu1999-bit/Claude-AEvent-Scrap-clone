@@ -125,6 +125,30 @@ def maybe_send_email(info: dict, status: str, post_count: int):
         print(f"[watcher] email failed: {e}", file=sys.stderr)
 
 
+def _api_items_url(dataset_id: str, token: str) -> str:
+    """Build the URL main.py needs to fetch dataset items as JSON.
+
+    Apify exposes two URL forms for a dataset:
+
+      · console.apify.com/storage/datasets/<id>
+        Human-facing web page. Returns HTML. main.py would try to
+        json.loads() the HTML and crash with "Expecting value: line 1
+        column 1 (char 0)" — which is the exact crash the user hit
+        when Path C auto-chain saved this form to config.json.
+
+      · api.apify.com/v2/datasets/<id>/items?token=<key>&format=json&clean=false
+        JSON endpoint. Authenticated. This is what we want.
+
+    The token is required because the dataset is private to the user's
+    Apify account. We pull APIFY_API_KEY from env (same env var the
+    initial scrape used to trigger the run).
+    """
+    if not (dataset_id and token):
+        return ""
+    return (f"https://api.apify.com/v2/datasets/{dataset_id}/items"
+            f"?token={token}&format=json&clean=false")
+
+
 def maybe_auto_chain(info: dict, post_count: int, repo_root: Path):
     """If auto_chain=True and Apify returned enough posts, spawn the
     pipeline as a detached subprocess. Updates info in-place."""
@@ -140,15 +164,25 @@ def maybe_auto_chain(info: dict, post_count: int, repo_root: Path):
         info["auto_chain_skipped_reason"] = f"only {post_count} posts (need {threshold})"
         return
 
-    # Update config.json so the pipeline picks up the dataset.
+    # Update config.json so the pipeline picks up the dataset. Use the
+    # API items URL (JSON) — the console URL is for humans and returns
+    # HTML, which would crash main.py's response.json() call.
     dataset_id = info.get("apify_dataset_id", "")
-    dataset_url = f"https://console.apify.com/storage/datasets/{dataset_id}" if dataset_id else ""
+    token = os.environ.get("APIFY_API_KEY", "").strip()
+    items_url = _api_items_url(dataset_id, token)
+    if not items_url:
+        print(f"[watcher] cannot build API items URL "
+              f"(dataset_id={dataset_id!r}, token_present={bool(token)}) "
+              f"— aborting auto-chain", file=sys.stderr)
+        info["auto_chain_skipped"] = True
+        info["auto_chain_skipped_reason"] = "missing dataset_id or APIFY_API_KEY"
+        return
     try:
         config_path = repo_root / "config.json"
         cfg = {}
         if config_path.exists():
             cfg = json.loads(config_path.read_text())
-        cfg["instagram_data_url"] = dataset_url
+        cfg["instagram_data_url"] = items_url
         cfg["apify_enabled"] = False
         tmp = config_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(cfg, indent=2))

@@ -288,7 +288,23 @@ def apify_poll_status(run_id: str, token: str) -> str:
 
 
 def apify_dataset_url(dataset_id: str) -> str:
+    """Human-facing console URL. Use for display only — main.py
+    can't fetch JSON from this URL because it returns HTML."""
     return f"https://console.apify.com/storage/datasets/{dataset_id}"
+
+
+def apify_items_api_url(dataset_id: str, token: str = "") -> str:
+    """API endpoint that returns dataset items as JSON. THIS is what
+    main.py's static_url path needs — the console URL returns HTML and
+    crashes response.json(). Token is required because the dataset is
+    private to the user's Apify account; falls back to env var if not
+    passed in. Returns "" if either piece is missing."""
+    if not token:
+        token = os.environ.get("APIFY_API_KEY", "").strip()
+    if not (dataset_id and token):
+        return ""
+    return (f"https://api.apify.com/v2/datasets/{dataset_id}/items"
+            f"?token={token}&format=json&clean=false")
 
 
 # ─── Log tailing ──────────────────────────────────────────────────────────
@@ -890,7 +906,15 @@ def render_apify_scrape_panel(info: dict):
                 cols = st.columns([1, 1, 3])
                 with cols[0]:
                     if st.button("Run pipeline anyway", key="auto_chain_override"):
-                        save_config({"instagram_data_url": apify_dataset_url(apify_dataset_id),
+                        # Use the API items URL (JSON), NOT the console URL.
+                        # The console URL returns HTML and crashes main.py's
+                        # response.json() call — bug surfaced 2026-06-18.
+                        items_url = apify_items_api_url(apify_dataset_id, token)
+                        if not items_url:
+                            st.error("APIFY_API_KEY missing — can't build the JSON items URL. "
+                                     "Set APIFY_API_KEY in Replit Secrets and try again.")
+                            return
+                        save_config({"instagram_data_url": items_url,
                                      "apify_enabled": False})
                         pid = _spawn([sys.executable, "main.py", "--now"],
                                      JOB_KIND_RUN, extra={"trigger": "path_c_override"})
@@ -909,7 +933,18 @@ def render_apify_scrape_panel(info: dict):
                 return
             else:
                 # Happy Path C: enough posts, no conflict — chain it.
-                save_config({"instagram_data_url": apify_dataset_url(apify_dataset_id),
+                # API items URL, NOT console URL — see _api_items_url
+                # docstring in apify_watcher.py for full background.
+                items_url = apify_items_api_url(apify_dataset_id, token)
+                if not items_url:
+                    st.error("APIFY_API_KEY missing — Path C can't build the JSON items URL "
+                             "for the pipeline. Falling back to Path B behavior; copy the "
+                             "dataset URL above into Path A manually.")
+                    info["auto_chain"] = False
+                    _write_job(JOB_KIND_SCRAPE, info)
+                    st.rerun()
+                    return
+                save_config({"instagram_data_url": items_url,
                              "apify_enabled": False})
                 pid = _spawn([sys.executable, "main.py", "--now"],
                              JOB_KIND_RUN, extra={"trigger": "path_c_auto"})
@@ -933,9 +968,17 @@ def render_apify_scrape_panel(info: dict):
             f"Path A and click Run Pipeline."
         )
         if st.button("Auto-fill into Path A and continue", key="fill_url"):
-            save_config({"instagram_data_url": apify_dataset_url(apify_dataset_id), "apify_enabled": False})
-            _clear_job(JOB_KIND_SCRAPE)
-            st.rerun()
+            # API items URL, NOT console URL — bug surfaced 2026-06-18.
+            items_url = apify_items_api_url(apify_dataset_id, token)
+            if not items_url:
+                st.error("APIFY_API_KEY missing — can't build the JSON items URL. "
+                         "Either set APIFY_API_KEY in Replit Secrets, or copy the "
+                         "dataset URL above into Path A's text field manually "
+                         "(use the api.apify.com form, not the console form).")
+            else:
+                save_config({"instagram_data_url": items_url, "apify_enabled": False})
+                _clear_job(JOB_KIND_SCRAPE)
+                st.rerun()
         if st.button("Clear scrape job", key="clear_done_scrape"):
             _clear_job(JOB_KIND_SCRAPE)
             st.rerun()
