@@ -3140,10 +3140,71 @@ def do_force_run(bot):
     if not data:
         url = CONF.get("instagram_data_url", "")
         if url:
+            # Safety net: detect when instagram_data_url points at Apify's
+            # human-facing CONSOLE URL (returns HTML) instead of the API
+            # items URL (returns JSON). The console URL was silently saved
+            # by Path C auto-chain in an earlier build of ui.py /
+            # apify_watcher.py (fixed in commit b936a6f), but a config.json
+            # written by that version still has the bad URL. Auto-translate
+            # if we can; bail with a clear error if we can't, rather than
+            # crashing 12 lines later on response.json() with the cryptic
+            # "Expecting value: line 1 column 1 (char 0)".
+            if "console.apify.com/storage/datasets/" in url:
+                token = os.environ.get("APIFY_API_KEY", "").strip()
+                dataset_id = _extract_dataset_id_from_url(url) or ""
+                if dataset_id and token:
+                    fixed = (f"https://api.apify.com/v2/datasets/{dataset_id}/items"
+                             f"?token={token}&format=json&clean=false")
+                    print(f"  ⚠ instagram_data_url was the Apify CONSOLE URL "
+                          f"(returns HTML, not JSON). Auto-translating to the "
+                          f"API items endpoint so this run works.")
+                    print(f"     bad : {url}")
+                    print(f"     fixed: api.apify.com/v2/datasets/{dataset_id}/items?...")
+                    # Persist the fix so subsequent runs don't need this
+                    # translation step.
+                    try:
+                        with open("config.json", 'r') as _cf:
+                            _cfg = json.load(_cf)
+                        _cfg["instagram_data_url"] = fixed
+                        with open("config.json.tmp", 'w') as _cf:
+                            json.dump(_cfg, _cf, indent=2)
+                        os.replace("config.json.tmp", "config.json")
+                        print(f"     config.json rewritten with the fixed URL")
+                    except Exception as _e:
+                        print(f"     (couldn't persist fix to config.json: {_e})")
+                    url = fixed
+                else:
+                    raise RuntimeError(
+                        f"config.json's instagram_data_url is the Apify console URL "
+                        f"({url}), which returns HTML rather than JSON. The pipeline "
+                        f"needs the API items URL: "
+                        f"https://api.apify.com/v2/datasets/<id>/items?token=...&format=json&clean=false. "
+                        f"Auto-translation failed because "
+                        f"{'APIFY_API_KEY is not set in env' if not token else 'no dataset ID could be extracted from the URL'}. "
+                        f"Fix config.json by hand or re-run Path C auto-fill from the UI "
+                        f"(now writes the correct URL since commit b936a6f)."
+                    )
+
             print("  ↳ Using static instagram_data_url as data source")
             response = requests.get(url, timeout=120)
             response.raise_for_status()
-            data = response.json()
+            # Wrap json() in a try so a non-JSON response (e.g., HTML error
+            # page, gateway timeout body) produces a clear error rather than
+            # the cryptic "Expecting value: line 1 column 1 (char 0)" from
+            # the raw json decoder.
+            try:
+                data = response.json()
+            except ValueError as e:
+                snippet = (response.text or '')[:200].replace('\n', ' ')
+                raise RuntimeError(
+                    f"instagram_data_url returned non-JSON content "
+                    f"(status={response.status_code}, content-type="
+                    f"{response.headers.get('Content-Type', '?')!r}). "
+                    f"First 200 chars: {snippet!r}. "
+                    f"Underlying parse error: {e}. "
+                    f"The URL needs to be the api.apify.com items endpoint, "
+                    f"not the console URL or a webpage."
+                ) from None
             data_source = 'static_url'
             data_url = url
             data_dataset_id = _extract_dataset_id_from_url(url)
