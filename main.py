@@ -659,6 +659,17 @@ class InstagramEventPipeline:
                     return str(val)
                 return val
 
+            # Wrap the entire worksheet-acquisition + setup phase so any
+            # API quota / network / auth error returns a clean False to
+            # the caller (which then aborts the Processed_Log write,
+            # preventing orphans). Previously these errors would
+            # propagate UP past _flush_processed_log and crash the
+            # worker loop — except when they came from a path that the
+            # narrow `except gspread.WorksheetNotFound` covered, which
+            # meant the failure modes were inconsistent: some quota
+            # errors crashed the run loudly, others silently let PL
+            # write while AE was empty. The user surfaced the silent
+            # case after a run where PL had entries and AE didn't.
             try:
                 evt_sheet = self.main_sheet.worksheet("All_Events")
                 # Existing-tab path: if the tab was created under the prior
@@ -710,9 +721,26 @@ class InstagramEventPipeline:
                 # WORKER ID / ATTEMPT ID provenance columns at the right edge.
                 evt_sheet = self.main_sheet.add_worksheet("All_Events", 5000, 30)
                 evt_sheet.append_row(df.columns.tolist())
+            except Exception as setup_exc:
+                # Quota / network / auth on the worksheet acquisition path.
+                # LOUDLY surface so the run log shows the cause, then
+                # return False so caller aborts PL flush (preventing the
+                # exact silent-orphan failure mode the user reported).
+                print(f"  ⚠ All_Events worksheet acquisition failed "
+                      f"({len(pending_events)} pending events): "
+                      f"{type(setup_exc).__name__}: {setup_exc}")
+                return False
 
-            # Track row position for per-cell highlighting AFTER append
-            start_row = len(evt_sheet.col_values(1)) + 1
+            # Track row position for per-cell highlighting AFTER append.
+            # This is ITSELF a Sheets read API call (col_values), so wrap
+            # it in the same try/except — a quota error here used to
+            # propagate up and crash the run.
+            try:
+                start_row = len(evt_sheet.col_values(1)) + 1
+            except Exception as e:
+                print(f"  ⚠ All_Events col_values failed ({len(pending_events)} pending): "
+                      f"{type(e).__name__}: {e}")
+                return False
             rows = [[sanitize(v) for v in row] for row in df.values.tolist()]
 
             try:
@@ -722,6 +750,11 @@ class InstagramEventPipeline:
                     self._events_flushed_count = start_idx + len(pending_events)
                 if force:
                     print(f"  ✓ Flushed {len(pending_events)} events to All_Events (final)")
+                else:
+                    # Quiet success during incremental flushes is fine, but
+                    # log the count so retrospective debugging can verify
+                    # the run actually wrote what the user thinks it did.
+                    print(f"  ✓ Flushed {len(pending_events)} events to All_Events (incremental)")
 
                 # Apply per-cell quality-flag highlighting on the just-written rows
                 try:
@@ -730,8 +763,13 @@ class InstagramEventPipeline:
                     print(f"  ⚠ Quality-flag formatting failed (non-fatal): {fmt_e}")
                 return True
             except Exception as e:
-                # Don't crash; next flush retries (start_idx unchanged)
-                print(f"  ⚠ All_Events flush error ({len(pending_events)} pending): {e}")
+                # Don't crash; next flush retries (start_idx unchanged).
+                # Include the row count, force flag, and error TYPE so
+                # the run log makes it obvious WHY events didn't land
+                # in the sheet — quota, auth, schema mismatch, etc.
+                print(f"  ⚠ All_Events flush error "
+                      f"({len(pending_events)} pending, force={force}): "
+                      f"{type(e).__name__}: {e}")
                 return False
 
     def _note_apify_shell_record(self, post, post_num):

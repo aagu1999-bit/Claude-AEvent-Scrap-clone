@@ -678,6 +678,34 @@ def screen_run():
         names = [a.strip().lstrip("@") for a in accts_input.splitlines() if a.strip()]
         if not names:
             st.error("Add at least one account.")
+        elif _read_job(JOB_KIND_SCRAPE) is not None:
+            # RE-TRIGGER GUARD: user already has an active scrape. A
+            # previous version of this UI would silently start a SECOND
+            # Apify run when the user re-clicked here — including the
+            # case where they re-clicked because the UI misreported a
+            # transient POLL_ERROR as a failure. Apify charged for every
+            # run, none of which the user could cancel from the UI.
+            # Now: refuse, show the live status, and force them to
+            # explicitly clear before retrying.
+            existing = _read_job(JOB_KIND_SCRAPE) or {}
+            st.error(
+                f"❌ A scrape is already running (Apify run ID "
+                f"`{existing.get('apify_run_id', '?')}`, started "
+                f"{existing.get('started_at', '?')}). Re-triggering would start "
+                f"a SECOND parallel run and Apify would charge you for both. "
+                f"Either wait for the existing one to finish or use the "
+                f"**Clear scrape job** button on the status panel above."
+            )
+            st.markdown(
+                f'<span class="muted">'
+                f"If the existing run is genuinely stuck and you want to "
+                f"abandon it, you can also cancel it directly in the "
+                f"Apify console (<a href=\"https://console.apify.com/actors/runs/"
+                f"{existing.get('apify_run_id', '')}\" target=\"_blank\">open run "
+                f"page</a>) — that prevents further charges on that run."
+                f"</span>",
+                unsafe_allow_html=True,
+            )
         else:
             try:
                 result = apify_trigger_scrape(
@@ -913,12 +941,35 @@ def render_apify_scrape_panel(info: dict):
             st.rerun()
         return
 
-    if status in ("FAILED", "TIMED-OUT", "ABORTED") or status.startswith("POLL_ERROR"):
+    if status in ("FAILED", "TIMED-OUT", "ABORTED"):
+        # ACTUAL terminal failure from Apify — the run definitely ended.
+        # Send email + clear button. Distinct from POLL_ERROR below
+        # (which is a transient network blip on OUR side, not a real
+        # failure on Apify's side).
         _maybe_send_apify_scrape_email(info, status, post_count=0)
         st.error(f"Apify run ended with status: {status}")
         if st.button("Clear failed scrape", key="clear_failed_scrape"):
             _clear_job(JOB_KIND_SCRAPE)
             st.rerun()
+        return
+
+    if status.startswith("POLL_ERROR"):
+        # TRANSIENT: we couldn't reach Apify to check status. Apify's
+        # actor is probably still running fine on their side; we just
+        # can't see it right now. Don't send a failure email and don't
+        # let the user think the run failed — they previously re-clicked
+        # the trigger thinking it was dead, which spawned a SECOND Apify
+        # run (Apify keeps each one going independently of our UI and
+        # charges for each, even ones the user thought failed).
+        st.warning(
+            f"⚠ Network blip while checking Apify status (the actor itself is most "
+            f"likely still running — Apify keeps it going regardless of whether "
+            f"we can reach the API). Retrying in a few seconds. "
+            f"**Do NOT trigger another scrape — the existing one is still active.**"
+        )
+        st.caption(f"Apify run ID: {apify_run_id} · Last poll error: {status}")
+        time.sleep(TAIL_REFRESH_SEC * 3)
+        st.rerun()
         return
 
     # Still running — soft refresh.
@@ -1280,6 +1331,19 @@ def screen_accounts():
 
 AUDIT_TOOLS = [
     {
+        "name": "🚑 Recover events from CSV",
+        "script": "recover_from_csv_xlsx.py",
+        "description": "**Use this if events landed in your local outputs/Events_*.csv files but "
+                       "didn't make it to All_Events.** Scans the local CSV/Excel files, compares "
+                       "against the live sheet, and appends rows that exist locally but are "
+                       "missing from All_Events. Safe to re-run — uses the conservative mode by "
+                       "default (only recovers posts that have ZERO rows in All_Events; won't "
+                       "duplicate). To preview without writing, leave the apply flag off — the "
+                       "tool runs in dry-run mode by default.",
+        "needs_confirm_arg": True,
+        "confirm_arg": "--apply",
+    },
+    {
         "name": "Quality Metrics",
         "script": "quality_metrics.py",
         "description": "Compute extraction stats over a date range — events found, OCR success rate, "
@@ -1347,12 +1411,16 @@ def screen_audits():
                 continue
             cmd = [sys.executable, tool["script"]]
             if tool.get("needs_confirm_arg"):
+                # Per-tool confirm flag name (defaults to --confirm; recovery
+                # tool uses --apply, etc.). Lets the same gate UI cover any
+                # destructive script regardless of its CLI convention.
+                confirm_arg = tool.get("confirm_arg", "--confirm")
                 confirm = st.checkbox(
-                    "I understand this rewrites data and want to proceed",
+                    f"I understand this rewrites data and want to proceed ({confirm_arg})",
                     key=f"confirm_{tool['script']}",
                 )
                 if confirm:
-                    cmd.append("--confirm")
+                    cmd.append(confirm_arg)
                 disabled = not confirm
             else:
                 disabled = False
