@@ -189,6 +189,110 @@ def load_accounts_from_file() -> list[str]:
     return []
 
 
+def _extract_sheet_id(url_or_id: str) -> str:
+    """Pull a sheet ID out of a Google Sheets URL, or return as-is if
+    it already looks like an ID. Handles the standard
+    docs.google.com/spreadsheets/d/<id>/... form."""
+    s = (url_or_id or "").strip()
+    if not s:
+        return ""
+    if "docs.google.com" in s:
+        import re
+        m = re.search(r"/d/([a-zA-Z0-9_-]+)", s)
+        return m.group(1) if m else ""
+    return s
+
+
+def load_accounts_from_sheet(sheet_url_or_id: str = "",
+                              sheet_name: str = "",
+                              tab_name: str = "Accounts") -> tuple[list, str]:
+    """Read usernames from a Google Sheet's Accounts tab via gspread.
+
+    Resolution order:
+      1. If sheet_url_or_id is non-empty → open_by_key on the extracted ID
+      2. Else if sheet_name is non-empty → open_by_name (matches main.py)
+      3. Else → return ([], "no sheet specified")
+
+    Mirrors main.py's load_usernames_from_accounts_sheet field reading:
+    column A, skip the header row if it looks like a label, strip @
+    prefixes, drop blanks.
+
+    Returns (handles, error_msg). On success error_msg is "". The tuple
+    shape lets the UI surface the actual cause when a refresh fails
+    (missing credentials, permission denied, no Accounts tab, etc.)
+    instead of just showing an empty list.
+    """
+    # Try gspread import — if unavailable, surface a clear error.
+    try:
+        import gspread
+        from oauth2client.service_account import ServiceAccountCredentials
+    except Exception as e:
+        return [], f"gspread/oauth2client not installed: {e}"
+
+    # Service account file: same env-var precedence main.py uses, so the
+    # UI and the pipeline always agree on credentials.
+    sa_file = (os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+               or os.environ.get("SERVICE_ACCOUNT_FILE")
+               or "apt-mark-468506-u9-ec44cabc7335 copy.json")
+    if not os.path.exists(sa_file):
+        return [], f"service account file not found: {sa_file}"
+
+    try:
+        scope = [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = ServiceAccountCredentials.from_json_keyfile_name(sa_file, scope)
+        client = gspread.authorize(creds)
+    except Exception as e:
+        return [], f"sheets auth failed: {e}"
+
+    # Open the spreadsheet — by ID/URL first if provided, by name otherwise.
+    try:
+        if sheet_url_or_id:
+            sid = _extract_sheet_id(sheet_url_or_id)
+            if not sid:
+                return [], f"couldn't extract sheet ID from: {sheet_url_or_id!r}"
+            spreadsheet = client.open_by_key(sid)
+        elif sheet_name:
+            spreadsheet = client.open(sheet_name)
+        else:
+            return [], "no sheet URL/ID or name provided"
+    except Exception as e:
+        return [], f"couldn't open sheet: {e}"
+
+    # Find the Accounts tab + read column A.
+    try:
+        ws = spreadsheet.worksheet(tab_name)
+    except Exception as e:
+        return [], f"'{tab_name}' tab not found: {e}"
+    try:
+        values = ws.col_values(1)
+    except Exception as e:
+        return [], f"couldn't read column A: {e}"
+
+    if not values:
+        return [], f"'{tab_name}' tab is empty"
+
+    # Skip the header row if it looks like a label (case-insensitive
+    # match against common labels — same heuristic main.py applies).
+    first = (values[0] or "").strip().lower()
+    if first in ("username", "usernames", "handle", "handles", "account", "accounts"):
+        values = values[1:]
+
+    handles = []
+    seen = set()
+    for v in values:
+        h = (v or "").strip().lstrip("@").lower()
+        if not h or h.startswith("#"):
+            continue
+        # Dedup while preserving order.
+        if h not in seen:
+            seen.add(h)
+            handles.append(h)
+    return handles, ""
+
+
 # ─── Apify API ────────────────────────────────────────────────────────────
 
 def apify_trigger_scrape(usernames: list[str], results_limit: int,
@@ -826,10 +930,48 @@ def screen_run():
                 unsafe_allow_html=True,
             )
         # Reset button — useful if the user accidentally deleted half the
-        # list while editing and wants to restore the file content.
-        if st.button("↺ Reload from accounts.json", key="reload_accts"):
-            st.session_state["scrape_accounts"] = "\n".join(all_handles)
-            st.rerun()
+        # list while editing and wants to restore the file content. Plus
+        # a refresh-from-Sheet button so the canonical list (which lives
+        # in the user's Google Sheet) can flow into the form with one
+        # click; that one also rewrites accounts.json so the pipeline's
+        # next run sees the same list.
+        reload_cols = st.columns([1, 1, 3])
+        with reload_cols[0]:
+            if st.button("↺ Reload from accounts.json", key="reload_accts"):
+                st.session_state["scrape_accounts"] = "\n".join(all_handles)
+                st.rerun()
+        with reload_cols[1]:
+            if st.button("☁ Refresh from Google Sheet", key="refresh_from_sheet",
+                         help="Pulls the Accounts tab from the Google Sheet "
+                              "(URL or name set in Settings → accounts_sheet_url / "
+                              "sheet_name). Writes results to accounts.json so the "
+                              "pipeline picks up the same list."):
+                # Prefer an explicit accounts_sheet_url, fall back to the
+                # pipeline's main sheet_name so a single config covers
+                # both cases.
+                sheet_url = (cfg.get("accounts_sheet_url", "") or "").strip()
+                sheet_name_fallback = cfg.get("sheet_name", SHEET_NAME_DEFAULT)
+                with st.spinner("Reading Google Sheet…"):
+                    fresh, err = load_accounts_from_sheet(
+                        sheet_url_or_id=sheet_url,
+                        sheet_name=sheet_name_fallback,
+                    )
+                if err:
+                    st.error(f"Couldn't refresh from sheet: {err}")
+                elif not fresh:
+                    st.warning("Sheet returned no handles. Accounts tab might be empty.")
+                else:
+                    try:
+                        ACCOUNTS_JSON.write_text(json.dumps(fresh, indent=2))
+                    except Exception as e:
+                        st.warning(f"Got {len(fresh)} handles from sheet but couldn't "
+                                   f"write accounts.json: {e}. Form updated for this "
+                                   f"session only.")
+                    st.session_state["scrape_accounts"] = "\n".join(fresh)
+                    st.success(f"Refreshed {len(fresh)} handle(s) from Google Sheet → "
+                               f"accounts.json")
+                    time.sleep(0.6)
+                    st.rerun()
     with cols[1]:
         results_limit = st.number_input(
             "Posts per profile",
@@ -1273,6 +1415,13 @@ CONFIG_DEFAULTS = {
     "apify_newer_than_days": 21,
     "apify_min_posts_for_auto_run": 10,
     "apify_memory_mb": 8192,
+    # Source of truth for the accounts list. The "☁ Refresh from Google
+    # Sheet" button in Path B/C reads the Accounts tab of whichever
+    # sheet this URL points to. Defaults to the user's primary sheet
+    # (confirmed 2026-06-26); change here if a different sheet becomes
+    # the canonical source. Set to "" to fall back to opening by name
+    # via the existing `sheet_name` setting.
+    "accounts_sheet_url": "https://docs.google.com/spreadsheets/d/1TllkAHA2fDXmYu5ckLMsH1BoOPkvBkcRBp-F_RnJaoA/edit",
     "sheet_name": "Instagram_Events_Master",
     "schedule_day": "Thursday",
     "schedule_time": "14:00",
@@ -1413,9 +1562,20 @@ def screen_settings():
                 value=cfg.get("sheet_name", CONFIG_DEFAULTS["sheet_name"]),
                 help="Exact case-sensitive Google Sheet name (must already exist).",
             )
-            saved = st.form_submit_button("💾 Save sheet name")
+            accounts_sheet_url = st.text_input(
+                "accounts_sheet_url",
+                value=cfg.get("accounts_sheet_url",
+                              CONFIG_DEFAULTS.get("accounts_sheet_url", "")),
+                help="Google Sheet URL whose 'Accounts' tab holds the canonical IG handle list. "
+                     "Used by the '☁ Refresh from Google Sheet' button in Path B/C. "
+                     "Leave blank to fall back to opening the sheet by `sheet_name` above.",
+            )
+            saved = st.form_submit_button("💾 Save sheet settings")
             if saved:
-                save_config({"sheet_name": sheet.strip()})
+                save_config({
+                    "sheet_name": sheet.strip(),
+                    "accounts_sheet_url": accounts_sheet_url.strip(),
+                })
                 st.success("Saved to config.json")
 
     # ── Schedule ────────────────────────────────────────────────────────
