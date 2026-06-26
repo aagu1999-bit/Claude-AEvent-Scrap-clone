@@ -60,7 +60,17 @@ SHEET_NAME_DEFAULT = "Instagram_Events_Master"
 
 # Polling cadence for live-tail panels — fast enough to feel live, slow
 # enough not to hammer Replit's request budget.
-TAIL_REFRESH_SEC = 2.0
+# Live-tail poll cadence for the running-pipeline panel. Higher value =
+# less Streamlit/main.py contention on the Replit container's shared
+# CPU + disk IOPS, at the cost of slightly less immediate UI updates.
+# Bumped 2.0 → 5.0 after user reported 3x pipeline slowdown when running
+# via UI (1-2 hrs from shell vs. 5-6 hrs via UI for same workload) —
+# the constant tail-read of a growing log file plus Streamlit script
+# reruns were eating cycles main.py's 8 workers needed. 5s is still
+# perfectly readable; if you want even less overhead during a long run,
+# just close the browser tab — the watcher subprocess handles email +
+# Path C auto-chain entirely independently of the UI.
+TAIL_REFRESH_SEC = 5.0
 
 
 # ─── Subprocess + job-state plumbing ──────────────────────────────────────
@@ -505,10 +515,48 @@ def apify_items_api_url(dataset_id: str, token: str = "") -> str:
 # ─── Log tailing ──────────────────────────────────────────────────────────
 
 def latest_run_log() -> Path | None:
+    """Return the path to the newest outputs/run_<ts>.log file.
+
+    Cached in session_state during an active pipeline run so we don't
+    re-glob + re-sort outputs/ on every TAIL_REFRESH_SEC tick — over a
+    multi-hour run with 44+ historical log files in the directory, the
+    repeated glob was a measurable contributor to the user's reported
+    UI-vs-shell slowdown. The cache resets whenever the live pipeline
+    job state file disappears (i.e., the run finished or was cleared)
+    so a SUBSEQUENT run picks up its own fresh log file."""
+    pipeline_running = _job_path(JOB_KIND_RUN).exists()
+    try:
+        cached = st.session_state.get("_cached_run_log_path")
+        cached_for_run = st.session_state.get("_cached_run_log_pipeline_active")
+    except Exception:
+        cached, cached_for_run = None, False
+
+    # Invalidate cache if the pipeline that owned it has finished.
+    if cached and not pipeline_running:
+        cached = None
+        try:
+            st.session_state["_cached_run_log_path"] = None
+            st.session_state["_cached_run_log_pipeline_active"] = False
+        except Exception:
+            pass
+
+    if cached and pipeline_running and Path(cached).exists():
+        return Path(cached)
+
     if not OUTPUTS.exists():
         return None
     logs = sorted(OUTPUTS.glob("run_*.log"), reverse=True)
-    return logs[0] if logs else None
+    latest = logs[0] if logs else None
+
+    # Only cache while there's an active pipeline — between runs we WANT
+    # to re-scan in case the user kicked off a fresh one in the gap.
+    if latest and pipeline_running:
+        try:
+            st.session_state["_cached_run_log_path"] = str(latest)
+            st.session_state["_cached_run_log_pipeline_active"] = True
+        except Exception:
+            pass
+    return latest
 
 
 def tail_text(path: Path, max_chars: int = 8000) -> str:
