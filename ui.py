@@ -929,49 +929,69 @@ def screen_run():
                 f'<span class="muted">Will send all {current_count} handle(s).</span>',
                 unsafe_allow_html=True,
             )
-        # Reset button — useful if the user accidentally deleted half the
-        # list while editing and wants to restore the file content. Plus
-        # a refresh-from-Sheet button so the canonical list (which lives
-        # in the user's Google Sheet) can flow into the form with one
-        # click; that one also rewrites accounts.json so the pipeline's
-        # next run sees the same list.
+        # Reload + Refresh buttons. Both mutate st.session_state["scrape_accounts"]
+        # to repopulate the text area. CRITICAL: Streamlit raises
+        # StreamlitAPIException if a widget's session_state key is assigned
+        # AFTER the widget has rendered in the same script run. The text
+        # area above us already instantiated key="scrape_accounts", so any
+        # direct assignment here would fail with:
+        #
+        #   st.session_state.scrape_accounts cannot be modified after
+        #   the widget with key scrape_accounts is instantiated.
+        #
+        # The fix is `on_click=<callback>` — callbacks run BEFORE the next
+        # rerender (before the widget re-instantiates), so the assignment
+        # is legal. The callback also pre-stages any banner the post-click
+        # rerender should show (via a separate session_state slot, since
+        # st.success/error called inside on_click don't actually render).
+        sheet_url_for_refresh = (cfg.get("accounts_sheet_url", "") or "").strip()
+        sheet_name_for_refresh = cfg.get("sheet_name", SHEET_NAME_DEFAULT)
+
+        def _do_reload():
+            st.session_state["scrape_accounts"] = "\n".join(all_handles)
+            st.session_state["_accts_banner"] = ("info", f"Reloaded {len(all_handles)} handle(s) from accounts.json")
+
+        def _do_refresh_from_sheet():
+            fresh, err = load_accounts_from_sheet(
+                sheet_url_or_id=sheet_url_for_refresh,
+                sheet_name=sheet_name_for_refresh,
+            )
+            if err:
+                st.session_state["_accts_banner"] = ("error", f"Couldn't refresh from sheet: {err}")
+                return
+            if not fresh:
+                st.session_state["_accts_banner"] = ("warning", "Sheet returned no handles. Accounts tab might be empty.")
+                return
+            # Cache to accounts.json so the next pipeline run sees the same list.
+            cache_err = ""
+            try:
+                ACCOUNTS_JSON.write_text(json.dumps(fresh, indent=2))
+            except Exception as e:
+                cache_err = f" (couldn't write accounts.json: {e})"
+            st.session_state["scrape_accounts"] = "\n".join(fresh)
+            st.session_state["_accts_banner"] = (
+                "success",
+                f"Refreshed {len(fresh)} handle(s) from Google Sheet → accounts.json{cache_err}",
+            )
+
         reload_cols = st.columns([1, 1, 3])
         with reload_cols[0]:
-            if st.button("↺ Reload from accounts.json", key="reload_accts"):
-                st.session_state["scrape_accounts"] = "\n".join(all_handles)
-                st.rerun()
+            st.button("↺ Reload from accounts.json", key="reload_accts",
+                      on_click=_do_reload)
         with reload_cols[1]:
-            if st.button("☁ Refresh from Google Sheet", key="refresh_from_sheet",
-                         help="Pulls the Accounts tab from the Google Sheet "
-                              "(URL or name set in Settings → accounts_sheet_url / "
-                              "sheet_name). Writes results to accounts.json so the "
-                              "pipeline picks up the same list."):
-                # Prefer an explicit accounts_sheet_url, fall back to the
-                # pipeline's main sheet_name so a single config covers
-                # both cases.
-                sheet_url = (cfg.get("accounts_sheet_url", "") or "").strip()
-                sheet_name_fallback = cfg.get("sheet_name", SHEET_NAME_DEFAULT)
-                with st.spinner("Reading Google Sheet…"):
-                    fresh, err = load_accounts_from_sheet(
-                        sheet_url_or_id=sheet_url,
-                        sheet_name=sheet_name_fallback,
-                    )
-                if err:
-                    st.error(f"Couldn't refresh from sheet: {err}")
-                elif not fresh:
-                    st.warning("Sheet returned no handles. Accounts tab might be empty.")
-                else:
-                    try:
-                        ACCOUNTS_JSON.write_text(json.dumps(fresh, indent=2))
-                    except Exception as e:
-                        st.warning(f"Got {len(fresh)} handles from sheet but couldn't "
-                                   f"write accounts.json: {e}. Form updated for this "
-                                   f"session only.")
-                    st.session_state["scrape_accounts"] = "\n".join(fresh)
-                    st.success(f"Refreshed {len(fresh)} handle(s) from Google Sheet → "
-                               f"accounts.json")
-                    time.sleep(0.6)
-                    st.rerun()
+            st.button("☁ Refresh from Google Sheet", key="refresh_from_sheet",
+                      on_click=_do_refresh_from_sheet,
+                      help="Pulls the Accounts tab from the Google Sheet "
+                           "(URL or name set in Settings → accounts_sheet_url / "
+                           "sheet_name). Writes results to accounts.json so the "
+                           "pipeline picks up the same list.")
+
+        # Show any banner the on_click callback queued. Cleared after
+        # display so it doesn't persist across unrelated reruns.
+        banner = st.session_state.pop("_accts_banner", None)
+        if banner:
+            level, msg = banner
+            getattr(st, level)(msg)
     with cols[1]:
         results_limit = st.number_input(
             "Posts per profile",
