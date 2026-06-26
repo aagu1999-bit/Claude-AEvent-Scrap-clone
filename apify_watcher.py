@@ -222,21 +222,23 @@ def maybe_auto_chain(info: dict, post_count: int, repo_root: Path):
         return
 
     # Write a PID file for the pipeline-run job so the UI's Run screen
-    # picks up the live state. Mirrors ui.py's _spawn behavior.
-    log_path = repo_root / "outputs" / "UI_pipeline.log"
+    # picks up the live state. Stdout/stderr → /dev/null for the same
+    # reason as ui.py's _spawn for JOB_KIND_RUN: main.py has its own
+    # TeeOutput → run_<ts>.log, and capturing stdout to UI_pipeline.log
+    # would double the per-print disk I/O. The Run panel tails
+    # run_*.log directly, so UI_pipeline.log was pure waste.
     try:
-        with open(log_path, "ab") as log_fd:
-            proc = subprocess.Popen(
-                [sys.executable, "main.py", "--now"],
-                stdout=log_fd,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-                cwd=str(repo_root),
-            )
+        proc = subprocess.Popen(
+            [sys.executable, "main.py", "--now"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            cwd=str(repo_root),
+        )
         run_job = {
             "pid": proc.pid,
             "cmd": [sys.executable, "main.py", "--now"],
-            "log_path": str(log_path),
+            "log_path": "",
             "trigger": "path_c_watcher",
             "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }

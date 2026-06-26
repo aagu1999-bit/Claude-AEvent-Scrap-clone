@@ -127,19 +127,48 @@ def _job_status(kind: str) -> tuple[str, dict | None]:
 def _spawn(cmd: list[str], kind: str, extra: dict | None = None) -> int:
     """Start a detached subprocess, write the job-state file, return PID.
     Subprocess survives browser refresh; its stdout goes to a log file
-    rather than getting piped into the UI process."""
+    (or /dev/null for the pipeline — see below).
+
+    stdout routing per kind:
+      · JOB_KIND_RUN   → /dev/null. main.py installs a TeeOutput that
+                         writes every print to BOTH stdout AND its own
+                         outputs/run_<ts>.log. When stdout is a UI-owned
+                         log file (UI_pipeline.log), every print incurs
+                         TWO file writes — a doubling of disk I/O that
+                         on Replit's shared filesystem caused the user's
+                         reported 3x slowdown vs shell-run. UI_pipeline.log
+                         was never read by anything (the Run panel tails
+                         run_*.log directly), so we lose nothing by
+                         dropping it. Crash diagnostics are still captured
+                         via main.py's sys.excepthook (committed earlier)
+                         which writes to the run-summary email body
+                         before exit.
+      · all others      → captured to outputs/UI_<kind>.log so the
+                         Audits & Tools / Lookup panels can tail it
+                         (lookup_post.py etc. don't have their own
+                         logging — their stdout IS the output).
+    """
     OUTPUTS.mkdir(parents=True, exist_ok=True)
-    log_path = OUTPUTS / f"UI_{kind}.log"
-    log_fd = open(log_path, "ab")
+
+    if kind == JOB_KIND_RUN:
+        # No file capture — main.py's TeeOutput writes its own log.
+        stdout_target = subprocess.DEVNULL
+        stderr_target = subprocess.DEVNULL
+        log_path = None
+    else:
+        log_path = OUTPUTS / f"UI_{kind}.log"
+        stdout_target = open(log_path, "ab")
+        stderr_target = subprocess.STDOUT
+
     # start_new_session=True detaches the child from the Streamlit process
     # group so SIGINT to Streamlit doesn't kill the pipeline.
     proc = subprocess.Popen(
         cmd,
-        stdout=log_fd,
-        stderr=subprocess.STDOUT,
+        stdout=stdout_target,
+        stderr=stderr_target,
         start_new_session=True,
     )
-    info = {"pid": proc.pid, "cmd": cmd, "log_path": str(log_path)}
+    info = {"pid": proc.pid, "cmd": cmd, "log_path": str(log_path) if log_path else ""}
     if extra:
         info.update(extra)
     _write_job(kind, info)
