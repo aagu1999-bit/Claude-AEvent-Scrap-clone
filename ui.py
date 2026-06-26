@@ -691,9 +691,68 @@ def render_outage_banner():
 
 
 def render_running_panel(kind: str, info: dict, label: str):
-    """Live progress + log tail for a running job."""
+    """Live progress + log tail for a running job.
+
+    Has two modes, toggled by the Lite-mode checkbox at the top:
+
+      • Full mode (default): live tail, progress bar, auto-refresh every
+        TAIL_REFRESH_SEC. Polls the log file + reruns the script
+        continuously. Best for short runs or active debugging.
+
+      • Lite mode: static status only (no tail, no auto-refresh, no
+        rerun loop). Pipeline keeps running unaffected. User clicks
+        🔄 Refresh to pull the latest state on demand. Designed for
+        long runs (hours) where the constant polling competes with
+        main.py for Replit's CPU + disk IOPS (root cause of the user's
+        3x UI-vs-shell slowdown).
+
+    The preference persists in st.session_state['lite_mode'] for the
+    Streamlit session — survives panel reruns, resets on browser
+    refresh / new session."""
     started = info.get("started_at", "?")
+
+    # Lite-mode toggle. Default off so first-time users see the live
+    # progress they expect; once they flip it on for a long run, it
+    # stays on until they uncheck or open a new session.
+    lite_mode = st.checkbox(
+        "🪶 Lite mode — manual refresh only (recommended for runs > 1 hr)",
+        value=st.session_state.get("lite_mode", False),
+        key="lite_mode",
+        help="Disables the live log tail and the auto-refresh loop. The "
+             "pipeline keeps running in the background; click Refresh to "
+             "check status on demand. Eliminates the UI's CPU + disk overhead "
+             "that competes with main.py's worker threads during multi-hour runs.",
+    )
+
     st.info(f"**{label} running** — started {started} (PID {info.get('pid', '?')})")
+
+    if lite_mode:
+        # Minimal panel — no file reads except for the manual Refresh
+        # below. NO time.sleep + st.rerun loop. The Streamlit session
+        # sits idle until the user clicks something.
+        st.markdown(
+            '<div style="background:#f3f4f6;padding:12px 16px;border-radius:8px;'
+            'margin:8px 0;color:#374151;font-size:0.95rem;">'
+            "Lite mode active. The pipeline is running silently in the background — "
+            "no auto-refresh, no log tail. Click <b>🔄 Refresh status</b> to pull the "
+            "latest state, or check <code>outputs/run_&lt;ts&gt;.log</code> directly "
+            "from the Shell. Run-complete email will still fire normally."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        cols = st.columns([1, 1, 4])
+        with cols[0]:
+            if st.button("🔄 Refresh status", key=f"refresh_{kind}"):
+                st.rerun()
+        with cols[1]:
+            if st.button("⏹ Stop", key=f"stop_{kind}", type="secondary"):
+                _stop_job(kind)
+                st.success("Stop requested. Workers will drain.")
+                time.sleep(1)
+                st.rerun()
+        return
+
+    # Full mode — the original live tail + progress bar + auto-refresh.
     log_path = latest_run_log() if kind == JOB_KIND_RUN else Path(info.get("log_path", ""))
     log_text = tail_text(log_path) if log_path else ""
     cur, total = parse_run_progress(log_text) if kind == JOB_KIND_RUN else (0, 0)
@@ -857,8 +916,8 @@ def screen_run():
     # or producing way less than the user expects.
     _early_token = os.environ.get("APIFY_API_KEY", "").strip()
     if _early_token:
-        with st.expander("📊 Your recent Apify runs (last 5)", expanded=False):
-            runs = apify_recent_runs(_early_token, limit=5)
+        with st.expander("📊 Your recent Apify runs (last 3)", expanded=False):
+            runs = apify_recent_runs(_early_token, limit=3)
             if not runs:
                 st.markdown(
                     '<span class="muted">'
