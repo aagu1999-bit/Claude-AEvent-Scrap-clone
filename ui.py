@@ -293,6 +293,73 @@ def apify_dataset_url(dataset_id: str) -> str:
     return f"https://console.apify.com/storage/datasets/{dataset_id}"
 
 
+def apify_run_console_url(run_id: str) -> str:
+    """Clickable link to the Apify run detail page. Used in the
+    'previous scrape ended' banner so the user can jump straight to
+    the Apify side to see WHY it aborted (billing cap, timeout, etc.)."""
+    return f"https://console.apify.com/actors/runs/{run_id}"
+
+
+def apify_recent_runs(token: str, limit: int = 5) -> list:
+    """Fetch the user's last N runs of the instagram-post-scraper actor.
+
+    Returns a list of dicts with the fields the UI needs to render a
+    'Recent runs' panel: run_id, status, started_at, finished_at,
+    dataset_id, item_count, usage_total_usd. Returns [] on any error
+    so the UI degrades gracefully when Apify is unreachable or the
+    token is wrong.
+    """
+    if not token:
+        return []
+    try:
+        r = requests.get(
+            f"{APIFY_API_BASE}/acts/{APIFY_ACTOR}/runs",
+            params={"token": token, "limit": int(limit), "desc": "true"},
+            timeout=15,
+        )
+        if not r.ok:
+            return []
+        items = (r.json().get("data") or {}).get("items") or []
+    except Exception:
+        return []
+
+    out = []
+    for it in items:
+        stats = it.get("stats") or {}
+        usage = it.get("usageTotalUsd") or it.get("usage", {}).get("totalUsd")
+        out.append({
+            "run_id":      it.get("id", ""),
+            "status":      it.get("status", "?"),
+            "started_at":  it.get("startedAt", ""),
+            "finished_at": it.get("finishedAt", ""),
+            "dataset_id":  it.get("defaultDatasetId", ""),
+            "item_count":  stats.get("itemCount") or stats.get("requestsFinished") or 0,
+            "usage_usd":   usage or 0.0,
+        })
+    return out
+
+
+def _format_run_started(iso_str: str) -> str:
+    """Compact 'started X ago' for the recent-runs panel."""
+    if not iso_str:
+        return "?"
+    try:
+        from datetime import datetime as _dt, timezone as _tz
+        dt = _dt.fromisoformat(iso_str.replace("Z", "+00:00"))
+        now = _dt.now(_tz.utc)
+        delta = now - dt
+        secs = int(delta.total_seconds())
+        if secs < 60:
+            return f"{secs}s ago"
+        if secs < 3600:
+            return f"{secs // 60}m ago"
+        if secs < 86400:
+            return f"{secs // 3600}h ago"
+        return f"{secs // 86400}d ago"
+    except Exception:
+        return iso_str[:10]
+
+
 # Whitelist of fields the pipeline reads from each post — see the
 # matching constant in apify_watcher.py for full background. The two
 # must stay in sync; the safer fix would be to import from a shared
@@ -532,10 +599,45 @@ def screen_run():
         render_apify_scrape_panel(scrape_info)
         return
     if scrape_status == "crashed":
-        st.warning("Previous Apify scrape ended unexpectedly. Recheck dataset URL before running pipeline.")
-        if st.button("Clear scrape state", key="clear_scrape_crash"):
-            _clear_job(JOB_KIND_SCRAPE)
-            st.rerun()
+        info = scrape_info or {}
+        run_id = info.get("apify_run_id", "")
+        dataset_id = info.get("apify_dataset_id", "")
+        token = os.environ.get("APIFY_API_KEY", "").strip()
+
+        # Try to pull the run's terminal status from Apify so we can say
+        # WHY it ended — billing cap, timeout, abort, succeeded-but-empty,
+        # etc. — instead of the vague "ended unexpectedly".
+        apify_status = "?"
+        item_count = "?"
+        if run_id and token:
+            try:
+                apify_status = apify_poll_status(run_id, token)
+            except Exception:
+                pass
+            try:
+                item_count = _fetch_apify_dataset_count(dataset_id, token)
+            except Exception:
+                pass
+
+        bits = [f"Previous Apify scrape ended."]
+        if apify_status != "?":
+            bits.append(f"Apify status: **{apify_status}**.")
+        if run_id:
+            bits.append(f"Run ID: `{run_id}`.")
+        if isinstance(item_count, int) and item_count > 0:
+            bits.append(f"Dataset has **{item_count:,}** posts.")
+        st.warning(" ".join(bits))
+
+        cols = st.columns([1, 1, 3])
+        with cols[0]:
+            if run_id:
+                st.markdown(
+                    f"[Open run in Apify console]({apify_run_console_url(run_id)})"
+                )
+        with cols[1]:
+            if st.button("Clear scrape state", key="clear_scrape_crash"):
+                _clear_job(JOB_KIND_SCRAPE)
+                st.rerun()
 
     # Pipeline in progress → big panel takes over
     if run_status == "running":
@@ -597,6 +699,95 @@ def screen_run():
         unsafe_allow_html=True,
     )
 
+    # Recent runs panel — pulled live from Apify so the user can compare
+    # their planned settings against what's been happening lately. Most
+    # actionable when scrapes are aborting (billing cap, blocked, etc.)
+    # or producing way less than the user expects.
+    _early_token = os.environ.get("APIFY_API_KEY", "").strip()
+    if _early_token:
+        with st.expander("📊 Your recent Apify runs (last 5)", expanded=False):
+            runs = apify_recent_runs(_early_token, limit=5)
+            if not runs:
+                st.markdown(
+                    '<span class="muted">'
+                    "Couldn't fetch recent runs from Apify (token issue, network, or no runs yet)."
+                    "</span>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                # Header
+                st.markdown(
+                    '<div style="display:grid;grid-template-columns:1.2fr 1fr 1.4fr 1fr 1fr;'
+                    'gap:8px;font-size:0.85rem;color:#6b7280;font-weight:600;">'
+                    '<div>Status</div><div>Started</div><div>Run ID</div>'
+                    '<div>Posts</div><div>Cost</div>'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
+                for r in runs:
+                    status = r.get("status", "?")
+                    color = "#16a34a" if status == "SUCCEEDED" else (
+                            "#dc2626" if status in ("FAILED", "TIMED-OUT", "ABORTED") else "#f59e0b")
+                    icon = "✓" if status == "SUCCEEDED" else (
+                           "✗" if status in ("FAILED", "TIMED-OUT", "ABORTED") else "…")
+                    posts = r.get("item_count", 0) or 0
+                    cost = r.get("usage_usd", 0) or 0
+                    started_short = _format_run_started(r.get("started_at", ""))
+                    run_id = r.get("run_id", "")
+                    run_link = f'<a href="{apify_run_console_url(run_id)}" target="_blank">{run_id[:14]}…</a>'
+                    st.markdown(
+                        f'<div style="display:grid;grid-template-columns:1.2fr 1fr 1.4fr 1fr 1fr;'
+                        f'gap:8px;font-size:0.9rem;padding:4px 0;border-top:1px solid #e5e7eb;">'
+                        f'<div style="color:{color};font-weight:600;">{icon} {status}</div>'
+                        f'<div>{started_short}</div>'
+                        f'<div style="font-family:monospace;font-size:0.8rem;">{run_link}</div>'
+                        f'<div>{int(posts):,}</div>'
+                        f'<div>${float(cost):.2f}</div>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                # Quick stats from the recent set
+                succeeded = [r for r in runs if r.get("status") == "SUCCEEDED"]
+                aborted = [r for r in runs if r.get("status") in ("FAILED", "TIMED-OUT", "ABORTED")]
+                if succeeded:
+                    avg_posts = sum((r.get("item_count") or 0) for r in succeeded) / len(succeeded)
+                    avg_cost = sum((r.get("usage_usd") or 0) for r in succeeded) / len(succeeded)
+                    st.markdown(
+                        f'<div style="margin-top:12px;font-size:0.85rem;color:#6b7280;">'
+                        f'Of the last {len(runs)}: <b>{len(succeeded)}</b> succeeded, '
+                        f'<b>{len(aborted)}</b> ended in failure/abort. '
+                        f'Successful runs averaged <b>{int(avg_posts):,}</b> posts at '
+                        f'<b>${avg_cost:.2f}</b> per run.'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                if aborted:
+                    st.markdown(
+                        f'<div style="margin-top:8px;font-size:0.85rem;color:#dc2626;">'
+                        f"⚠ {len(aborted)} recent run(s) aborted. If the Apify console shows "
+                        f'"reached the maximum usage for your current billing cycle", '
+                        f"the cap is the cause — not your scrape settings."
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+    # Settings presets — three buttons that snap to known-good values.
+    # The user mentioned they "usually scrape 5000 posts" but the form's
+    # last-used values produced 1000. Presets remove the guesswork.
+    st.markdown("**Quick settings presets:**")
+    preset_cols = st.columns([1, 1, 1, 2])
+    PRESETS = {
+        "preset_quick":    {"label": "⚡ Quick (~1k posts)",     "results": 9,  "days": 14},
+        "preset_standard": {"label": "📊 Standard (~5k posts)",  "results": 25, "days": 21},
+        "preset_deep":     {"label": "🚀 Deep (~10k posts)",     "results": 50, "days": 30},
+    }
+    for i, (key, p) in enumerate(PRESETS.items()):
+        with preset_cols[i]:
+            if st.button(p["label"], key=key, help=f"Sets posts/profile to {p['results']} and days to {p['days']}"):
+                st.session_state["scrape_results_limit"] = p["results"]
+                st.session_state["scrape_newer_than"] = p["days"]
+                st.rerun()
+
     cols = st.columns([3, 2])
     with cols[0]:
         # Load the FULL accounts.json list — no truncation. Previously this
@@ -651,6 +842,26 @@ def screen_run():
             key="scrape_newer_than",
         )
         skip_pinned = st.checkbox("Skip pinned posts", value=False, key="scrape_skip_pinned")
+
+        # Live estimate of the upper bound on posts this scrape can return.
+        # Helps the user catch the obvious "wait, why am I only getting 1k?"
+        # case before they spend 10 min finding out from Apify. The actual
+        # count is always lower — most accounts don't have N posts in the
+        # last D days — but the upper bound is a useful sanity check.
+        est_max = int(current_count) * int(results_limit)
+        st.markdown(
+            f'<div style="background:#f3f4f6;padding:8px 12px;border-radius:6px;'
+            f'font-size:0.85rem;margin-top:4px;">'
+            f"<b>Estimated max:</b> {current_count:,} accounts × {int(results_limit)} posts "
+            f"= up to <b>{est_max:,}</b> posts<br>"
+            f'<span style="color:#6b7280;">'
+            f"Real count is usually 20–60% of this — most accounts have fewer than "
+            f"{int(results_limit)} posts in the last {int(newer_than) or '∞'} days."
+            f"</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
         auto_min_posts = st.number_input(
             "Path C safety: min posts to auto-chain",
             min_value=1, max_value=10000,
