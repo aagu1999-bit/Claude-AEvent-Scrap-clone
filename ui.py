@@ -1621,6 +1621,119 @@ def _env_state(name: str) -> str:
     return "✓ set" if os.environ.get(name, "").strip() else "✗ not set"
 
 
+def _check_integrations() -> dict:
+    """Run a live health check across the three integrations the user
+    cares about: outgoing email (SMTP creds), Google Sheets connectivity,
+    and the Weekend_Review tab (read by Event-Calendar).
+
+    Each check returns {ok, message} so the UI can render a row per
+    integration. Failures are non-fatal — we surface the reason but
+    don't raise; the user sees which piece is broken and how to fix it.
+    """
+    out = {}
+
+    # ── Email ─────────────────────────────────────────────────────────
+    admin = (os.environ.get("RUN_SUMMARY_EMAIL", "")
+             or os.environ.get("ADMIN_EMAIL", "")).strip()
+    smtp_host = os.environ.get("SMTP_HOST", "").strip()
+    smtp_port = os.environ.get("SMTP_PORT", "").strip()
+    smtp_user = os.environ.get("SMTP_USER", "").strip()
+    smtp_pass = os.environ.get("SMTP_PASS", "").strip()
+    if not admin:
+        out["email"] = {
+            "ok": False,
+            "message": "No RUN_SUMMARY_EMAIL or ADMIN_EMAIL set in env. Run-summary + outage "
+                       "emails won't be sent. Set in Replit Secrets.",
+        }
+    elif not (smtp_host and smtp_port and smtp_user and smtp_pass):
+        missing = [k for k, v in [
+            ("SMTP_HOST", smtp_host), ("SMTP_PORT", smtp_port),
+            ("SMTP_USER", smtp_user), ("SMTP_PASS", smtp_pass),
+        ] if not v]
+        out["email"] = {
+            "ok": False,
+            "message": f"ADMIN_EMAIL is set to {admin!r} but SMTP credentials are incomplete: "
+                       f"missing {', '.join(missing)}. Email path won't send (marker files still "
+                       f"written for outages).",
+        }
+    else:
+        recipients = [e.strip() for e in admin.split(",") if e.strip()]
+        out["email"] = {
+            "ok": True,
+            "message": f"SMTP configured ({smtp_host}:{smtp_port} as {smtp_user}) → "
+                       f"{len(recipients)} recipient(s): {', '.join(recipients)}",
+        }
+
+    # ── Google Sheets ────────────────────────────────────────────────
+    sa_file = (os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+               or os.environ.get("SERVICE_ACCOUNT_FILE")
+               or "apt-mark-468506-u9-ec44cabc7335 copy.json")
+    cfg = load_config()
+    sheet_name = cfg.get("sheet_name", SHEET_NAME_DEFAULT)
+    if not os.path.exists(sa_file):
+        out["sheets"] = {
+            "ok": False,
+            "message": f"Service-account JSON not found at {sa_file!r}. Sheets writes will fail.",
+        }
+    else:
+        try:
+            import gspread
+            from oauth2client.service_account import ServiceAccountCredentials
+            scope = [
+                "https://spreadsheets.google.com/feeds",
+                "https://www.googleapis.com/auth/drive",
+            ]
+            creds = ServiceAccountCredentials.from_json_keyfile_name(sa_file, scope)
+            client = gspread.authorize(creds)
+            spreadsheet = client.open(sheet_name)
+            out["sheets"] = {
+                "ok": True,
+                "message": f"Connected to '{sheet_name}' as {creds.service_account_email}.",
+            }
+            # Bonus: check Weekend_Review existence + row count for the next check
+            out["_spreadsheet_for_weekend"] = spreadsheet
+        except Exception as e:
+            out["sheets"] = {
+                "ok": False,
+                "message": f"Sheets auth/open failed: {e}",
+            }
+
+    # ── Weekend_Review tab (the bridge to Event-Calendar) ────────────
+    ss = out.pop("_spreadsheet_for_weekend", None)
+    if not ss:
+        out["weekend_review"] = {
+            "ok": False,
+            "message": "Skipped — Sheets connection failed (see above).",
+        }
+    else:
+        try:
+            ws = ss.worksheet("Weekend_Review")
+            all_values = ws.get_all_values()
+            n_data = max(0, len(all_values) - 1)
+            n_cols = len(all_values[0]) if all_values else 0
+            if n_data == 0:
+                out["weekend_review"] = {
+                    "ok": False,
+                    "message": f"Tab exists ({n_cols} header cols) but has no data rows. "
+                               f"Open Stage Review → click 'Stage for Review' to populate.",
+                }
+            else:
+                out["weekend_review"] = {
+                    "ok": True,
+                    "message": f"Tab has {n_data:,} data row(s) across {n_cols} columns. "
+                               f"Event-Calendar /scraper page reads from this tab.",
+                }
+        except Exception as e:
+            cls = type(e).__name__
+            out["weekend_review"] = {
+                "ok": False,
+                "message": f"Couldn't access 'Weekend_Review' tab: {cls}: {e}. "
+                           f"Open Stage Review → click 'Stage for Review' to create the tab.",
+            }
+
+    return out
+
+
 def screen_settings():
     st.title("Settings")
     st.markdown(
@@ -1633,6 +1746,48 @@ def screen_settings():
     )
 
     cfg = load_config()
+
+    # ── Integration status (live check) ──────────────────────────────
+    with st.expander("**🔌 Integration status** (email · Google Sheets · Weekend_Review bridge)", expanded=True):
+        st.markdown(
+            '<span class="muted">'
+            "Live check of the three integrations the pipeline depends on. "
+            "Run this any time the wiring feels off — each row shows whether the "
+            "credential set is configured AND whether the live call succeeds."
+            "</span>",
+            unsafe_allow_html=True,
+        )
+        col_a, col_b = st.columns([1, 3])
+        with col_a:
+            check_clicked = st.button("🔄 Check now", key="run_integration_check", type="primary")
+        if check_clicked:
+            with st.spinner("Checking email config, Sheets auth, Weekend_Review tab…"):
+                results = _check_integrations()
+            st.session_state["_integration_results"] = results
+
+        results = st.session_state.get("_integration_results")
+        if results:
+            labels = {
+                "email":          "📧 Email (SMTP + ADMIN_EMAIL)",
+                "sheets":         "📊 Google Sheets (gspread auth + open)",
+                "weekend_review": "📅 Weekend_Review tab (Event-Calendar reads this)",
+            }
+            for key, label in labels.items():
+                r = results.get(key, {"ok": False, "message": "(check not run)"})
+                icon = "✅" if r["ok"] else "❌"
+                color = "#16a34a" if r["ok"] else "#dc2626"
+                st.markdown(
+                    f'<div style="display:flex;gap:10px;padding:8px 12px;'
+                    f'margin:4px 0;border-left:4px solid {color};background:#f9fafb;'
+                    f'border-radius:4px;">'
+                    f'<div style="font-size:1.4rem;line-height:1;">{icon}</div>'
+                    f'<div>'
+                    f'<div style="font-weight:600;font-size:0.9rem;">{label}</div>'
+                    f'<div style="font-size:0.85rem;color:#4b5563;margin-top:2px;">{r["message"]}</div>'
+                    f'</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
 
     # ── Pipeline run tuning ─────────────────────────────────────────────
     with st.expander("**Pipeline run tuning**", expanded=True):
