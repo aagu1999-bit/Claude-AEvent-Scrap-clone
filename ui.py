@@ -2129,9 +2129,12 @@ def screen_stage():
         if err:
             st.error(f"Couldn't stage: {err}")
         else:
+            # Use a proper emoji codepoint — Streamlit's toast validator
+            # rejects "✓" (U+2713 HEAVY CHECK MARK, technically a glyph
+            # not an emoji) with a StreamlitAPIException.
             st.toast(
                 f"Staged {count:,} events to Weekend_Review",
-                icon="✓",
+                icon="✅",
             )
             st.success(
                 f"✓ Staged **{count:,}** event(s) for the {start_date} → {end_date} "
