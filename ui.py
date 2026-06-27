@@ -809,7 +809,7 @@ with st.sidebar:
     st.markdown("&nbsp;")
     screen = st.radio(
         "Section",
-        ("Run", "Settings", "Lookup Post", "Accounts", "Audits & Tools"),
+        ("Run", "Stage Review", "Settings", "Lookup Post", "Accounts", "Audits & Tools"),
         label_visibility="collapsed",
     )
     st.markdown("---")
@@ -838,56 +838,68 @@ def screen_run():
         st.subheader("Apify scrape in progress")
         render_apify_scrape_panel(scrape_info)
         return
-    if scrape_status == "crashed":
-        info = scrape_info or {}
-        run_id = info.get("apify_run_id", "")
-        dataset_id = info.get("apify_dataset_id", "")
-        token = os.environ.get("APIFY_API_KEY", "").strip()
-
-        # Try to pull the run's terminal status from Apify so we can say
-        # WHY it ended — billing cap, timeout, abort, succeeded-but-empty,
-        # etc. — instead of the vague "ended unexpectedly".
-        apify_status = "?"
-        item_count = "?"
-        if run_id and token:
-            try:
-                apify_status = apify_poll_status(run_id, token)
-            except Exception:
-                pass
-            try:
-                item_count = _fetch_apify_dataset_count(dataset_id, token)
-            except Exception:
-                pass
-
-        bits = [f"Previous Apify scrape ended."]
-        if apify_status != "?":
-            bits.append(f"Apify status: **{apify_status}**.")
-        if run_id:
-            bits.append(f"Run ID: `{run_id}`.")
-        if isinstance(item_count, int) and item_count > 0:
-            bits.append(f"Dataset has **{item_count:,}** posts.")
-        st.warning(" ".join(bits))
-
-        cols = st.columns([1, 1, 3])
-        with cols[0]:
-            if run_id:
-                st.markdown(
-                    f"[Open run in Apify console]({apify_run_console_url(run_id)})"
-                )
-        with cols[1]:
-            if st.button("Clear scrape state", key="clear_scrape_crash"):
-                _clear_job(JOB_KIND_SCRAPE)
-                st.rerun()
 
     # Pipeline in progress → big panel takes over
     if run_status == "running":
         render_running_panel(JOB_KIND_RUN, run_info, "Pipeline")
         return
+
+    # Consolidated stale-state banner. Previously rendered as two separate
+    # yellow boxes stacked on top of each other (scrape crash + pipeline
+    # crash); now one collapsible card. Headline shows the count so the
+    # user sees there's something to look at without the whole detail
+    # block taking up real estate every page load.
+    crashes = []
+    if scrape_status == "crashed":
+        crashes.append(("scrape", scrape_info or {}))
     if run_status == "crashed":
-        st.warning("The previous pipeline run ended unexpectedly. Check the log before starting another.")
-        if st.button("Clear run state", key="clear_run_crash"):
-            _clear_job(JOB_KIND_RUN)
-            st.rerun()
+        crashes.append(("pipeline", run_info or {}))
+
+    if crashes:
+        label = "stale run state" if len(crashes) == 1 else f"{len(crashes)} stale run states"
+        with st.expander(f"⚠ {label} — click to inspect / clear", expanded=False):
+            for kind, info in crashes:
+                if kind == "scrape":
+                    run_id = info.get("apify_run_id", "")
+                    dataset_id = info.get("apify_dataset_id", "")
+                    token = os.environ.get("APIFY_API_KEY", "").strip()
+                    # Pull live status from Apify so we know WHY it ended.
+                    apify_status_str = "?"
+                    item_count = "?"
+                    if run_id and token:
+                        try:
+                            apify_status_str = apify_poll_status(run_id, token)
+                        except Exception:
+                            pass
+                        try:
+                            item_count = _fetch_apify_dataset_count(dataset_id, token)
+                        except Exception:
+                            pass
+                    bits = ["**Scrape ended.**"]
+                    if apify_status_str != "?":
+                        bits.append(f"Apify status: `{apify_status_str}`.")
+                    if run_id:
+                        bits.append(f"Run ID: `{run_id}`.")
+                    if isinstance(item_count, int) and item_count > 0:
+                        bits.append(f"Dataset has **{item_count:,}** posts.")
+                    st.markdown(" ".join(bits))
+                    cols = st.columns([1, 1, 3])
+                    with cols[0]:
+                        if run_id:
+                            st.markdown(f"[Open in Apify console]({apify_run_console_url(run_id)})")
+                    with cols[1]:
+                        if st.button("Clear scrape state", key="clear_scrape_crash"):
+                            _clear_job(JOB_KIND_SCRAPE)
+                            st.rerun()
+                else:  # pipeline
+                    st.markdown(
+                        "**Pipeline ended unexpectedly.** Check the log "
+                        f"(PID `{info.get('pid', '?')}`) before starting another."
+                    )
+                    if st.button("Clear run state", key="clear_run_crash"):
+                        _clear_job(JOB_KIND_RUN)
+                        st.rerun()
+                st.markdown("---")
 
     cfg = load_config()
     current_url = cfg.get("instagram_data_url", "")
@@ -927,17 +939,16 @@ def screen_run():
     st.markdown("---")
 
     # ── Path B / C: trigger Apify via API ──────────────────────────────
-    st.subheader("Path B / C — Trigger Apify (with optional auto-chain)")
-    st.markdown(
-        '<span class="muted">'
-        "Kicks off an Apify run via API. <b>Path B</b> stops after the scrape — you sanity-check the "
-        "dataset and click Run Pipeline yourself. <b>Path C</b> auto-triggers the pipeline as soon as "
-        "Apify succeeds with at least the configured minimum number of posts. Path C requires the UI "
-        "tab to stay open; if you close it before Apify finishes, you'll still get the scrape-complete "
-        "email and can click Run Pipeline manually."
-        "</span>",
-        unsafe_allow_html=True,
-    )
+    st.subheader("Path B / C — Trigger Apify")
+    with st.expander("ℹ How Path B vs C differ", expanded=False):
+        st.markdown(
+            "**Path B** — kicks off Apify and stops. You sanity-check the dataset "
+            "and click Run Pipeline yourself."
+            "\n\n"
+            "**Path C** — auto-triggers the pipeline as soon as Apify succeeds "
+            "with at least the configured minimum number of posts. UI tab can "
+            "be closed; the background watcher handles the chain + emails."
+        )
 
     # Recent runs panel — pulled live from Apify so the user can compare
     # their planned settings against what's been happening lately. Most
@@ -1124,22 +1135,33 @@ def screen_run():
 
         # Show any banner the on_click callback queued. Cleared after
         # display so it doesn't persist across unrelated reruns.
+        # Success/info → st.toast (auto-dismisses after ~4s, doesn't
+        # take up vertical space forever). Warnings/errors stay sticky
+        # because the user needs to act on them.
         banner = st.session_state.pop("_accts_banner", None)
         if banner:
             level, msg = banner
-            getattr(st, level)(msg)
+            if level in ("success", "info"):
+                icon = "✅" if level == "success" else "ℹ️"
+                st.toast(msg, icon=icon)
+            else:
+                getattr(st, level)(msg)
     with cols[1]:
         results_limit = st.number_input(
-            "Posts per profile",
+            "Posts / account",
             min_value=1, max_value=200, value=int(cfg.get("apify_posts_per_profile", 25)),
+            help="Max number of recent posts Apify will pull per Instagram account.",
             key="scrape_results_limit",
         )
         newer_than = st.number_input(
-            "Newer than (days, 0 = no filter)",
+            "Days back (0 = all)",
             min_value=0, max_value=365, value=int(cfg.get("apify_newer_than_days", 21)),
+            help="Skip posts older than this many days. 0 disables the date filter.",
             key="scrape_newer_than",
         )
-        skip_pinned = st.checkbox("Skip pinned posts", value=False, key="scrape_skip_pinned")
+        skip_pinned = st.checkbox("Skip pinned", value=False, key="scrape_skip_pinned",
+                                  help="Skip posts pinned to the top of profiles "
+                                       "(usually static intro / link-in-bio posts).")
 
         # Live estimate of the upper bound on posts this scrape can return.
         # Helps the user catch the obvious "wait, why am I only getting 1k?"
@@ -1161,11 +1183,12 @@ def screen_run():
         )
 
         auto_min_posts = st.number_input(
-            "Path C safety: min posts to auto-chain",
+            "Path C min posts",
             min_value=1, max_value=10000,
             value=int(cfg.get("apify_min_posts_for_auto_run", 10)),
-            help="Path C refuses to auto-trigger the pipeline if Apify returns fewer than this many "
-                 "posts — guards against running 30 min of Gemini calls on a busted scrape.",
+            help="Safety guard: Path C refuses to auto-trigger the pipeline if Apify "
+                 "returns fewer than this many posts. Prevents 30 min of Gemini calls "
+                 "on a busted scrape.",
             key="auto_min_posts",
         )
         memory_options = {
@@ -1181,14 +1204,13 @@ def screen_run():
             "8192 MB (~15 min for 1000 accts)",
         )
         memory_label = st.selectbox(
-            "Apify compute tier",
+            "Compute tier",
             options=list(memory_options.keys()),
             index=list(memory_options.keys()).index(default_label),
-            help="This is Apify's server-side memory allocation, not your computer's. "
-                 "Caps depend on your Apify plan: Free=4GB, Personal=32GB, Team=64GB+. "
-                 "If you pick a tier above your plan, Apify rejects the run with a clear "
-                 "error message — the scrape just won't start, nothing else breaks. "
-                 "Drop to a lower tier and retry.",
+            help="Apify server-side memory (NOT your computer). Caps by plan: "
+                 "Free 4 GB · Personal 32 GB · Team 64 GB+. Higher tier = faster but "
+                 "burns CUs faster — total spend is roughly equal. If your plan caps "
+                 "below the tier you pick, Apify rejects the run with a clear error.",
             key="apify_memory_label",
         )
         memory_mb = memory_options[memory_label]
@@ -1847,6 +1869,283 @@ def screen_settings():
         st.code(json.dumps(load_config(), indent=2), language="json")
 
 
+# ─── Screen: Stage for Review ────────────────────────────────────────────
+# Reads All_Events, filters to a date range (defaults to the upcoming
+# Fri-Sun), and writes the subset to a separate Weekend_Review tab where
+# the Event-Calendar app handles approvals. All_Events is NEVER edited
+# by this screen — the user's master record stays pristine. Re-staging
+# REPLACES the Weekend_Review tab contents (user's explicit choice over
+# append, so stale approvals from a prior weekend don't linger).
+
+WEEKEND_REVIEW_TAB = "Weekend_Review"
+WEEKEND_REVIEW_EXTRA_COLS = ["APPROVED", "REVIEWED_AT", "EDITED_FIELDS", "PUSHED_AT"]
+
+
+def _compute_default_weekend() -> tuple:
+    """Return (start, end) date pair for the upcoming Fri-Sun window.
+
+    Per the user's 2026-06-27 workflow note: they post on Friday FOR
+    that weekend. So:
+      · Mon-Thu (wd 0-3): this coming Fri-Sun (haven't posted yet)
+      · Fri (wd 4):       today's weekend (posting day; today + Sat + Sun)
+      · Sat-Sun (wd 5-6): NEXT weekend (current weekend already published)
+
+    Override via the date picker for off-cadence weeks (holidays, etc.).
+    """
+    from datetime import date, timedelta
+    today = date.today()
+    wd = today.weekday()  # Mon=0, Fri=4, Sat=5, Sun=6
+    if wd <= 4:
+        # Mon (0)→4, Tue (1)→3, Wed (2)→2, Thu (3)→1, Fri (4)→0
+        days = 4 - wd
+    else:
+        # Sat (5)→6, Sun (6)→5
+        days = 11 - wd
+    friday = today + timedelta(days=days)
+    sunday = friday + timedelta(days=2)
+    return friday, sunday
+
+
+def _parse_sheet_date(s: str):
+    """Parse the DATE column from All_Events. The sheet stores dates in
+    'M/D/YYYY' form (per save_data's uppercase pass) but tolerate the
+    ISO form too in case future rows differ. Returns a date object or
+    None if unparseable / blank."""
+    if not s:
+        return None
+    s = str(s).strip()
+    if not s:
+        return None
+    from datetime import datetime
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%-m/%-d/%Y", "%m-%d-%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def stage_for_review(start_date, end_date) -> tuple:
+    """Read All_Events, filter rows where DATE ∈ [start, end], REPLACE
+    the Weekend_Review tab with the filtered subset + the four extra
+    columns (APPROVED / REVIEWED_AT / EDITED_FIELDS / PUSHED_AT).
+
+    Returns (count, error_msg). error_msg == '' on success.
+
+    Idempotent — re-staging with the same range yields the same tab
+    content. Re-staging with a different range REPLACES (does not
+    append) per the user's 2026-06-27 design choice; stale approvals
+    don't linger across weekends."""
+    try:
+        import gspread
+        from oauth2client.service_account import ServiceAccountCredentials
+    except Exception as e:
+        return 0, f"gspread/oauth2client not installed: {e}"
+
+    sa_file = (os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+               or os.environ.get("SERVICE_ACCOUNT_FILE")
+               or "apt-mark-468506-u9-ec44cabc7335 copy.json")
+    if not os.path.exists(sa_file):
+        return 0, f"service account file not found: {sa_file}"
+
+    cfg = load_config()
+    sheet_name = cfg.get("sheet_name", SHEET_NAME_DEFAULT)
+
+    try:
+        scope = [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = ServiceAccountCredentials.from_json_keyfile_name(sa_file, scope)
+        client = gspread.authorize(creds)
+        spreadsheet = client.open(sheet_name)
+    except Exception as e:
+        return 0, f"couldn't open sheet '{sheet_name}': {e}"
+
+    # Read All_Events — header + all data rows in one API call.
+    try:
+        src = spreadsheet.worksheet("All_Events")
+        all_rows = src.get_all_values()
+    except Exception as e:
+        return 0, f"couldn't read All_Events: {e}"
+
+    if not all_rows or len(all_rows) < 2:
+        return 0, "All_Events has no data rows"
+
+    header = all_rows[0]
+    data = all_rows[1:]
+
+    try:
+        date_idx = header.index("DATE")
+    except ValueError:
+        return 0, "All_Events has no DATE column (header lookup failed)"
+
+    # Filter to the requested date range.
+    filtered = []
+    for row in data:
+        if date_idx >= len(row):
+            continue
+        d = _parse_sheet_date(row[date_idx])
+        if d and start_date <= d <= end_date:
+            filtered.append(row)
+
+    if not filtered:
+        return 0, (f"No All_Events rows have DATE in [{start_date} .. {end_date}]. "
+                   f"Either the scraper hasn't extracted anything for that range yet, "
+                   f"or the dates in the sheet are in an unexpected format.")
+
+    # Build the Weekend_Review payload: same columns as All_Events, plus
+    # the four review-flow columns at the right edge. Existing rows in
+    # Weekend_Review (if any) get wiped — that's the explicit replace
+    # semantic the user chose.
+    new_header = list(header) + WEEKEND_REVIEW_EXTRA_COLS
+    new_rows = [list(row) + ["", "", "", ""] for row in filtered]
+
+    # Pad each row to the header length so the gspread update doesn't
+    # complain about row-length mismatch (some All_Events rows may be
+    # shorter than the header when trailing columns are blank).
+    padded = []
+    for r in new_rows:
+        if len(r) < len(new_header):
+            r = r + [""] * (len(new_header) - len(r))
+        padded.append(r)
+
+    try:
+        dst = spreadsheet.worksheet(WEEKEND_REVIEW_TAB)
+        dst.clear()
+        # Resize generously so the update has room (clear() preserves
+        # row/col count but the previous staging might have been smaller).
+        target_rows = max(len(padded) + 10, 100)
+        target_cols = len(new_header)
+        if dst.row_count < target_rows:
+            dst.resize(rows=target_rows)
+        if dst.col_count < target_cols:
+            dst.resize(cols=target_cols)
+    except Exception:  # gspread.WorksheetNotFound or any other
+        try:
+            dst = spreadsheet.add_worksheet(
+                title=WEEKEND_REVIEW_TAB,
+                rows=max(len(padded) + 10, 100),
+                cols=len(new_header),
+            )
+        except Exception as e:
+            return 0, f"couldn't create Weekend_Review tab: {e}"
+
+    try:
+        dst.update(values=[new_header] + padded,
+                   range_name="A1",
+                   value_input_option="USER_ENTERED")
+    except Exception as e:
+        return 0, f"couldn't write Weekend_Review rows: {e}"
+
+    return len(padded), ""
+
+
+def screen_stage():
+    st.title("Stage for Review")
+    st.markdown(
+        '<span class="muted">'
+        "Creates a snapshot of <code>All_Events</code> rows that fall in the chosen "
+        "date range and writes them to a separate <code>Weekend_Review</code> tab "
+        "(where Event-Calendar handles approvals). <b>All_Events is never edited</b> — "
+        "your master record stays pristine. Re-staging <b>replaces</b> Weekend_Review "
+        "entirely; any pending approvals from a previous range are wiped."
+        "</span>",
+        unsafe_allow_html=True,
+    )
+
+    default_start, default_end = _compute_default_weekend()
+    from datetime import timedelta
+
+    # Preset buttons that update the date pickers via session_state. The
+    # date_input widgets below own their session_state keys, so we set
+    # the preset values in a SEPARATE key and let the widgets read from
+    # them as defaults on the next render.
+    st.markdown("**Quick presets**")
+    preset_cols = st.columns([1, 1, 1, 2])
+    with preset_cols[0]:
+        if st.button("📅 This weekend",
+                     key="preset_this_wknd",
+                     help=f"{default_start.strftime('%a %m/%d')} – "
+                          f"{default_end.strftime('%a %m/%d')}"):
+            st.session_state["stage_start_default"] = default_start
+            st.session_state["stage_end_default"] = default_end
+            # Force re-instantiation of the date inputs:
+            for k in ("stage_start_input", "stage_end_input"):
+                st.session_state.pop(k, None)
+            st.rerun()
+    with preset_cols[1]:
+        nxt_fri = default_start + timedelta(days=7)
+        nxt_sun = default_end + timedelta(days=7)
+        if st.button("📅 Next weekend",
+                     key="preset_next_wknd",
+                     help=f"{nxt_fri.strftime('%a %m/%d')} – "
+                          f"{nxt_sun.strftime('%a %m/%d')}"):
+            st.session_state["stage_start_default"] = nxt_fri
+            st.session_state["stage_end_default"] = nxt_sun
+            for k in ("stage_start_input", "stage_end_input"):
+                st.session_state.pop(k, None)
+            st.rerun()
+    with preset_cols[2]:
+        if st.button("📅 This week (Mon–Sun)", key="preset_this_week"):
+            from datetime import date
+            today = date.today()
+            mon = today - timedelta(days=today.weekday())
+            sun = mon + timedelta(days=6)
+            st.session_state["stage_start_default"] = mon
+            st.session_state["stage_end_default"] = sun
+            for k in ("stage_start_input", "stage_end_input"):
+                st.session_state.pop(k, None)
+            st.rerun()
+
+    # Date pickers — read their defaults from session_state slots above
+    # so the preset buttons feed in cleanly.
+    s_default = st.session_state.get("stage_start_default", default_start)
+    e_default = st.session_state.get("stage_end_default", default_end)
+    date_cols = st.columns([1, 1, 2])
+    with date_cols[0]:
+        start_date = st.date_input("Start date", value=s_default, key="stage_start_input")
+    with date_cols[1]:
+        end_date = st.date_input("End date", value=e_default, key="stage_end_input")
+
+    if end_date < start_date:
+        st.error("End date must be on or after start date.")
+        return
+
+    st.markdown(
+        f'<div style="background:#f3f4f6;padding:8px 12px;border-radius:6px;'
+        f'font-size:0.9rem;margin-top:8px;">'
+        f"Will stage every <code>All_Events</code> row whose <b>DATE</b> falls between "
+        f"<b>{start_date.strftime('%a %b %d, %Y')}</b> and "
+        f"<b>{end_date.strftime('%a %b %d, %Y')}</b> (inclusive)."
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("&nbsp;", unsafe_allow_html=True)
+    if st.button("🎯 Stage for Review", type="primary", key="stage_btn"):
+        with st.spinner(f"Reading All_Events, filtering, writing Weekend_Review…"):
+            count, err = stage_for_review(start_date, end_date)
+        if err:
+            st.error(f"Couldn't stage: {err}")
+        else:
+            st.toast(
+                f"Staged {count:,} events to Weekend_Review",
+                icon="✓",
+            )
+            st.success(
+                f"✓ Staged **{count:,}** event(s) for the {start_date} → {end_date} "
+                f"window into the **Weekend_Review** tab. The Event-Calendar app reads "
+                f"from there."
+            )
+            cfg2 = load_config()
+            sheet_name = cfg2.get("sheet_name", SHEET_NAME_DEFAULT)
+            st.markdown(
+                f'📂 [Open **{sheet_name} → Weekend_Review** in Google Sheets]'
+                f'(https://docs.google.com/spreadsheets/)'
+            )
+
+
 # ─── Screen: Lookup Post ─────────────────────────────────────────────────
 
 def screen_lookup():
@@ -2038,6 +2337,8 @@ def screen_audits():
 
 if screen == "Run":
     screen_run()
+elif screen == "Stage Review":
+    screen_stage()
 elif screen == "Settings":
     screen_settings()
 elif screen == "Lookup Post":
