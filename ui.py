@@ -672,13 +672,125 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Custom CSS for friendlier look
+# Modern UI theme.
+#
+# Design goals — a teammate opens the app on their phone, is told "go to
+# Home, tap the big blue button" and knows exactly what to do:
+#   • Larger touch targets (44 px+, WCAG minimum) so buttons don't
+#     require thumb precision on mobile
+#   • Consistent card styling with soft shadow + rounded corners so
+#     related controls read as a group
+#   • One visually dominant CTA per screen — the daily-workflow button
+#     is bigger and blue; secondary options are quieter
+#   • Numbered step badges for the walkthrough card at the top of Home
+#   • System font stack so it looks native everywhere (San Francisco on
+#     iOS, Roboto on Android, Segoe on Win)
 st.markdown(
     """
     <style>
+      /* Base typography — system fonts feel native on every platform */
+      .stApp {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                     "Helvetica Neue", Arial, sans-serif;
+      }
       .stApp [data-testid="stMetricValue"] { font-size: 1.6rem; }
-      .big-btn button { height: 3.2rem; font-size: 1.1rem; font-weight: 600; }
+
+      /* Buttons — bigger, rounder, mobile-friendly. Streamlit's default
+         button height is ~38 px which fails Apple's 44 px touch guideline. */
+      .stApp .stButton > button {
+        min-height: 44px;
+        border-radius: 8px;
+        font-weight: 600;
+        transition: transform 0.05s ease-in-out;
+      }
+      .stApp .stButton > button:active { transform: scale(0.98); }
+
+      /* Primary CTA — bigger, higher contrast. Applied via a wrapping div
+         with class "primary-cta". Keeps Streamlit's own primary styling
+         but boosts prominence for the one "recommended" button per screen. */
+      .primary-cta button {
+        height: 3.6rem !important;
+        font-size: 1.1rem !important;
+        font-weight: 700 !important;
+        box-shadow: 0 2px 8px rgba(37, 99, 235, 0.25);
+      }
+      .big-btn button {
+        height: 3.2rem;
+        font-size: 1.05rem;
+        font-weight: 600;
+      }
       .danger-btn button { background-color: #b91c1c; color: white; }
+
+      /* Cards — the visual grouping used throughout the redesign */
+      .ui-card {
+        background: white;
+        border: 1px solid #e5e7eb;
+        border-radius: 10px;
+        padding: 16px 18px;
+        margin: 12px 0;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+      }
+      .ui-card-primary {
+        background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%);
+        border: 2px solid #2563eb;
+      }
+      .ui-card-title {
+        font-size: 1.05rem;
+        font-weight: 700;
+        color: #111827;
+        margin: 0 0 6px 0;
+      }
+      .ui-card-sub {
+        font-size: 0.9rem;
+        color: #4b5563;
+        margin: 0 0 12px 0;
+      }
+
+      /* Numbered step badges for the workflow walkthrough */
+      .step-badge {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 26px; height: 26px;
+        border-radius: 50%;
+        background: #2563eb;
+        color: white;
+        font-weight: 700;
+        font-size: 0.85rem;
+        margin-right: 8px;
+      }
+      .step-row {
+        display: flex;
+        align-items: flex-start;
+        margin: 8px 0;
+        font-size: 0.95rem;
+        color: #1f2937;
+      }
+      .step-body b { color: #111827; }
+
+      /* Sidebar workflow guide */
+      .sidebar-workflow {
+        background: #f9fafb;
+        border: 1px solid #e5e7eb;
+        border-radius: 8px;
+        padding: 10px 12px;
+        margin: 12px 0;
+        font-size: 0.85rem;
+        line-height: 1.5;
+      }
+      .sidebar-workflow h4 {
+        margin: 0 0 6px 0;
+        font-size: 0.85rem;
+        color: #6b7280;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+      .sidebar-workflow ol {
+        margin: 0; padding-left: 22px;
+        color: #1f2937;
+      }
+      .sidebar-workflow li { margin: 3px 0; }
+
       .muted { color: #6b7280; font-size: 0.85rem; }
       .outage-banner {
         background: #fef2f2; border: 2px solid #b91c1c; border-radius: 8px;
@@ -687,6 +799,13 @@ st.markdown(
       .legend-swatch {
         display: inline-block; width: 12px; height: 12px; border-radius: 2px;
         margin-right: 6px; vertical-align: middle;
+      }
+
+      /* Mobile tweaks — stack columns cleanly and give buttons room */
+      @media (max-width: 640px) {
+        .stApp .stButton > button { min-height: 48px; width: 100%; }
+        .primary-cta button { height: 4rem !important; }
+        .ui-card { padding: 14px; }
       }
     </style>
     """,
@@ -803,19 +922,51 @@ def render_running_panel(kind: str, info: dict, label: str):
 
 
 # ─── Sidebar navigation ──────────────────────────────────────────────────
+#
+# Section labels are action-oriented + numbered so a teammate can be told
+# "go to 1. Home" or "go to 2. Prep for Review" without ambiguity. The
+# workflow guide directly below shows the happy path so nobody has to
+# hunt for the daily sequence.
+#
+# Keep in sync with the dispatch block at the bottom of the file (there's
+# a NAV_LABELS constant guarding both sides).
+NAV_LABELS = (
+    "🏠 Home",             # was "Run"
+    "📤 Prep for Review",  # was "Stage Review"
+    "⚙️ Settings",
+    "🔍 Post Lookup",      # was "Lookup Post"
+    "📇 Accounts",
+    "🧰 Advanced Tools",   # was "Audits & Tools"
+)
 
 with st.sidebar:
     st.markdown("# 📅 Apify Pipeline")
-    st.markdown("&nbsp;")
+
+    # Workflow guide — the daily sequence, front and center. Teammate can
+    # be told "just do steps 1 and 2 on the app, then go to the website".
+    st.markdown(
+        """
+        <div class="sidebar-workflow">
+          <h4>Daily workflow</h4>
+          <ol>
+            <li><b>Home</b> — scrape Instagram &amp; run pipeline</li>
+            <li><b>Prep for Review</b> — pick date range</li>
+            <li>Open the website's <b>/scraper</b> page &amp; hit Send</li>
+          </ol>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
     screen = st.radio(
         "Section",
-        ("Run", "Stage Review", "Settings", "Lookup Post", "Accounts", "Audits & Tools"),
+        NAV_LABELS,
         label_visibility="collapsed",
     )
     st.markdown("---")
     st.markdown(
         '<div class="muted">'
-        "Flag legend<br>"
+        "Sheet flag colors<br>"
         '<span class="legend-swatch" style="background:#fce7eb"></span> pink — wrong field<br>'
         '<span class="legend-swatch" style="background:#ffe0b8"></span> orange — probably not event<br>'
         '<span class="legend-swatch" style="background:#fff7c7"></span> yellow — legacy / missing<br>'
@@ -827,8 +978,53 @@ with st.sidebar:
 # ─── Screen: Run ─────────────────────────────────────────────────────────
 
 def screen_run():
-    st.title("Run")
+    st.title("🏠 Home")
+    st.markdown(
+        '<span class="muted">Scrape Instagram accounts, then run the extraction pipeline.</span>',
+        unsafe_allow_html=True,
+    )
     render_outage_banner()
+
+    # Walkthrough card — the 3-step daily flow, shown at the top of Home
+    # so a teammate landing on this screen instantly knows what happens
+    # in what order. Only rendered when nothing is currently running
+    # (would just be noise on top of a live progress panel).
+    _run_status_early, _ = _job_status(JOB_KIND_RUN)
+    _scrape_status_early, _ = _job_status(JOB_KIND_SCRAPE)
+    if _run_status_early != "running" and _scrape_status_early != "running":
+        st.markdown(
+            """
+            <div class="ui-card ui-card-primary">
+              <div class="ui-card-title">📅 The daily flow</div>
+              <div class="step-row">
+                <span class="step-badge">1</span>
+                <span class="step-body">
+                  <b>Here (Home):</b> hit <b>🚀 Scrape &amp; Run</b> below.
+                  Instagram gets scraped, then the pipeline extracts events
+                  into Google Sheets. Takes ~15–45 min. You'll get an email
+                  when it finishes.
+                </span>
+              </div>
+              <div class="step-row">
+                <span class="step-badge">2</span>
+                <span class="step-body">
+                  <b>Prep for Review</b> (sidebar): pick the date range you
+                  want to publish (e.g. this weekend), hit the button. The
+                  events for those dates get copied into a review tab.
+                </span>
+              </div>
+              <div class="step-row">
+                <span class="step-badge">3</span>
+                <span class="step-body">
+                  <b>Website:</b> open the Event-Calendar site, go to the
+                  <b>/scraper</b> page, tap <b>📤 Send NJ events to Review</b>.
+                  The events land in the review queue, ready to publish.
+                </span>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     run_status, run_info = _job_status(JOB_KIND_RUN)
     scrape_status, scrape_info = _job_status(JOB_KIND_SCRAPE)
@@ -904,50 +1100,58 @@ def screen_run():
     cfg = load_config()
     current_url = cfg.get("instagram_data_url", "")
 
-    # ── Path A: paste a dataset URL and run ────────────────────────────
-    st.subheader("Path A — Already have a dataset URL")
+    # ── Primary action: Scrape & Run (was "Path C") ───────────────────
+    st.markdown("## 🚀 Scrape & Run")
     st.markdown(
-        '<span class="muted">When you triggered Apify yourself on the website, paste the dataset URL here.</span>',
+        '<span class="muted">'
+        "Recommended daily action. Kicks off the Instagram scrape, then when "
+        "it finishes, automatically runs the extraction pipeline. You can close "
+        "this tab — you'll get an email when it's done."
+        "</span>",
         unsafe_allow_html=True,
     )
-    new_url = st.text_input("Dataset URL", value=current_url, key="ds_url")
 
-    cols = st.columns([1, 1, 4])
-    with cols[0]:
-        if st.button("💾 Save URL", key="save_url"):
-            save_config({"instagram_data_url": new_url, "apify_enabled": False})
-            st.success("Saved to config.json (apify_enabled=false)")
-            time.sleep(0.6)
-            st.rerun()
-    with cols[1]:
-        st.markdown('<div class="big-btn">', unsafe_allow_html=True)
-        if st.button("▶ Run Pipeline", key="run_pipeline_a", type="primary"):
-            if not (new_url or current_url):
-                st.error("No dataset URL set.")
-            else:
+    # ── Alternate flows (was Path A / Path B) — collapsed by default ──
+    with st.expander("Alternate flows (advanced)", expanded=False):
+        st.markdown(
+            "**Already have a dataset URL from Apify?** Paste it below and click "
+            "*Run Pipeline*. Skips the scrape entirely — useful if you triggered "
+            "Apify manually on their website."
+        )
+        new_url = st.text_input("Dataset URL", value=current_url, key="ds_url")
+
+        cols = st.columns([1, 1, 4])
+        with cols[0]:
+            if st.button("💾 Save URL", key="save_url"):
                 save_config({"instagram_data_url": new_url, "apify_enabled": False})
-                # --now forces immediate execution. Without it, main.py
-                # enters scheduler mode and waits for the schedule_day/time
-                # match instead of running. The user clicking Run Pipeline
-                # almost always wants "now," not "next Thursday."
-                pid = _spawn([sys.executable, "main.py", "--now"], JOB_KIND_RUN, extra={"trigger": "path_a"})
-                st.success(f"Pipeline started (PID {pid}).")
+                st.success("Saved to config.json (apify_enabled=false)")
                 time.sleep(0.6)
                 st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
+        with cols[1]:
+            st.markdown('<div class="big-btn">', unsafe_allow_html=True)
+            if st.button("▶ Run Pipeline", key="run_pipeline_a", type="primary"):
+                if not (new_url or current_url):
+                    st.error("No dataset URL set.")
+                else:
+                    save_config({"instagram_data_url": new_url, "apify_enabled": False})
+                    # --now forces immediate execution. Without it, main.py
+                    # enters scheduler mode and waits for the schedule_day/time
+                    # match instead of running. The user clicking Run Pipeline
+                    # almost always wants "now," not "next Thursday."
+                    pid = _spawn([sys.executable, "main.py", "--now"], JOB_KIND_RUN, extra={"trigger": "path_a"})
+                    st.success(f"Pipeline started (PID {pid}).")
+                    time.sleep(0.6)
+                    st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("---")
-
-    # ── Path B / C: trigger Apify via API ──────────────────────────────
-    st.subheader("Path B / C — Trigger Apify")
-    with st.expander("ℹ How Path B vs C differ", expanded=False):
         st.markdown(
-            "**Path B** — kicks off Apify and stops. You sanity-check the dataset "
-            "and click Run Pipeline yourself."
-            "\n\n"
-            "**Path C** — auto-triggers the pipeline as soon as Apify succeeds "
-            "with at least the configured minimum number of posts. UI tab can "
-            "be closed; the background watcher handles the chain + emails."
+            '<div style="margin-top:16px;padding-top:12px;border-top:1px solid #e5e7eb;">'
+            "<b>Want to scrape but NOT auto-run the pipeline?</b> Below, hit "
+            "<b>Just scrape (don't run pipeline)</b> instead of the big blue button. "
+            "You'll get an email when Apify finishes; come back and click Run Pipeline "
+            "yourself when you're ready."
+            "</div>",
+            unsafe_allow_html=True,
         )
 
     # Recent runs panel — pulled live from Apify so the user can compare
@@ -1226,24 +1430,33 @@ def screen_run():
     if not apify_token:
         st.warning("APIFY_API_KEY is not set in environment. Set it in Replit Secrets to use Path B/C.")
 
-    btn_cols = st.columns([1, 1, 3])
-    with btn_cols[0]:
-        scrape_only_clicked = st.button(
-            "🚀 Scrape only (Path B)",
-            key="scrape_only",
-            disabled=not apify_token,
-            help="Kicks off Apify and stops. You'll get an email when it finishes; "
-                 "then come back and click Run Pipeline.",
-        )
-    with btn_cols[1]:
-        scrape_and_run_clicked = st.button(
-            "🔗 Scrape & Run (Path C)",
-            key="scrape_and_run",
-            disabled=not apify_token,
-            type="primary",
-            help="Triggers Apify, polls until done, then auto-starts the pipeline as long as the "
-                 "scrape returned at least the minimum post count above.",
-        )
+    # Primary CTA: the big blue button teammates should always be
+    # directed to. Full-width so it dominates the page and is trivially
+    # tappable on mobile. Path B (scrape-only) sits below as a smaller,
+    # less prominent alternate.
+    st.markdown('<div class="primary-cta">', unsafe_allow_html=True)
+    scrape_and_run_clicked = st.button(
+        "🚀 Scrape & Run  →  Instagram scrape + auto-run pipeline",
+        key="scrape_and_run",
+        disabled=not apify_token,
+        type="primary",
+        use_container_width=True,
+        help="This is the recommended daily action. Triggers the Instagram scrape, "
+             "waits for it to finish, then automatically runs the extraction pipeline. "
+             "You'll get an email when everything is done — safe to close this tab.",
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    scrape_only_clicked = st.button(
+        "  Just scrape (don't run pipeline)",
+        key="scrape_only",
+        disabled=not apify_token,
+        use_container_width=True,
+        help="Kicks off Apify and stops. You'll get an email when it finishes; "
+             "then come back to Home and click Run Pipeline yourself. Useful if "
+             "you want to sanity-check the scrape before spending 15+ minutes on "
+             "extraction.",
+    )
 
     if scrape_only_clicked or scrape_and_run_clicked:
         names = [a.strip().lstrip("@") for a in accts_input.splitlines() if a.strip()]
@@ -1329,9 +1542,9 @@ def screen_run():
                         f"Email and Path C auto-chain will only fire if you keep this tab open."
                     )
 
-                label = "Path C (auto-chain)" if scrape_and_run_clicked else "Path B (scrape only)"
+                label = "Scrape & Run (auto-chain)" if scrape_and_run_clicked else "Scrape only"
                 st.success(
-                    f"Apify run started: {result['run_id']} · {label} · "
+                    f"✓ Apify scrape started: `{result['run_id']}` · {label} · "
                     f"compute tier {memory_mb} MB"
                 )
                 time.sleep(0.6)
@@ -1735,7 +1948,7 @@ def _check_integrations() -> dict:
 
 
 def screen_settings():
-    st.title("Settings")
+    st.title("⚙️ Settings")
     st.markdown(
         '<span class="muted">'
         "Edit values in <code>config.json</code> for the next pipeline run. "
@@ -2197,15 +2410,36 @@ def stage_for_review(start_date, end_date) -> tuple:
 
 
 def screen_stage():
-    st.title("Stage for Review")
+    st.title("📤 Prep for Review")
     st.markdown(
-        '<span class="muted">'
-        "Creates a snapshot of <code>All_Events</code> rows that fall in the chosen "
-        "date range and writes them to a separate <code>Weekend_Review</code> tab "
-        "(where Event-Calendar handles approvals). <b>All_Events is never edited</b> — "
-        "your master record stays pristine. Re-staging <b>replaces</b> Weekend_Review "
-        "entirely; any pending approvals from a previous range are wiped."
-        "</span>",
+        '<span class="muted">Pick the dates you want to review, then hit the big button. '
+        'This copies matching events into the review tab that the Event-Calendar website reads from.</span>',
+        unsafe_allow_html=True,
+    )
+
+    # Plain-English "what this does" card so teammates aren't reading
+    # jargon about "All_Events" and "Weekend_Review tab" without context.
+    st.markdown(
+        """
+        <div class="ui-card">
+          <div class="ui-card-title">What this button does</div>
+          <div class="step-row">
+            <span class="step-badge">1</span>
+            <span class="step-body">Copies events matching your date range into a
+            <b>review-only tab</b> — your master events sheet stays untouched.</span>
+          </div>
+          <div class="step-row">
+            <span class="step-badge">2</span>
+            <span class="step-body">The Event-Calendar website reads from that tab
+            (its <b>/scraper</b> page).</span>
+          </div>
+          <div class="step-row">
+            <span class="step-badge">3</span>
+            <span class="step-body">Re-running this <b>replaces</b> the review tab — so
+            only re-run when you're ready to review a fresh batch.</span>
+          </div>
+        </div>
+        """,
         unsafe_allow_html=True,
     )
 
@@ -2278,8 +2512,16 @@ def screen_stage():
     )
 
     st.markdown("&nbsp;", unsafe_allow_html=True)
-    if st.button("🎯 Stage for Review", type="primary", key="stage_btn"):
-        with st.spinner(f"Reading All_Events, filtering, writing Weekend_Review…"):
+    st.markdown('<div class="primary-cta">', unsafe_allow_html=True)
+    _stage_clicked = st.button(
+        "📤 Prep these dates for review",
+        type="primary",
+        key="stage_btn",
+        use_container_width=True,
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
+    if _stage_clicked:
+        with st.spinner(f"Reading events, filtering, writing to review tab…"):
             count, err = stage_for_review(start_date, end_date)
         if err:
             st.error(f"Couldn't stage: {err}")
@@ -2307,11 +2549,13 @@ def screen_stage():
 # ─── Screen: Lookup Post ─────────────────────────────────────────────────
 
 def screen_lookup():
-    st.title("Lookup Post")
+    st.title("🔍 Post Lookup")
     st.markdown(
         '<span class="muted">'
-        "Paste an Instagram shortcode, post ID, or URL. The tool checks every local archive "
-        "(Apify dumps, Processed_Log, All_Events, run logs, anomalies) and shows the full trace."
+        "Wondering why a specific Instagram post didn't make it to the calendar? Paste its "
+        "URL or shortcode below. The tool checks everywhere the post could be — the raw "
+        "scrape, the processing log, and the final events sheet — and tells you where it "
+        "got lost."
         "</span>",
         unsafe_allow_html=True,
     )
@@ -2354,7 +2598,7 @@ def screen_lookup():
 # ─── Screen: Accounts (read-only) ────────────────────────────────────────
 
 def screen_accounts():
-    st.title("Accounts")
+    st.title("📇 Accounts")
     st.markdown(
         '<span class="muted">'
         "Read-only view of the local accounts list. Edits happen in the Google Sheet Accounts tab "
@@ -2430,7 +2674,14 @@ AUDIT_TOOLS = [
 
 
 def screen_audits():
-    st.title("Audits & Tools")
+    st.title("🧰 Advanced Tools")
+    st.markdown(
+        '<span class="muted">'
+        "Debug and maintenance tools. Only needed when something looks wrong — "
+        "the daily flow (Home → Prep for Review) doesn't touch anything here."
+        "</span>",
+        unsafe_allow_html=True,
+    )
     status, info = _job_status(JOB_KIND_AUDIT)
 
     if status == "running":
@@ -2492,16 +2743,17 @@ def screen_audits():
 
 
 # ─── Dispatch ────────────────────────────────────────────────────────────
+# Order matches NAV_LABELS above — keep both in sync when renaming.
 
-if screen == "Run":
+if screen == NAV_LABELS[0]:       # 🏠 Home
     screen_run()
-elif screen == "Stage Review":
+elif screen == NAV_LABELS[1]:     # 📤 Prep for Review
     screen_stage()
-elif screen == "Settings":
+elif screen == NAV_LABELS[2]:     # ⚙️ Settings
     screen_settings()
-elif screen == "Lookup Post":
+elif screen == NAV_LABELS[3]:     # 🔍 Post Lookup
     screen_lookup()
-elif screen == "Accounts":
+elif screen == NAV_LABELS[4]:     # 📇 Accounts
     screen_accounts()
-elif screen == "Audits & Tools":
+elif screen == NAV_LABELS[5]:     # 🧰 Advanced Tools
     screen_audits()
