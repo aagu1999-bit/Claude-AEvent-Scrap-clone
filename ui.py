@@ -73,6 +73,32 @@ SHEET_NAME_DEFAULT = "Instagram_Events_Master"
 TAIL_REFRESH_SEC = 5.0
 
 
+def _run_elapsed_sec(info: dict) -> float:
+    """Seconds since the job's started_at stamp; 0.0 if unparseable."""
+    try:
+        started = datetime.fromisoformat(info.get("started_at", ""))
+        return max(0.0, (datetime.now() - started).total_seconds())
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _adaptive_refresh_sec(info: dict) -> float:
+    """Back the auto-refresh off as a run ages.
+
+    A 6-hour run at a fixed 5s cadence is ~4,300 full script reruns, each
+    re-executing this whole file and re-rendering the page — CPU spent on
+    a screen nobody is staring at by hour 3. Fresh runs stay snappy (5s)
+    while the user is actually watching; after 10 minutes the interval
+    drops to 15s, and after an hour to 30s. Progress on a multi-hour run
+    moves slower than that anyway, so nothing readable is lost."""
+    elapsed = _run_elapsed_sec(info)
+    if elapsed < 600:
+        return TAIL_REFRESH_SEC
+    if elapsed < 3600:
+        return 15.0
+    return 30.0
+
+
 # ─── Subprocess + job-state plumbing ──────────────────────────────────────
 
 def _job_path(kind: str) -> Path:
@@ -859,12 +885,15 @@ def render_running_panel(kind: str, info: dict, label: str):
     refresh / new session."""
     started = info.get("started_at", "?")
 
-    # Lite-mode toggle. Default off so first-time users see the live
-    # progress they expect; once they flip it on for a long run, it
-    # stays on until they uncheck or open a new session.
+    # Lite-mode toggle. Fresh runs default to off so first-time users see
+    # the live progress they expect. But a session that opens on a run
+    # already >30 min old is a multi-hour run being checked on — those
+    # default to Lite so the poll loop isn't burning CPU between visits.
+    # Either way the user's explicit choice sticks for the session.
+    if "lite_mode" not in st.session_state:
+        st.session_state["lite_mode"] = _run_elapsed_sec(info) > 1800
     lite_mode = st.checkbox(
         "🪶 Lite mode — manual refresh only (recommended for runs > 1 hr)",
-        value=st.session_state.get("lite_mode", False),
         key="lite_mode",
         help="Disables the live log tail and the auto-refresh loop. The "
              "pipeline keeps running in the background; click Refresh to "
@@ -906,8 +935,19 @@ def render_running_panel(kind: str, info: dict, label: str):
     cur, total = parse_run_progress(log_text) if kind == JOB_KIND_RUN else (0, 0)
     if total > 0:
         st.progress(cur / total, text=f"Processing {cur:,} / {total:,} posts")
+        elapsed = _run_elapsed_sec(info)
+        if cur > 0 and elapsed > 120:
+            rate = cur / (elapsed / 3600.0)
+            eta_h = (total - cur) / rate if rate > 0 else 0.0
+            st.caption(
+                f"⏱ {rate:,.0f} posts/hr · {elapsed / 3600.0:.1f} h elapsed · "
+                f"~{eta_h:.1f} h remaining"
+            )
 
-    st.code(log_text or "(no log output yet — pipeline is starting up...)", language="log")
+    # st.text, not st.code: st.code runs an 8KB syntax-highlighting pass
+    # and builds a heavier DOM on every refresh tick — pure waste on a
+    # plain log tail.
+    st.text(log_text or "(no log output yet — pipeline is starting up...)")
 
     cols = st.columns([1, 5])
     with cols[0]:
@@ -916,8 +956,9 @@ def render_running_panel(kind: str, info: dict, label: str):
             st.success("Stop requested. Workers will drain.")
             time.sleep(1)
             st.rerun()
-    # Soft auto-refresh — Streamlit reruns the script on this sleep
-    time.sleep(TAIL_REFRESH_SEC)
+    # Soft auto-refresh — Streamlit reruns the script on this sleep.
+    # Interval backs off as the run ages (see _adaptive_refresh_sec).
+    time.sleep(_adaptive_refresh_sec(info))
     st.rerun()
 
 
@@ -1783,11 +1824,12 @@ def render_apify_scrape_panel(info: dict):
         st.rerun()
         return
 
-    # Still running — soft refresh.
+    # Still running — soft refresh. Every tick costs a network round-trip
+    # to Apify's API, so back off like the run panel does on long scrapes.
     if st.button("Stop polling (keep Apify run going)", key="stop_polling"):
         _clear_job(JOB_KIND_SCRAPE)
         st.rerun()
-    time.sleep(TAIL_REFRESH_SEC * 3)  # Apify polling: slower than log tail
+    time.sleep(max(TAIL_REFRESH_SEC * 3, _adaptive_refresh_sec(info)))
     st.rerun()
 
 

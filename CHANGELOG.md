@@ -41,6 +41,21 @@ in ~2 hours. Three compounding causes, all in `main.py`:
   runs "before the UI existed" felt faster regardless of settings.
   Tradeoff: restart the UI Dashboard workflow after editing `ui.py`.
 
+- **Run-panel auto-refresh backs off as the run ages** (5s for the
+  first 10 min → 15s to the 1-hour mark → 30s after). A 6-hour run at
+  a fixed 5s cadence was ~4,300 full ui.py re-executions; long runs now
+  cost ~85% fewer reruns with no visible loss (progress moves slower
+  than 30s anyway). The Apify scrape poll backs off the same way.
+- **Lite mode auto-defaults ON for runs already >30 min old** when a
+  browser session opens on them — that's someone checking on a
+  multi-hour run, not watching a fresh one. Unchecking still works and
+  sticks for the session.
+- **Log tail renders with `st.text` instead of `st.code`** — skips an
+  8KB syntax-highlighting pass + heavier DOM on every refresh tick.
+- **Run panel shows live throughput** (posts/hr, elapsed, ETA) computed
+  from the progress line already being parsed — so a slow run is
+  visible as a number, not a feeling.
+
 ### Changed
 - **Default `max_workers` is now 5 (was 10)** in both `main.py` and the
   UI's `CONFIG_DEFAULTS`. The 10-worker default shipped with the UI and
