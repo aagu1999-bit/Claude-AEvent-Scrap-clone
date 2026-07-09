@@ -2025,7 +2025,9 @@ def screen_settings():
                 min_value=0.0, max_value=10.0, step=0.1,
                 value=float(cfg.get("rate_limit_delay", CONFIG_DEFAULTS["rate_limit_delay"])),
                 help="Sleep duration between successive Vision API calls inside a worker. The "
-                     "pipeline auto-increases this on 429s, so set the floor here.",
+                     "pipeline auto-increases this on 429s AND decays it back to this floor "
+                     "after successful calls, so a burst of quota errors no longer taxes the "
+                     "whole run.",
             )
             history_days = st.number_input(
                 "history_max_age_days",

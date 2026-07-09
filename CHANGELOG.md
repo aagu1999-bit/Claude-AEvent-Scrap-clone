@@ -3,6 +3,35 @@
 Notable changes to the Instagram event extraction pipeline. Newest first.
 Each entry is dated and links to a decision record where the *why* is non-obvious.
 
+## 2026-07-09 (screening throughput: adaptive rate-limit recovery + lazy image downloads)
+
+Addresses the reported regression where a 6,000-post run took ~6 hours with
+10 workers via the UI, while 5 workers from the shell historically finished
+in ~2 hours. Three compounding causes, all in `main.py`:
+
+### Fixed
+- **`rate_limit_delay` now decays back to its configured base after
+  successful API calls.** Previously it only ratcheted UP (×1.5 per 429,
+  capped at 5.0s) and never recovered — one 429 burst early in a long run
+  left every subsequent Vision call (per carousel slide!) and per-post
+  Gemini call sleeping 5s for the rest of the run. At 6,000 posts that is
+  hours of dead sleep. More workers made it *worse*: 10 workers hit the
+  quota harder, pinning the delay at max sooner — the counterintuitive
+  "10 workers slower than 5" effect. Successful calls now walk the delay
+  back (×0.9 per success, floor = configured `rate_limit_delay`).
+- **Gemini 429s are retried in place instead of escalating the tier
+  ladder.** `_call_gemini_tier` used to swallow a 429 and return `None`,
+  which the ladder read as "zero events" → escalate to the next tier —
+  burning up to 4 Gemini calls per post into an already-exhausted quota
+  and amplifying the storm. Rate-limit errors now retry the SAME tier up
+  to 2 more times with the escalated adaptive delay.
+- **Carousel images are downloaded lazily in the tier ladder.**
+  `_process_with_tier_ladder` eagerly downloaded every slide for every
+  post before Tier 1 ran; most posts resolve caption-only and never
+  needed them. Downloads now happen only when an image tier (2 or 4)
+  actually runs; Tier 2/4 still share one download via the existing
+  per-post cache.
+
 ## 2026-05-08 (incremental Processed_Log writes)
 
 ### Changed

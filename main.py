@@ -280,6 +280,10 @@ class InstagramEventPipeline:
         self.vision_enabled = False
         self.max_workers = CONF["max_workers"]
         self.rate_limit_delay = CONF["rate_limit_delay"]
+        # Floor for the adaptive delay. rate_limit_delay ratchets up ×1.5
+        # on every 429 (capped at 5s) and decays back toward this base on
+        # successful calls — see _bump_rate_limit_delay / _decay_rate_limit_delay.
+        self.base_rate_limit_delay = self.rate_limit_delay
 
         self.run_id = datetime.now(EAST_TZ).strftime('%Y%m%d_%H%M%S')
         self._setup_run_log()
@@ -1210,9 +1214,8 @@ class InstagramEventPipeline:
                 elif '403' in error_msg:
                     outage_watchdog.record('vision_403', error_msg)
                 if 'quota' in low or '429' in error_msg:
-                    with self.lock:
-                        self.rate_limit_delay = min(self.rate_limit_delay * 1.5, 5.0)
-                    wprint(f"    ⚠ Rate limited - increasing delay to {self.rate_limit_delay:.1f}s")
+                    new_delay = self._bump_rate_limit_delay()
+                    wprint(f"    ⚠ Rate limited - increasing delay to {new_delay:.1f}s")
                 return ""
 
             if response_ocr.text_annotations:
@@ -1223,6 +1226,7 @@ class InstagramEventPipeline:
                 with self.lock:
                     self.stats['ocr_success'] += 1
                     self.successful_ocr.append(post_id)
+                self._decay_rate_limit_delay()
                 return ocr_text
             else:
                 wprint(f"    ⚠ No text found in image")
@@ -1253,9 +1257,8 @@ class InstagramEventPipeline:
             elif '403' in error_str:
                 outage_watchdog.record('vision_403', error_str)
             if '429' in error_str or 'quota' in low:
-                with self.lock:
-                    self.rate_limit_delay = min(self.rate_limit_delay * 1.5, 5.0)
-                wprint(f"    ⚠ Increasing delay to {self.rate_limit_delay:.1f}s")
+                new_delay = self._bump_rate_limit_delay()
+                wprint(f"    ⚠ Increasing delay to {new_delay:.1f}s")
 
         return ""
 
@@ -1339,22 +1342,72 @@ class InstagramEventPipeline:
                     return None
             return None
 
+    # ─────────────────────────────────────────────────────────────
+    # Adaptive rate-limit pacing (2026-07 throughput fix).
+    #
+    # rate_limit_delay is SHARED across all workers and gates every
+    # Vision call (per carousel slide) and every per-post Gemini call.
+    # Before this fix it only ever went UP (×1.5 per 429, cap 5.0s) —
+    # one bad minute early in a 6,000-post run left every subsequent
+    # API call sleeping 5s for the rest of the run: hours of dead time,
+    # and the reason 10 workers via the UI ran SLOWER than 5 from the
+    # shell (more workers → more 429s → pinned at max delay sooner).
+    # Now successful calls walk the delay back toward the configured
+    # base, so a transient 429 burst costs seconds, not hours.
+    # NOTE: both helpers acquire self.lock — never call them while
+    # already holding it (threading.Lock is not reentrant).
+    # ─────────────────────────────────────────────────────────────
+
+    def _bump_rate_limit_delay(self):
+        """Ratchet the shared adaptive delay after a 429/quota hit.
+        Returns the new delay for logging."""
+        with self.lock:
+            self.rate_limit_delay = min(self.rate_limit_delay * 1.5, 5.0)
+            return self.rate_limit_delay
+
+    def _decay_rate_limit_delay(self):
+        """Walk the shared adaptive delay back toward base after a
+        successful API call. ~22 consecutive successes recover from the
+        5.0s cap to a 0.5s base — a couple of posts' worth of calls."""
+        if self.rate_limit_delay <= self.base_rate_limit_delay:
+            return
+        with self.lock:
+            self.rate_limit_delay = max(
+                self.base_rate_limit_delay, self.rate_limit_delay * 0.9
+            )
+
     def _call_gemini_tier(self, model, prompt_or_content, tier_name):
         """Wrap a Gemini call with parsing + minimal error handling.
         Returns the parsed JSON dict or None on any failure. tier_name
-        is recorded for log readability only."""
-        try:
-            resp = model.generate_content(prompt_or_content)
-            if not resp:
+        is recorded for log readability only.
+
+        429/quota errors are retried IN PLACE (up to 2 retries with the
+        escalated adaptive delay). Before this, a rate-limited call
+        returned None, which the tier ladder read as "zero events" and
+        escalated to the NEXT tier — burning up to 4 Gemini calls per
+        post into an already-exhausted quota and amplifying the storm."""
+        for attempt in range(3):
+            try:
+                resp = model.generate_content(prompt_or_content)
+                if not resp:
+                    return None
+                text = resp.text.strip()
+            except Exception as e:
+                err = str(e)
+                if '429' in err or 'quota' in err.lower() or 'resource_exhausted' in err.lower():
+                    outage_watchdog.record('gemini_429', err)
+                    delay = self._bump_rate_limit_delay()
+                    if attempt < 2:
+                        wprint(f"    ⚠ Gemini rate-limited in {tier_name} — "
+                               f"retrying same tier in {delay:.1f}s "
+                               f"(attempt {attempt + 2}/3)")
+                        time.sleep(delay)
+                        continue
+                wprint(f"    ✗ Gemini error in {tier_name}: {err[:120]}")
                 return None
-            text = resp.text.strip()
-        except Exception as e:
-            err = str(e)
-            wprint(f"    ✗ Gemini error in {tier_name}: {err[:120]}")
-            if '429' in err or 'quota' in err.lower():
-                outage_watchdog.record('gemini_429', err)
-            return None
-        return self._parse_gemini_json(text)
+            self._decay_rate_limit_delay()
+            return self._parse_gemini_json(text)
+        return None
 
     def _enrich_event_for_tier(self, e, post, has_ocr, is_calendar):
         """Add the metadata fields the sheet expects. Used by every
@@ -1535,8 +1588,14 @@ class InstagramEventPipeline:
               cost discipline (Pro is ~8× Flash-Lite per call)."""
         max_tier = max_tier or ec_TIER_PRO_IMAGE
 
-        # Download images once, reuse across Tier 2 + Tier 4
-        cached_images = self._collect_multimodal_images(post)
+        # Images are downloaded LAZILY — only when an image tier (2 or 4)
+        # actually runs, inside the loop below. The old eager download here
+        # fetched every carousel slide for EVERY post before Tier 1 ran,
+        # wasting a full set of CDN downloads (up to 15s timeout each) on
+        # the majority of posts that Tier 1 resolves caption-only.
+        # _collect_multimodal_images caches on the post dict, so Tier 2 and
+        # Tier 4 still share one download.
+        cached_images = None
 
         has_caption = bool((post.get('caption') or '').strip())
         if not has_caption:
@@ -1550,6 +1609,8 @@ class InstagramEventPipeline:
         final_has_ocr = False
 
         while current_tier is not None:
+            if current_tier in (ec_TIER_FLASH_IMAGE, ec_TIER_PRO_IMAGE):
+                cached_images = self._collect_multimodal_images(post)
             events, is_calendar, has_ocr, flags = self._run_tier(
                 current_tier, post, post_date, ocr_text,
                 slide_count, slides_with_text, cached_images,
@@ -1924,9 +1985,8 @@ class InstagramEventPipeline:
                     self.stats['gemini_errors'] += 1
                     self.stats['processed'] += 1
                 if '429' in error_str:
-                    with self.lock:
-                        self.rate_limit_delay = min(self.rate_limit_delay * 1.5, 5.0)
-                    wprint(f"  ⚠ Rate limited - delay increased to {self.rate_limit_delay:.1f}s")
+                    new_delay = self._bump_rate_limit_delay()
+                    wprint(f"  ⚠ Rate limited - delay increased to {new_delay:.1f}s")
                 return None
 
     def save_checkpoint(self):
