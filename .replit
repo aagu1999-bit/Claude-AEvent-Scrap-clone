@@ -34,3 +34,11 @@ outputType = "console"
 [postMerge]
 path = "scripts/post-merge.sh"
 timeoutMs = 60000
+
+[[ports]]
+localPort = 5000
+externalPort = 80
+
+[deployment]
+deploymentTarget = "vm"
+run = ["streamlit", "run", "ui.py", "--server.port", "5000", "--server.address", "0.0.0.0"]
