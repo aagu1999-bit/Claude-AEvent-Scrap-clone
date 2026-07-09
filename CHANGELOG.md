@@ -3,6 +3,67 @@
 Notable changes to the Instagram event extraction pipeline. Newest first.
 Each entry is dated and links to a decision record where the *why* is non-obvious.
 
+## 2026-07-09 (screening throughput: adaptive rate-limit recovery + lazy image downloads)
+
+Addresses the reported regression where a 6,000-post run took ~6 hours with
+10 workers via the UI, while 5 workers from the shell historically finished
+in ~2 hours. Three compounding causes, all in `main.py`:
+
+### Fixed
+- **`rate_limit_delay` now decays back to its configured base after
+  successful API calls.** Previously it only ratcheted UP (×1.5 per 429,
+  capped at 5.0s) and never recovered — one 429 burst early in a long run
+  left every subsequent Vision call (per carousel slide!) and per-post
+  Gemini call sleeping 5s for the rest of the run. At 6,000 posts that is
+  hours of dead sleep. More workers made it *worse*: 10 workers hit the
+  quota harder, pinning the delay at max sooner — the counterintuitive
+  "10 workers slower than 5" effect. Successful calls now walk the delay
+  back (×0.9 per success, floor = configured `rate_limit_delay`).
+- **Gemini 429s are retried in place instead of escalating the tier
+  ladder.** `_call_gemini_tier` used to swallow a 429 and return `None`,
+  which the ladder read as "zero events" → escalate to the next tier —
+  burning up to 4 Gemini calls per post into an already-exhausted quota
+  and amplifying the storm. Rate-limit errors now retry the SAME tier up
+  to 2 more times with the escalated adaptive delay.
+- **Carousel images are downloaded lazily in the tier ladder.**
+  `_process_with_tier_ladder` eagerly downloaded every slide for every
+  post before Tier 1 ran; most posts resolve caption-only and never
+  needed them. Downloads now happen only when an image tier (2 or 4)
+  actually runs; Tier 2/4 still share one download via the existing
+  per-post cache.
+- **Streamlit's polling file watcher is disabled**
+  (`.streamlit/config.toml`: `fileWatcherType = "none"`). `watchdog`
+  isn't installed, so Streamlit was re-reading + re-hashing its watched
+  source files (`ui.py` is 120KB+) about once per second, continuously,
+  even with no browser tab open — a standing CPU + disk tax on the
+  shared Replit container that competes with the pipeline's workers for
+  the whole run. This overhead arrived with the UI itself, which is why
+  runs "before the UI existed" felt faster regardless of settings.
+  Tradeoff: restart the UI Dashboard workflow after editing `ui.py`.
+
+- **Run-panel auto-refresh backs off as the run ages** (5s for the
+  first 10 min → 15s to the 1-hour mark → 30s after). A 6-hour run at
+  a fixed 5s cadence was ~4,300 full ui.py re-executions; long runs now
+  cost ~85% fewer reruns with no visible loss (progress moves slower
+  than 30s anyway). The Apify scrape poll backs off the same way.
+- **Lite mode auto-defaults ON for runs already >30 min old** when a
+  browser session opens on them — that's someone checking on a
+  multi-hour run, not watching a fresh one. Unchecking still works and
+  sticks for the session.
+- **Log tail renders with `st.text` instead of `st.code`** — skips an
+  8KB syntax-highlighting pass + heavier DOM on every refresh tick.
+- **Run panel shows live throughput** (posts/hr, elapsed, ETA) computed
+  from the progress line already being parsed — so a slow run is
+  visible as a number, not a feeling.
+
+### Changed
+- **Default `max_workers` is now 5 (was 10)** in both `main.py` and the
+  UI's `CONFIG_DEFAULTS`. The 10-worker default shipped with the UI and
+  measured *slower* than the old 5-worker console runs because of the
+  429/adaptive-delay dynamics above. NOTE: an existing `config.json`
+  saved with `max_workers: 10` keeps that value — lower it in
+  Settings → Pipeline run tuning.
+
 ## 2026-05-08 (incremental Processed_Log writes)
 
 ### Changed
