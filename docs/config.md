@@ -14,8 +14,8 @@ based on whether they apply to **live Apify mode** (`apify_enabled: true`),
 | `apify_enabled` | bool | `true` | Mode switch. `true` = live Apify auto-run on each pipeline trigger. `false` = read from the fixed `instagram_data_url` dataset. |
 | `sheet_name` | str | `"Instagram_Events_Master"` | Target Google Sheet. |
 | `gemini_model` | str | `"gemini-2.0-flash-lite"` | Extraction model. |
-| `max_workers` | int | `10` | `ThreadPoolExecutor` concurrency for `process_post()`. Capped at 20. Higher = faster but more concurrency races. |
-| `rate_limit_delay` | float | `0.5` | Per-post sleep before the Gemini call, in seconds. Increases automatically on 429 errors. |
+| `max_workers` | int | `5` | `ThreadPoolExecutor` concurrency for `process_post()`. Capped at 20. 5 matches the proven ~2h/6k-post throughput; more workers trip Gemini/Vision per-minute 429s, escalating the shared adaptive delay every worker pays — 10 measured slower than 5. |
+| `rate_limit_delay` | float | `0.5` | Per-post sleep before the Gemini call, in seconds. Escalates automatically on 429 errors and decays back toward this base after ~2 min without one. |
 | `post_offset` | int | `0` | Skip the first N posts in the input list before extraction. Useful for resuming from a known position. |
 | `max_posts` | int | `0` | Cap on posts extracted. `0` = no cap (process all). Useful for testing on a small slice. |
 
