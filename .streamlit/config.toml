@@ -4,6 +4,16 @@ port = 5000
 address = "0.0.0.0"
 enableCORS = false
 enableXsrfProtection = false
+# Disable source-file watching. watchdog isn't installed, so Streamlit
+# falls back to its POLLING watcher: it re-reads and re-hashes every
+# watched source file (ui.py is 120KB+) roughly once per second, all
+# day, even with no browser tab open. On Replit's small shared CPU +
+# disk this competes directly with main.py's pipeline workers for the
+# entire multi-hour run. Tradeoff: after editing ui.py you must restart
+# the "UI Dashboard" workflow (or the Repl) to pick up changes — hot
+# reload no longer triggers.
+fileWatcherType = "none"
+runOnSave = false
 
 [browser]
 gatherUsageStats = false

@@ -31,6 +31,23 @@ in ~2 hours. Three compounding causes, all in `main.py`:
   needed them. Downloads now happen only when an image tier (2 or 4)
   actually runs; Tier 2/4 still share one download via the existing
   per-post cache.
+- **Streamlit's polling file watcher is disabled**
+  (`.streamlit/config.toml`: `fileWatcherType = "none"`). `watchdog`
+  isn't installed, so Streamlit was re-reading + re-hashing its watched
+  source files (`ui.py` is 120KB+) about once per second, continuously,
+  even with no browser tab open — a standing CPU + disk tax on the
+  shared Replit container that competes with the pipeline's workers for
+  the whole run. This overhead arrived with the UI itself, which is why
+  runs "before the UI existed" felt faster regardless of settings.
+  Tradeoff: restart the UI Dashboard workflow after editing `ui.py`.
+
+### Changed
+- **Default `max_workers` is now 5 (was 10)** in both `main.py` and the
+  UI's `CONFIG_DEFAULTS`. The 10-worker default shipped with the UI and
+  measured *slower* than the old 5-worker console runs because of the
+  429/adaptive-delay dynamics above. NOTE: an existing `config.json`
+  saved with `max_workers: 10` keeps that value — lower it in
+  Settings → Pipeline run tuning.
 
 ## 2026-05-08 (incremental Processed_Log writes)
 

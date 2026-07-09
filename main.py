@@ -116,7 +116,10 @@ def load_configuration():
         "sheet_name": "Instagram_Events_Master",
         "gemini_model": "gemini-2.0-flash-lite",
         "instagram_data_url": "",
-        "max_workers": 10,
+        # 5, not 10: matches the proven ~2h console runs. Higher counts
+        # trip Gemini/Vision 429s, escalating the shared adaptive delay
+        # that every worker then pays — 10 workers measured SLOWER than 5.
+        "max_workers": 5,
         "rate_limit_delay": 0.5,
         "history_max_age_days": 30,
         "apify_enabled": True,

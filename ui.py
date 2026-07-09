@@ -1797,7 +1797,11 @@ def render_apify_scrape_panel(info: dict):
 # of truth for these values is main.py's `config = {...}` block — when that
 # block changes, update this one too so the UI doesn't drift.
 CONFIG_DEFAULTS = {
-    "max_workers": 10,
+    # 5 workers matches the historical console runs that finished 6k posts
+    # in ~2h. 10 workers proved SLOWER in practice: they trip Gemini/Vision
+    # 429s, which ratchets main.py's shared adaptive delay and (pre-2026-07
+    # fix) pinned every API call at a 5s sleep for the rest of the run.
+    "max_workers": 5,
     "rate_limit_delay": 0.5,
     "gemini_model": "gemini-2.0-flash-lite",
     "history_max_age_days": 30,
@@ -2017,8 +2021,10 @@ def screen_settings():
                 "max_workers (ThreadPoolExecutor)",
                 min_value=1, max_value=50,
                 value=int(cfg.get("max_workers", CONFIG_DEFAULTS["max_workers"])),
-                help="How many post-processors run in parallel. 10 is the historical default; 15+ "
-                     "increases Sheets API quota risk on flushes.",
+                help="How many post-processors run in parallel. 5 is the recommended default — "
+                     "it matches the throughput of the old console runs. More workers hit "
+                     "Gemini/Vision 429 rate limits harder, which slows the WHOLE run down "
+                     "(escalated delays apply to every worker); 10+ has measured slower than 5.",
             )
             rl_delay = st.number_input(
                 "rate_limit_delay (seconds between Vision calls)",
