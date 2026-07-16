@@ -195,6 +195,13 @@ def _spawn(cmd: list[str], kind: str, extra: dict | None = None) -> int:
         start_new_session=True,
     )
     info = {"pid": proc.pid, "cmd": cmd, "log_path": str(log_path) if log_path else ""}
+    if kind == JOB_KIND_RUN:
+        # Snapshot the tuning this run launched with, so the running panel
+        # can display the ACTUAL values instead of whatever config.json says
+        # now (config edits mid-run don't affect a running pipeline).
+        w, d = _effective_run_settings()
+        info["workers"] = w
+        info["rate_delay"] = d
     if extra:
         info.update(extra)
     _write_job(kind, info)
@@ -237,6 +244,25 @@ def save_config(updates: dict):
     tmp = CONFIG_PATH.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(cur, indent=2))
     tmp.replace(CONFIG_PATH)
+
+
+def _effective_run_settings() -> tuple[int, float]:
+    """The worker count + rate delay main.py will ACTUALLY use for the next
+    run. Mirrors main.py's load_configuration() precedence exactly:
+    defaults → config.json → env vars last (incl. its clamps). Keep the two
+    in sync — this exists so the UI can never show a value the run ignores."""
+    cfg = load_config()
+    workers = os.environ.get("MAX_WORKERS") or cfg.get("max_workers", CONFIG_DEFAULTS["max_workers"])
+    delay = os.environ.get("RATE_LIMIT_DELAY") or cfg.get("rate_limit_delay", CONFIG_DEFAULTS["rate_limit_delay"])
+    try:
+        workers = min(20, max(1, int(workers)))
+    except (TypeError, ValueError):
+        workers = CONFIG_DEFAULTS["max_workers"]
+    try:
+        delay = max(0.1, float(delay))
+    except (TypeError, ValueError):
+        delay = CONFIG_DEFAULTS["rate_limit_delay"]
+    return workers, delay
 
 
 def load_accounts_from_file() -> list[str]:
@@ -901,7 +927,10 @@ def render_running_panel(kind: str, info: dict, label: str):
              "that competes with main.py's worker threads during multi-hour runs.",
     )
 
-    st.info(f"**{label} running** — started {started} (PID {info.get('pid', '?')})")
+    tuning = ""
+    if info.get("workers"):
+        tuning = f" · {info['workers']} workers · {info.get('rate_delay', '?')}s delay"
+    st.info(f"**{label} running** — started {started} (PID {info.get('pid', '?')}){tuning}")
 
     if lite_mode:
         # Minimal panel — no file reads except for the manual Refresh
@@ -1160,6 +1189,9 @@ def screen_run():
             "Apify manually on their website."
         )
         new_url = st.text_input("Dataset URL", value=current_url, key="ds_url")
+
+        _w_a, _d_a = _effective_run_settings()
+        st.caption(f"⚙️ Run Pipeline will use **{_w_a} workers** · **{_d_a}s** rate delay")
 
         cols = st.columns([1, 1, 4])
         with cols[0]:
@@ -1487,6 +1519,15 @@ def screen_run():
              "You'll get an email when everything is done — safe to close this tab.",
     )
     st.markdown('</div>', unsafe_allow_html=True)
+
+    # Show the tuning the pipeline will ACTUALLY launch with, resolved the
+    # same way main.py resolves it. Kills the "did my settings save?" doubt
+    # at the exact moment it matters — right before the button gets clicked.
+    _w, _d = _effective_run_settings()
+    st.caption(
+        f"⚙️ Next pipeline run: **{_w} workers** · **{_d}s** rate delay "
+        f"(change in Settings → Pipeline run tuning)"
+    )
 
     scrape_only_clicked = st.button(
         "  Just scrape (don't run pipeline)",
