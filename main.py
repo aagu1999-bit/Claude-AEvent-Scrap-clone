@@ -146,6 +146,10 @@ def load_configuration():
     for env_key, conf_key in env_overrides.items():
         val = os.environ.get(env_key)
         if val:
+            if str(config.get(conf_key)) != val:
+                print(f"⚠ Env var {env_key}={val} OVERRIDES config.json "
+                      f"{conf_key}={config.get(conf_key)!r} — the UI's Settings "
+                      f"screen can't win while this env var / Replit Secret is set.")
             config[conf_key] = val
 
     config["max_workers"] = min(20, max(1, int(config.get("max_workers", 10))))

@@ -2058,6 +2058,21 @@ def screen_settings():
             "</span>",
             unsafe_allow_html=True,
         )
+        # main.py applies env vars LAST (after config.json), so a stray
+        # MAX_WORKERS / RATE_LIMIT_DELAY in Replit Secrets silently wins
+        # over anything saved here. Users spent hours confused by exactly
+        # this — surface it instead of letting the save look like a no-op.
+        _env_wins = {k: os.environ[k]
+                     for k in ("MAX_WORKERS", "RATE_LIMIT_DELAY", "DATA_URL")
+                     if os.environ.get(k)}
+        if _env_wins:
+            st.warning(
+                "⚠ **These environment variables override anything you save here:** "
+                + ", ".join(f"`{k}={v}`" for k, v in _env_wins.items())
+                + ". main.py applies env vars *after* config.json, so your saved "
+                  "settings are being ignored for those keys. Delete them from "
+                  "Replit Secrets (padlock icon) to make this form take effect."
+            )
         with st.form("form_run_tuning", clear_on_submit=False):
             workers = st.number_input(
                 "max_workers (ThreadPoolExecutor)",
